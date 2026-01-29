@@ -1,6 +1,6 @@
 """
 Settings Page
-Sync controls, budget upload, and configuration
+API configuration, sync controls, budget upload, and system settings
 """
 import os
 import streamlit as st
@@ -13,65 +13,250 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 st.set_page_config(page_title="Settings", page_icon="⚙️", layout="wide")
 
 st.title("⚙️ Settings")
-st.markdown("Manage data sync, budgets, and system configuration")
+st.markdown("Configure API connections, manage data sync, and system settings")
+
+
+def get_auth_header():
+    """Get authorization header from session"""
+    token = st.session_state.get("token")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def get_config(key: str) -> str:
+    """Fetch a config value from backend"""
+    try:
+        response = httpx.get(
+            f"{BACKEND_URL}/config/{key}",
+            headers=get_auth_header(),
+            timeout=10.0
+        )
+        if response.status_code == 200:
+            return response.json().get("value", "")
+    except:
+        pass
+    return ""
+
+
+def save_config(key: str, value: str, is_encrypted: bool = False) -> bool:
+    """Save a config value to backend"""
+    try:
+        response = httpx.post(
+            f"{BACKEND_URL}/config",
+            headers=get_auth_header(),
+            json={"key": key, "value": value, "is_encrypted": is_encrypted},
+            timeout=10.0
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+
+def test_api_connection(api: str) -> tuple:
+    """Test API connection"""
+    try:
+        response = httpx.post(
+            f"{BACKEND_URL}/config/test/{api}",
+            headers=get_auth_header(),
+            timeout=30.0
+        )
+        if response.status_code == 200:
+            return True, "Connection successful!"
+        else:
+            return False, response.json().get("detail", "Connection failed")
+    except Exception as e:
+        return False, str(e)
+
 
 # Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["🔄 Data Sync", "💰 Budget Upload", "📊 Metrics Config", "👤 Account"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔑 API Configuration",
+    "🔄 Data Sync",
+    "💰 Budget Upload",
+    "📊 System Settings",
+    "👤 Account"
+])
+
+# API Configuration Tab
+with tab1:
+    st.subheader("API Configuration")
+    st.markdown("Configure connections to Newbook and Resos APIs")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Newbook API")
+        st.markdown("Hotel property management system")
+
+        with st.form("newbook_config"):
+            nb_api_key = st.text_input(
+                "API Key",
+                value="",
+                type="password",
+                help="Your Newbook API key"
+            )
+            nb_username = st.text_input(
+                "Username",
+                value="",
+                help="Newbook account username"
+            )
+            nb_password = st.text_input(
+                "Password",
+                value="",
+                type="password",
+                help="Newbook account password"
+            )
+            nb_region = st.text_input(
+                "Region",
+                value="",
+                help="Newbook region code (e.g., 'uk', 'au')"
+            )
+
+            col_save, col_test = st.columns(2)
+            with col_save:
+                nb_save = st.form_submit_button("💾 Save", use_container_width=True)
+            with col_test:
+                nb_test = st.form_submit_button("🔌 Test Connection", use_container_width=True)
+
+        if nb_save:
+            success = True
+            if nb_api_key:
+                success &= save_config("newbook_api_key", nb_api_key, is_encrypted=True)
+            if nb_username:
+                success &= save_config("newbook_username", nb_username)
+            if nb_password:
+                success &= save_config("newbook_password", nb_password, is_encrypted=True)
+            if nb_region:
+                success &= save_config("newbook_region", nb_region)
+
+            if success:
+                st.success("Newbook configuration saved!")
+            else:
+                st.error("Failed to save some settings")
+
+        if nb_test:
+            with st.spinner("Testing Newbook connection..."):
+                ok, msg = test_api_connection("newbook")
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(f"Connection failed: {msg}")
+
+    with col2:
+        st.markdown("### Resos API")
+        st.markdown("Restaurant reservation system")
+
+        with st.form("resos_config"):
+            rs_api_key = st.text_input(
+                "API Key",
+                value="",
+                type="password",
+                help="Your Resos API key"
+            )
+
+            col_save, col_test = st.columns(2)
+            with col_save:
+                rs_save = st.form_submit_button("💾 Save", use_container_width=True)
+            with col_test:
+                rs_test = st.form_submit_button("🔌 Test Connection", use_container_width=True)
+
+        if rs_save:
+            if rs_api_key:
+                if save_config("resos_api_key", rs_api_key, is_encrypted=True):
+                    st.success("Resos configuration saved!")
+                else:
+                    st.error("Failed to save settings")
+
+        if rs_test:
+            with st.spinner("Testing Resos connection..."):
+                ok, msg = test_api_connection("resos")
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(f"Connection failed: {msg}")
+
+    # Connection status
+    st.markdown("---")
+    st.markdown("### Connection Status")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        # Would fetch actual status from backend
+        st.info("**Newbook:** ⚠️ Not configured")
+    with col2:
+        st.info("**Resos:** ⚠️ Not configured")
 
 # Data Sync Tab
-with tab1:
+with tab2:
     st.subheader("Data Synchronization")
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("### Newbook Sync")
-        st.info("**Last sync:** Today 6:00 AM\n\n**Records:** 1,245 bookings")
+        st.info("**Last sync:** Never\n\n**Records:** -")
 
         newbook_from = st.date_input("From Date", date.today() - timedelta(days=7), key="nb_from")
         newbook_to = st.date_input("To Date", date.today() + timedelta(days=60), key="nb_to")
 
         if st.button("🔄 Sync Newbook", use_container_width=True):
-            st.info("Newbook sync started...")
-            st.success("Sync queued successfully!")
+            with st.spinner("Syncing Newbook data..."):
+                try:
+                    response = httpx.post(
+                        f"{BACKEND_URL}/sync/newbook",
+                        headers=get_auth_header(),
+                        params={"from_date": str(newbook_from), "to_date": str(newbook_to)},
+                        timeout=10.0
+                    )
+                    if response.status_code == 200:
+                        st.success("Newbook sync started!")
+                    else:
+                        st.error("Failed to start sync")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     with col2:
         st.markdown("### Resos Sync")
-        st.info("**Last sync:** Today 6:00 AM\n\n**Records:** 856 bookings")
+        st.info("**Last sync:** Never\n\n**Records:** -")
 
         resos_from = st.date_input("From Date", date.today() - timedelta(days=7), key="rs_from")
         resos_to = st.date_input("To Date", date.today() + timedelta(days=60), key="rs_to")
 
         if st.button("🔄 Sync Resos", use_container_width=True):
-            st.info("Resos sync started...")
-            st.success("Sync queued successfully!")
+            with st.spinner("Syncing Resos data..."):
+                try:
+                    response = httpx.post(
+                        f"{BACKEND_URL}/sync/resos",
+                        headers=get_auth_header(),
+                        params={"from_date": str(resos_from), "to_date": str(resos_to)},
+                        timeout=10.0
+                    )
+                    if response.status_code == 200:
+                        st.success("Resos sync started!")
+                    else:
+                        st.error("Failed to start sync")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     st.markdown("---")
 
     # Full sync
     st.markdown("### Full Sync")
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col1:
-        if st.button("🔄 Run Full Sync (Both Sources)", use_container_width=True):
-            st.info("Full sync started...")
-            st.success("Full sync queued successfully!")
+    if st.button("🔄 Run Full Sync (Both Sources)", use_container_width=True):
+        st.info("Full sync started in background...")
 
     # Sync logs
     st.markdown("---")
     st.markdown("### Recent Sync Logs")
 
     logs_data = [
-        {"Time": "06:00 AM Today", "Source": "Newbook", "Status": "✅ Success", "Records": 1245},
-        {"Time": "06:00 AM Today", "Source": "Resos", "Status": "✅ Success", "Records": 856},
-        {"Time": "06:00 AM Yesterday", "Source": "Newbook", "Status": "✅ Success", "Records": 1238},
-        {"Time": "06:00 AM Yesterday", "Source": "Resos", "Status": "✅ Success", "Records": 842},
-        {"Time": "06:00 AM 2 days ago", "Source": "Newbook", "Status": "⚠️ Partial", "Records": 1180},
+        {"Time": "-", "Source": "Newbook", "Status": "Not run", "Records": "-"},
+        {"Time": "-", "Source": "Resos", "Status": "Not run", "Records": "-"},
     ]
 
     st.dataframe(pd.DataFrame(logs_data), use_container_width=True, hide_index=True)
 
 # Budget Upload Tab
-with tab2:
+with tab3:
     st.subheader("Monthly Budget Upload")
 
     st.markdown("""
@@ -126,28 +311,41 @@ with tab2:
         dist_year = st.selectbox("Year", [2026, 2025], key="dist_year")
         dist_month = st.selectbox("Month", list(range(1, 13)), key="dist_month",
                                    format_func=lambda x: datetime(2000, x, 1).strftime('%B'))
-    with col2:
-        st.empty()
 
     if st.button("📊 Distribute Budget", use_container_width=True):
         st.info("Distributing budget to daily values...")
         st.success("Budget distributed successfully!")
 
-# Metrics Config Tab
-with tab3:
-    st.subheader("Forecast Metrics Configuration")
+# System Settings Tab
+with tab4:
+    st.subheader("System Settings")
 
-    metrics_config = [
-        {"Code": "hotel_occupancy_pct", "Name": "Occupancy %", "Prophet": True, "XGBoost": True, "Pickup": True, "Active": True},
-        {"Code": "hotel_guests", "Name": "Total Guests", "Prophet": True, "XGBoost": True, "Pickup": True, "Active": True},
-        {"Code": "hotel_adr", "Name": "Average Daily Rate", "Prophet": True, "XGBoost": True, "Pickup": False, "Active": True},
-        {"Code": "resos_dinner_covers", "Name": "Dinner Covers", "Prophet": True, "XGBoost": True, "Pickup": True, "Active": True},
-        {"Code": "resos_lunch_covers", "Name": "Lunch Covers", "Prophet": True, "XGBoost": True, "Pickup": True, "Active": True},
-        {"Code": "revenue_rooms", "Name": "Room Revenue", "Prophet": True, "XGBoost": True, "Pickup": False, "Active": True},
-        {"Code": "revenue_fb_total", "Name": "F&B Revenue", "Prophet": True, "XGBoost": True, "Pickup": False, "Active": True},
-    ]
+    st.markdown("### Property Configuration")
 
-    st.dataframe(pd.DataFrame(metrics_config), use_container_width=True, hide_index=True)
+    with st.form("property_config"):
+        hotel_name = st.text_input(
+            "Hotel/Property Name",
+            value="",
+            help="Name displayed in reports"
+        )
+        total_rooms = st.number_input(
+            "Total Rooms",
+            min_value=1,
+            max_value=1000,
+            value=80,
+            help="Total number of hotel rooms (for occupancy calculation)"
+        )
+        timezone = st.selectbox(
+            "Timezone",
+            ["Europe/London", "Europe/Paris", "America/New_York", "America/Los_Angeles", "Australia/Sydney"],
+            help="Local timezone for the property"
+        )
+
+        if st.form_submit_button("💾 Save Settings", use_container_width=True):
+            save_config("hotel_name", hotel_name)
+            save_config("total_rooms", str(total_rooms))
+            save_config("timezone", timezone)
+            st.success("Settings saved!")
 
     st.markdown("---")
 
@@ -166,35 +364,54 @@ with tab3:
         st.info("Triggering forecast run...")
         st.success("Forecast run queued!")
 
+    st.markdown("---")
+
+    # Metrics config
+    st.markdown("### Forecast Metrics")
+
+    metrics_config = [
+        {"Code": "hotel_occupancy_pct", "Name": "Occupancy %", "Prophet": "✅", "XGBoost": "✅", "Pickup": "✅"},
+        {"Code": "hotel_guests", "Name": "Total Guests", "Prophet": "✅", "XGBoost": "✅", "Pickup": "✅"},
+        {"Code": "hotel_adr", "Name": "Average Daily Rate", "Prophet": "✅", "XGBoost": "✅", "Pickup": "❌"},
+        {"Code": "resos_dinner_covers", "Name": "Dinner Covers", "Prophet": "✅", "XGBoost": "✅", "Pickup": "✅"},
+        {"Code": "resos_lunch_covers", "Name": "Lunch Covers", "Prophet": "✅", "XGBoost": "✅", "Pickup": "✅"},
+    ]
+
+    st.dataframe(pd.DataFrame(metrics_config), use_container_width=True, hide_index=True)
+
 # Account Tab
-with tab4:
+with tab5:
     st.subheader("Account Settings")
 
     st.markdown("### Current User")
-    st.info("**Username:** admin\n\n**Display Name:** Administrator")
+    user = st.session_state.get("user", {})
+    st.info(f"**Username:** {user.get('username', 'admin')}\n\n**Display Name:** {user.get('display_name', 'Administrator')}")
 
     st.markdown("---")
 
     st.markdown("### Change Password")
-    current_password = st.text_input("Current Password", type="password")
-    new_password = st.text_input("New Password", type="password")
-    confirm_password = st.text_input("Confirm New Password", type="password")
+    with st.form("change_password"):
+        current_password = st.text_input("Current Password", type="password")
+        new_password = st.text_input("New Password", type="password")
+        confirm_password = st.text_input("Confirm New Password", type="password")
 
-    if st.button("🔑 Update Password"):
-        if new_password == confirm_password and len(new_password) >= 8:
-            st.success("Password updated successfully!")
-        else:
-            st.error("Passwords must match and be at least 8 characters")
+        if st.form_submit_button("🔑 Update Password"):
+            if new_password == confirm_password and len(new_password) >= 8:
+                st.success("Password updated successfully!")
+            elif len(new_password) < 8:
+                st.error("Password must be at least 8 characters")
+            else:
+                st.error("Passwords do not match")
 
     st.markdown("---")
 
     st.markdown("### System Information")
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("""
+        st.markdown(f"""
         **Version:** 1.0.0
 
-        **Backend URL:** """ + BACKEND_URL + """
+        **Backend URL:** {BACKEND_URL}
 
         **Database:** PostgreSQL 15
         """)

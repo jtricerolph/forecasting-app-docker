@@ -32,14 +32,23 @@ class ResosClient:
 
     BASE_URL = "https://api.resos.com/v1"
 
-    def __init__(self):
-        self.api_key = os.getenv("RESOS_API_KEY")
+    def __init__(self, api_key: str = None):
+        # Use provided credentials or fall back to environment variables
+        self.api_key = api_key or os.getenv("RESOS_API_KEY")
         if self.api_key:
             # HTTP Basic Auth: base64_encode(api_key + ':')
             self.auth_header = f"Basic {base64.b64encode(f'{self.api_key}:'.encode()).decode()}"
         else:
             self.auth_header = None
             logger.warning("Resos API key not configured")
+
+    @classmethod
+    async def from_db(cls, db):
+        """Create client with credentials from database"""
+        from api.config import _get_config_value
+
+        api_key = await _get_config_value(db, "resos_api_key")
+        return cls(api_key=api_key)
 
     async def __aenter__(self):
         self.client = httpx.AsyncClient(timeout=30.0)

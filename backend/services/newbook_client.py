@@ -30,14 +30,27 @@ class NewbookClient:
 
     BASE_URL = "https://api.newbook.cloud/rest/"
 
-    def __init__(self):
-        self.api_key = os.getenv("NEWBOOK_API_KEY")
-        self.username = os.getenv("NEWBOOK_USERNAME")
-        self.password = os.getenv("NEWBOOK_PASSWORD")
-        self.region = os.getenv("NEWBOOK_REGION")
+    def __init__(self, api_key: str = None, username: str = None, password: str = None, region: str = None):
+        # Use provided credentials or fall back to environment variables
+        self.api_key = api_key or os.getenv("NEWBOOK_API_KEY")
+        self.username = username or os.getenv("NEWBOOK_USERNAME")
+        self.password = password or os.getenv("NEWBOOK_PASSWORD")
+        self.region = region or os.getenv("NEWBOOK_REGION")
 
         if not all([self.api_key, self.username, self.password, self.region]):
             logger.warning("Newbook credentials not fully configured")
+
+    @classmethod
+    async def from_db(cls, db):
+        """Create client with credentials from database"""
+        from api.config import _get_config_value
+
+        api_key = await _get_config_value(db, "newbook_api_key")
+        username = await _get_config_value(db, "newbook_username")
+        password = await _get_config_value(db, "newbook_password")
+        region = await _get_config_value(db, "newbook_region")
+
+        return cls(api_key=api_key, username=username, password=password, region=region)
 
     async def __aenter__(self):
         self.client = httpx.AsyncClient(timeout=60.0)

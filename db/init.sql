@@ -611,6 +611,36 @@ CREATE TABLE sync_log (
 );
 
 -- ============================================
+-- SYSTEM CONFIGURATION
+-- ============================================
+
+-- Store API credentials and system settings
+CREATE TABLE system_config (
+    id SERIAL PRIMARY KEY,
+    config_key VARCHAR(100) NOT NULL UNIQUE,
+    config_value TEXT,
+    is_encrypted BOOLEAN DEFAULT FALSE,
+    description TEXT,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    updated_by VARCHAR(100)
+);
+
+-- Default config entries (values to be set via GUI)
+INSERT INTO system_config (config_key, description) VALUES
+('newbook_api_key', 'Newbook API Key'),
+('newbook_username', 'Newbook Username'),
+('newbook_password', 'Newbook Password'),
+('newbook_region', 'Newbook Region Code'),
+('resos_api_key', 'Resos API Key'),
+('total_rooms', 'Total number of hotel rooms (for occupancy calculation)'),
+('hotel_name', 'Hotel/Property Name'),
+('timezone', 'Local timezone (e.g., Europe/London)');
+
+-- Set default values
+UPDATE system_config SET config_value = '80' WHERE config_key = 'total_rooms';
+UPDATE system_config SET config_value = 'Europe/London' WHERE config_key = 'timezone';
+
+-- ============================================
 -- BACKFILL TRACKING
 -- ============================================
 

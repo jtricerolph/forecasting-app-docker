@@ -16,7 +16,7 @@ from auth import (
     authenticate_user, create_access_token, get_current_user,
     ACCESS_TOKEN_EXPIRE_MINUTES
 )
-from api import forecast, sync, export, budget, accuracy, evolution, crossref, explain
+from api import forecast, sync, export, budget, accuracy, evolution, crossref, explain, config
 from scheduler import start_scheduler, shutdown_scheduler
 
 
@@ -55,6 +55,7 @@ app.include_router(accuracy.router, prefix="/accuracy", tags=["Accuracy"])
 app.include_router(evolution.router, prefix="/evolution", tags=["Forecast Evolution"])
 app.include_router(crossref.router, prefix="/crossref", tags=["Cross-Reference"])
 app.include_router(explain.router, prefix="/explain", tags=["Explainability"])
+app.include_router(config.router, prefix="/config", tags=["Configuration"])
 
 
 @app.get("/health")
