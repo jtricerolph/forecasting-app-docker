@@ -2409,6 +2409,8 @@ interface TFTSettings {
   use_gpu: boolean
   auto_retrain: boolean
   use_cached_model: boolean
+  use_special_dates: boolean
+  use_otb_data: boolean
 }
 
 interface TFTModel {
@@ -2788,6 +2790,32 @@ const TFTTrainingPage: React.FC = () => {
                 </label>
                 <span style={styles.settingHint}>Use trained model for previews</span>
               </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>
+                  <input
+                    type="checkbox"
+                    checked={settings.use_special_dates}
+                    onChange={(e) => setSettings({ ...settings, use_special_dates: e.target.checked })}
+                    style={styles.checkbox}
+                  />
+                  Include Special Dates
+                </label>
+                <span style={styles.settingHint}>Use holidays/events from Settings as features</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>
+                  <input
+                    type="checkbox"
+                    checked={settings.use_otb_data}
+                    onChange={(e) => setSettings({ ...settings, use_otb_data: e.target.checked })}
+                    style={styles.checkbox}
+                  />
+                  Include OTB Data
+                </label>
+                <span style={styles.settingHint}>Use On-The-Books pickup patterns as features</span>
+              </div>
             </div>
 
             <div style={styles.buttonRow}>
@@ -2931,6 +2959,18 @@ const TFTTrainingPage: React.FC = () => {
                 <div style={styles.modelMeta}>
                   <span>Trained: {new Date(model.trained_at).toLocaleString()}</span>
                   {model.created_by && <span>By: {model.created_by}</span>}
+                </div>
+                <div style={styles.modelMeta}>
+                  <span>Features: </span>
+                  {model.training_config?.use_special_dates !== false && (
+                    <span style={{ ...badgeStyle('info'), marginRight: spacing.xs }}>Special Dates</span>
+                  )}
+                  {model.training_config?.use_otb_data && (
+                    <span style={{ ...badgeStyle('info'), marginRight: spacing.xs }}>OTB Data</span>
+                  )}
+                  {!model.training_config?.use_special_dates && !model.training_config?.use_otb_data && (
+                    <span style={{ color: colors.textMuted }}>Base features only</span>
+                  )}
                 </div>
                 <div style={styles.modelActions}>
                   <button

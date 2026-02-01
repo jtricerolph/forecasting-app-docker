@@ -49,7 +49,7 @@ def get_tft_config_from_db(db) -> Dict[str, Any]:
                 config[key] = int(value) if value else 0
             elif key in ('learning_rate', 'dropout'):
                 config[key] = float(value) if value else 0.0
-            elif key in ('use_gpu', 'auto_retrain', 'use_cached_model'):
+            elif key in ('use_gpu', 'auto_retrain', 'use_cached_model', 'use_special_dates', 'use_otb_data'):
                 config[key] = value.lower() == 'true' if value else False
             else:
                 config[key] = value
@@ -75,6 +75,8 @@ def get_effective_config(db=None) -> Dict[str, Any]:
         'training_days': DEFAULT_TRAINING_DAYS,
         'use_gpu': False,
         'use_cached_model': True,
+        'use_special_dates': True,
+        'use_otb_data': True,
     }
 
     # Override with database values if available
@@ -350,11 +352,29 @@ async def _generate_forecasts_from_pretrained_model(
         } for row in rows])
         df = df.sort_values('ds').reset_index(drop=True)
 
-        # Load holidays
-        holidays_df = await _load_holidays(forecast_from, forecast_to)
+        # Check if model was trained with special dates and/or OTB features
+        training_config = checkpoint.get("training_config", {})
+        use_special_dates = training_config.get("use_special_dates", True)
+        use_otb_data = training_config.get("use_otb_data", False)
+
+        # Load holidays if model was trained with special dates
+        holidays_df = None
+        if use_special_dates:
+            holidays_df = await _load_holidays(forecast_from, forecast_to)
 
         # Create features
         df = create_tft_features(df, holidays_df)
+
+        # Load and add OTB features if model was trained with them
+        if use_otb_data:
+            otb_df = _load_otb_data_for_inference(db, context_from, forecast_from)
+            if otb_df is not None and len(otb_df) > 0:
+                df = _add_otb_features_for_inference(df, otb_df)
+                logger.info("Added OTB features for inference")
+            else:
+                # Add zero defaults if no OTB data available
+                df = _add_otb_features_for_inference(df, None)
+                logger.info("No OTB data found - using zero defaults for inference")
 
         # Add time index and group
         df['time_idx'] = range(len(df))
@@ -426,7 +446,8 @@ async def _generate_forecasts_from_pretrained_model(
         forecasts = await _generate_forecasts(
             db, model, training, df, metric_code,
             forecast_from, forecast_to, holidays_df,
-            known_reals, unknown_reals
+            known_reals, unknown_reals,
+            use_otb_data=use_otb_data
         )
 
         return forecasts
@@ -440,7 +461,8 @@ async def _generate_forecasts_from_pretrained_model(
 
 async def _generate_forecasts(
     db, model, training_dataset, historical_df, metric_code,
-    forecast_from, forecast_to, holidays_df, time_varying_known, time_varying_unknown
+    forecast_from, forecast_to, holidays_df, time_varying_known, time_varying_unknown,
+    use_otb_data: bool = False
 ) -> List[dict]:
     """Generate forecasts and store in database with explanations."""
     import torch
@@ -460,9 +482,35 @@ async def _generate_forecasts(
     combined['time_idx'] = range(len(combined))
     combined['group'] = metric_code
 
+    # Add OTB features for future dates if needed
+    if use_otb_data:
+        # If historical_df already has OTB columns, we just need to fill future rows
+        if 'otb_at_30d' not in combined.columns:
+            # No OTB columns exist, add defaults
+            combined = _add_otb_features_for_inference(combined, None)
+        else:
+            # OTB columns exist from historical, load current OTB for future dates
+            otb_future = _load_otb_data_for_inference(db, forecast_from, forecast_to)
+            if otb_future is not None and len(otb_future) > 0:
+                # Map future OTB data to the combined dataframe
+                otb_future['date_only'] = pd.to_datetime(otb_future['arrival_date']).dt.date
+                combined['date_only_temp'] = combined['ds'].dt.date
+                otb_lookup = otb_future.set_index('date_only')
+
+                # Fill in OTB for future dates
+                for idx in combined[combined['ds'] >= pd.Timestamp(forecast_from)].index:
+                    d = combined.loc[idx, 'date_only_temp']
+                    if d in otb_lookup.index:
+                        row = otb_lookup.loc[d]
+                        combined.loc[idx, 'otb_at_30d'] = row.get('otb_at_30d', 0)
+                        combined.loc[idx, 'otb_at_14d'] = row.get('otb_at_14d', 0)
+                        combined.loc[idx, 'otb_at_7d'] = row.get('otb_at_7d', 0)
+
+                combined = combined.drop(columns=['date_only_temp'], errors='ignore')
+
     # Forward fill lag and rolling features for future dates
     for col in combined.columns:
-        if col.startswith('lag_') or col.startswith('rolling_'):
+        if col.startswith('lag_') or col.startswith('rolling_') or col.startswith('otb_') or col.startswith('pickup_'):
             combined[col] = combined[col].ffill()
 
     # Get room capacity for capping (if applicable)
@@ -711,6 +759,115 @@ async def _load_holidays(from_date: date, to_date: date, db=None) -> pd.DataFram
         import traceback
         logger.debug(traceback.format_exc())
         return pd.DataFrame()
+
+
+def _load_otb_data_for_inference(db, from_date: date, to_date: date) -> Optional[pd.DataFrame]:
+    """
+    Load OTB (On-The-Books) data for inference.
+
+    Returns DataFrame with columns:
+    - arrival_date
+    - otb_at_90d, otb_at_60d, otb_at_30d, otb_at_14d, otb_at_7d, final_bookings
+    """
+    try:
+        result = db.execute(text("""
+            SELECT
+                arrival_date,
+                d90 as otb_at_90d,
+                d60 as otb_at_60d,
+                d30 as otb_at_30d,
+                d14 as otb_at_14d,
+                d7 as otb_at_7d,
+                d0 as final_bookings
+            FROM newbook_booking_pace
+            WHERE arrival_date BETWEEN :from_date AND :to_date
+            ORDER BY arrival_date
+        """), {"from_date": from_date, "to_date": to_date})
+        rows = result.fetchall()
+
+        if not rows:
+            logger.debug("No OTB data found in booking_pace table for inference")
+            return None
+
+        df = pd.DataFrame([{
+            "arrival_date": row.arrival_date,
+            "otb_at_90d": float(row.otb_at_90d) if row.otb_at_90d else 0,
+            "otb_at_60d": float(row.otb_at_60d) if row.otb_at_60d else 0,
+            "otb_at_30d": float(row.otb_at_30d) if row.otb_at_30d else 0,
+            "otb_at_14d": float(row.otb_at_14d) if row.otb_at_14d else 0,
+            "otb_at_7d": float(row.otb_at_7d) if row.otb_at_7d else 0,
+            "final_bookings": float(row.final_bookings) if row.final_bookings else 0
+        } for row in rows])
+
+        logger.debug(f"Loaded OTB data for {len(df)} dates for inference")
+        return df
+
+    except Exception as e:
+        logger.warning(f"Failed to load OTB data for inference: {e}")
+        return None
+
+
+def _add_otb_features_for_inference(df: pd.DataFrame, otb_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Add OTB features for inference (matching the training features).
+    """
+    df = df.copy()
+
+    if otb_df is None or len(otb_df) == 0:
+        # No OTB data - set defaults
+        df['otb_at_30d'] = 0
+        df['otb_at_14d'] = 0
+        df['otb_at_7d'] = 0
+        df['pickup_30d_to_14d'] = 0
+        df['pickup_14d_to_7d'] = 0
+        df['otb_pct_at_30d'] = 0
+        df['otb_pct_at_14d'] = 0
+        df['otb_pct_at_7d'] = 0
+        return df
+
+    # Create date column for merging
+    df['date_only'] = df['ds'].dt.date
+
+    # Merge OTB data
+    otb_df = otb_df.copy()
+    otb_df['date_only'] = pd.to_datetime(otb_df['arrival_date']).dt.date
+
+    df = df.merge(
+        otb_df[['date_only', 'otb_at_90d', 'otb_at_60d', 'otb_at_30d',
+                'otb_at_14d', 'otb_at_7d', 'final_bookings']],
+        on='date_only',
+        how='left'
+    )
+
+    # Fill NaN with 0
+    for col in ['otb_at_90d', 'otb_at_60d', 'otb_at_30d', 'otb_at_14d', 'otb_at_7d', 'final_bookings']:
+        df[col] = df[col].fillna(0)
+
+    # Calculate pickup between windows
+    df['pickup_30d_to_14d'] = df['otb_at_14d'] - df['otb_at_30d']
+    df['pickup_14d_to_7d'] = df['otb_at_7d'] - df['otb_at_14d']
+
+    # Calculate OTB as percentage of final (capped at 100%)
+    df['otb_pct_at_30d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_30d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+    df['otb_pct_at_14d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_14d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+    df['otb_pct_at_7d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_7d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+
+    # Drop temporary column
+    df = df.drop(columns=['date_only'], errors='ignore')
+
+    return df
 
 
 # Import for TimeSeriesDataSet (used in _generate_forecasts)
