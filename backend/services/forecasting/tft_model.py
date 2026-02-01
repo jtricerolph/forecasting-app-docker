@@ -16,15 +16,86 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
-# Model configuration
-ENCODER_LENGTH = 60      # 60 days of historical context
-PREDICTION_LENGTH = 28   # 28 days ahead forecast
-MAX_EPOCHS = 50
-BATCH_SIZE = 64
-LEARNING_RATE = 0.001
-HIDDEN_SIZE = 32
-ATTENTION_HEAD_SIZE = 4
-DROPOUT = 0.1
+# Default model configuration (can be overridden by database settings)
+DEFAULT_ENCODER_LENGTH = 60      # 60 days of historical context
+DEFAULT_PREDICTION_LENGTH = 28   # 28 days ahead forecast
+DEFAULT_MAX_EPOCHS = 50
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_LEARNING_RATE = 0.001
+DEFAULT_HIDDEN_SIZE = 32
+DEFAULT_ATTENTION_HEAD_SIZE = 4
+DEFAULT_DROPOUT = 0.1
+DEFAULT_TRAINING_DAYS = 2555
+
+
+def get_tft_config_from_db(db) -> Dict[str, Any]:
+    """Load TFT configuration from database system_config table."""
+    try:
+        result = db.execute(text("""
+            SELECT config_key, config_value
+            FROM system_config
+            WHERE config_key LIKE 'tft_%'
+        """))
+        rows = result.fetchall()
+
+        config = {}
+        for row in rows:
+            key = row.config_key.replace('tft_', '')
+            value = row.config_value
+
+            # Convert to appropriate types
+            if key in ('encoder_length', 'prediction_length', 'hidden_size',
+                       'attention_heads', 'batch_size', 'max_epochs', 'training_days'):
+                config[key] = int(value) if value else 0
+            elif key in ('learning_rate', 'dropout'):
+                config[key] = float(value) if value else 0.0
+            elif key in ('use_gpu', 'auto_retrain', 'use_cached_model'):
+                config[key] = value.lower() == 'true' if value else False
+            else:
+                config[key] = value
+
+        return config
+    except Exception as e:
+        logger.warning(f"Failed to load TFT config from database: {e}")
+        return {}
+
+
+def get_effective_config(db=None) -> Dict[str, Any]:
+    """Get effective TFT config, merging DB values with defaults."""
+    # Start with defaults
+    config = {
+        'encoder_length': DEFAULT_ENCODER_LENGTH,
+        'prediction_length': DEFAULT_PREDICTION_LENGTH,
+        'max_epochs': DEFAULT_MAX_EPOCHS,
+        'batch_size': DEFAULT_BATCH_SIZE,
+        'learning_rate': DEFAULT_LEARNING_RATE,
+        'hidden_size': DEFAULT_HIDDEN_SIZE,
+        'attention_heads': DEFAULT_ATTENTION_HEAD_SIZE,
+        'dropout': DEFAULT_DROPOUT,
+        'training_days': DEFAULT_TRAINING_DAYS,
+        'use_gpu': False,
+        'use_cached_model': True,
+    }
+
+    # Override with database values if available
+    if db:
+        db_config = get_tft_config_from_db(db)
+        for key, value in db_config.items():
+            if value is not None and key in config:
+                config[key] = value
+
+    return config
+
+
+# Keep legacy constants for backward compatibility
+ENCODER_LENGTH = DEFAULT_ENCODER_LENGTH
+PREDICTION_LENGTH = DEFAULT_PREDICTION_LENGTH
+MAX_EPOCHS = DEFAULT_MAX_EPOCHS
+BATCH_SIZE = DEFAULT_BATCH_SIZE
+LEARNING_RATE = DEFAULT_LEARNING_RATE
+HIDDEN_SIZE = DEFAULT_HIDDEN_SIZE
+ATTENTION_HEAD_SIZE = DEFAULT_ATTENTION_HEAD_SIZE
+DROPOUT = DEFAULT_DROPOUT
 
 
 def create_tft_features(df: pd.DataFrame, holidays_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
@@ -127,9 +198,10 @@ async def run_tft_forecast(
     metric_code: str,
     forecast_from: date,
     forecast_to: date,
-    training_days: int = 2555,  # ~7 years, same as Prophet/XGBoost
-    use_gpu: bool = False,
-    save_model: bool = True
+    training_days: int = None,  # Load from DB config if None
+    use_gpu: bool = None,  # Load from DB config if None
+    save_model: bool = True,
+    force_retrain: bool = False  # Force training even if cached model exists
 ) -> List[dict]:
     """
     Run TFT forecast for a metric.
@@ -137,14 +209,18 @@ async def run_tft_forecast(
     Uses same data source as Prophet/XGBoost (newbook_bookings_stats table).
     Applies same floor/cap logic as pickup model.
 
+    If a cached model exists and use_cached_model is enabled, uses the cached
+    model for faster predictions. Set force_retrain=True to train a new model.
+
     Args:
         db: Database session
         metric_code: Metric to forecast
         forecast_from: Start date for forecasts
         forecast_to: End date for forecasts
-        training_days: Days of historical data to use
-        use_gpu: Whether to use GPU acceleration
+        training_days: Days of historical data to use (None = from DB)
+        use_gpu: Whether to use GPU acceleration (None = from DB)
         save_model: Whether to persist trained model
+        force_retrain: Force training even if cached model exists
 
     Returns:
         List of forecast records
@@ -160,10 +236,34 @@ async def run_tft_forecast(
         import warnings
         warnings.filterwarnings("ignore", category=UserWarning)
 
+        # Load configuration from database
+        config = get_effective_config(db)
+
+        # Use provided values or fall back to config
+        if training_days is None:
+            training_days = config['training_days']
+        if use_gpu is None:
+            use_gpu = config['use_gpu']
+
+        use_cached = config.get('use_cached_model', True)
+
         # Check GPU availability
         device = "gpu" if use_gpu and torch.cuda.is_available() else "cpu"
         accelerator = "cuda" if device == "gpu" else "cpu"
-        logger.info(f"TFT training for {metric_code} on {device}")
+        logger.info(f"TFT forecast for {metric_code} on {device}")
+
+        # Try to load cached model if not forcing retrain
+        if use_cached and not force_retrain:
+            cached_model, checkpoint = await _try_load_cached_model(db, metric_code)
+            if cached_model is not None:
+                logger.info(f"Using cached TFT model for {metric_code}")
+                # Generate predictions using cached model
+                return await _generate_forecasts_from_cached_model(
+                    db, cached_model, checkpoint, metric_code,
+                    forecast_from, forecast_to
+                )
+
+        logger.info(f"Training new TFT model for {metric_code}")
 
         # Get historical data from newbook_bookings_stats (forecast_data database)
         training_from = forecast_from - timedelta(days=training_days + ENCODER_LENGTH)
@@ -574,3 +674,147 @@ try:
     from pytorch_forecasting import TimeSeriesDataSet
 except ImportError:
     TimeSeriesDataSet = None
+
+
+async def _try_load_cached_model(db, metric_code: str):
+    """
+    Try to load a cached TFT model for the given metric.
+
+    Returns:
+        Tuple of (model, checkpoint) if found, (None, None) otherwise
+    """
+    try:
+        from services.model_storage import load_model
+        model, checkpoint = load_model(db, metric_code)
+        return model, checkpoint
+    except Exception as e:
+        logger.warning(f"Failed to load cached model for {metric_code}: {e}")
+        return None, None
+
+
+async def _generate_forecasts_from_cached_model(
+    db, model, checkpoint, metric_code: str,
+    forecast_from: date, forecast_to: date
+) -> List[dict]:
+    """
+    Generate forecasts using a cached TFT model.
+
+    This function rebuilds the dataset and generates predictions without
+    retraining the model.
+    """
+    try:
+        import torch
+        from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+        import pandas as pd
+        import numpy as np
+
+        logger.info(f"Generating forecasts from cached model for {metric_code}")
+
+        # Get effective config
+        config = get_effective_config(db)
+        encoder_length = config['encoder_length']
+        prediction_length = config['prediction_length']
+        training_days = config['training_days']
+
+        # Load historical data needed for encoder context
+        training_from = forecast_from - timedelta(days=training_days + encoder_length)
+
+        # Map metric to column
+        metric_column_map = {
+            'hotel_occupancy_pct': 'total_occupancy_pct',
+            'hotel_room_nights': 'booking_count',
+            'hotel_guests': 'guests_count',
+        }
+
+        column_name = metric_column_map.get(metric_code)
+        if not column_name:
+            logger.warning(f"Unknown metric_code for TFT: {metric_code}")
+            return []
+
+        result = db.execute(
+            text(f"""
+            SELECT date, {column_name} as actual_value
+            FROM newbook_bookings_stats
+            WHERE date BETWEEN :from_date AND :to_date
+                AND {column_name} IS NOT NULL
+            ORDER BY date
+            """),
+            {
+                "from_date": training_from,
+                "to_date": forecast_from - timedelta(days=1)
+            }
+        )
+        rows = result.fetchall()
+
+        if len(rows) < encoder_length + 30:
+            logger.warning(f"Insufficient data for TFT prediction: {len(rows)} rows")
+            return []
+
+        # Prepare DataFrame
+        df = pd.DataFrame([{
+            "ds": pd.Timestamp(row.date),
+            "y": float(row.actual_value)
+        } for row in rows])
+        df = df.sort_values('ds').reset_index(drop=True)
+
+        # Load holidays
+        holidays_df = await _load_holidays(forecast_from, forecast_to)
+
+        # Create features
+        df = create_tft_features(df, holidays_df)
+
+        # Add time index and group
+        df['time_idx'] = range(len(df))
+        df['group'] = metric_code
+
+        # Drop NaN from lag features
+        df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
+
+        # Define feature columns (same as training)
+        time_varying_known = [
+            'day_of_week', 'month', 'week_of_year', 'is_weekend',
+            'is_holiday', 'days_to_holiday',
+            'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
+        ]
+
+        time_varying_unknown = [
+            'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
+            'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
+            'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
+        ]
+
+        if 'lag_364' in df.columns and df['lag_364'].notna().sum() > 30:
+            time_varying_unknown.append('lag_364')
+
+        # Recreate the training dataset structure
+        training = TimeSeriesDataSet(
+            df.copy(),
+            time_idx="time_idx",
+            target="y",
+            group_ids=["group"],
+            min_encoder_length=encoder_length // 2,
+            max_encoder_length=encoder_length,
+            min_prediction_length=1,
+            max_prediction_length=prediction_length,
+            static_categoricals=["group"],
+            time_varying_known_reals=time_varying_known,
+            time_varying_unknown_reals=time_varying_unknown,
+            add_relative_time_idx=True,
+            add_target_scales=True,
+            add_encoder_length=True,
+        )
+
+        # Generate forecasts using the same logic as _generate_forecasts
+        forecasts = await _generate_forecasts(
+            db, model, training, df, metric_code,
+            forecast_from, forecast_to, holidays_df,
+            time_varying_known, time_varying_unknown
+        )
+
+        return forecasts
+
+    except Exception as e:
+        logger.error(f"Failed to generate forecasts from cached model: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return []

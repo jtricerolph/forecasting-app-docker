@@ -2,12 +2,14 @@
 Configuration API endpoints
 Manage system configuration including API credentials
 """
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from pydantic import BaseModel
 import base64
+import io
 
 from database import get_db
 from auth import get_current_user
@@ -784,3 +786,473 @@ async def _test_resos(db: AsyncSession):
         raise HTTPException(status_code=400, detail="Connection timed out")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ============================================
+# TFT MODEL SETTINGS AND MANAGEMENT
+# ============================================
+
+class TFTSettingsResponse(BaseModel):
+    encoder_length: int = 90
+    prediction_length: int = 28
+    hidden_size: int = 64
+    attention_heads: int = 4
+    learning_rate: float = 0.001
+    batch_size: int = 128
+    max_epochs: int = 100
+    training_days: int = 2555
+    dropout: float = 0.1
+    use_gpu: bool = False
+    auto_retrain: bool = True
+    use_cached_model: bool = True
+
+
+class TFTSettingsUpdate(BaseModel):
+    encoder_length: Optional[int] = None
+    prediction_length: Optional[int] = None
+    hidden_size: Optional[int] = None
+    attention_heads: Optional[int] = None
+    learning_rate: Optional[float] = None
+    batch_size: Optional[int] = None
+    max_epochs: Optional[int] = None
+    training_days: Optional[int] = None
+    dropout: Optional[float] = None
+    use_gpu: Optional[bool] = None
+    auto_retrain: Optional[bool] = None
+    use_cached_model: Optional[bool] = None
+
+
+class TFTModelResponse(BaseModel):
+    id: int
+    metric_code: str
+    model_name: str
+    file_path: Optional[str]
+    file_size_bytes: Optional[int]
+    trained_at: str
+    training_config: dict
+    training_time_seconds: Optional[int]
+    validation_loss: Optional[float]
+    epochs_completed: Optional[int]
+    is_active: bool
+    created_by: Optional[str]
+    notes: Optional[str]
+
+
+class TFTTrainRequest(BaseModel):
+    metric_code: str
+    model_name: Optional[str] = None
+
+
+class TFTImportRequest(BaseModel):
+    metric_code: str
+    model_name: str
+
+
+@router.get("/tft-settings", response_model=TFTSettingsResponse)
+async def get_tft_settings(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Get TFT model training settings"""
+    result = await db.execute(text("""
+        SELECT config_key, config_value
+        FROM system_config
+        WHERE config_key LIKE 'tft_%'
+    """))
+    rows = result.fetchall()
+
+    settings = {}
+    for row in rows:
+        key = row.config_key.replace('tft_', '')
+        value = row.config_value
+
+        # Convert to appropriate types
+        if key in ('encoder_length', 'prediction_length', 'hidden_size',
+                   'attention_heads', 'batch_size', 'max_epochs', 'training_days'):
+            settings[key] = int(value) if value else 0
+        elif key in ('learning_rate', 'dropout'):
+            settings[key] = float(value) if value else 0.0
+        elif key in ('use_gpu', 'auto_retrain', 'use_cached_model'):
+            settings[key] = value.lower() == 'true' if value else False
+        else:
+            settings[key] = value
+
+    return TFTSettingsResponse(**settings)
+
+
+@router.post("/tft-settings")
+async def update_tft_settings(
+    settings: TFTSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Update TFT model training settings"""
+    username = current_user.get("username")
+    updated = []
+
+    for field, value in settings.model_dump(exclude_none=True).items():
+        config_key = f"tft_{field}"
+        config_value = str(value).lower() if isinstance(value, bool) else str(value)
+
+        await db.execute(text("""
+            UPDATE system_config
+            SET config_value = :value, updated_at = NOW(), updated_by = :username
+            WHERE config_key = :key
+        """), {"key": config_key, "value": config_value, "username": username})
+        updated.append(field)
+
+    await db.commit()
+    return {"status": "saved", "updated": updated}
+
+
+@router.get("/tft-models")
+async def list_tft_models(
+    metric_code: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """List all saved TFT models"""
+    if metric_code:
+        result = await db.execute(text("""
+            SELECT * FROM tft_models
+            WHERE metric_code = :metric_code
+            ORDER BY trained_at DESC
+        """), {"metric_code": metric_code})
+    else:
+        result = await db.execute(text("""
+            SELECT * FROM tft_models
+            ORDER BY metric_code, trained_at DESC
+        """))
+
+    models = []
+    for row in result.fetchall():
+        models.append({
+            "id": row.id,
+            "metric_code": row.metric_code,
+            "model_name": row.model_name,
+            "file_path": row.file_path,
+            "file_size_bytes": row.file_size_bytes,
+            "trained_at": row.trained_at.isoformat() if row.trained_at else None,
+            "training_config": row.training_config if row.training_config else {},
+            "training_time_seconds": row.training_time_seconds,
+            "validation_loss": float(row.validation_loss) if row.validation_loss else None,
+            "epochs_completed": row.epochs_completed,
+            "is_active": row.is_active,
+            "created_by": row.created_by,
+            "notes": row.notes
+        })
+
+    return models
+
+
+@router.post("/tft-models/train")
+async def start_tft_training(
+    request: TFTTrainRequest,
+    background_tasks: "BackgroundTasks",
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Start TFT model training in background"""
+    from fastapi import BackgroundTasks
+    import uuid
+    from datetime import datetime
+
+    username = current_user.get("username", "unknown")
+    model_name = request.model_name or f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Get current settings
+    result = await db.execute(text("""
+        SELECT config_key, config_value FROM system_config WHERE config_key LIKE 'tft_%'
+    """))
+    settings = {row.config_key.replace('tft_', ''): row.config_value for row in result.fetchall()}
+    max_epochs = int(settings.get('max_epochs', 100))
+
+    # Create job record
+    job_id = str(uuid.uuid4())
+    await db.execute(text("""
+        INSERT INTO tft_training_jobs (job_id, metric_code, total_epochs, created_by)
+        VALUES (:job_id, :metric_code, :total_epochs, :created_by)
+    """), {
+        "job_id": job_id,
+        "metric_code": request.metric_code,
+        "total_epochs": max_epochs,
+        "created_by": username
+    })
+    await db.commit()
+
+    # Start background training
+    background_tasks.add_task(
+        _run_tft_training,
+        job_id,
+        request.metric_code,
+        model_name,
+        username
+    )
+
+    return {"status": "started", "job_id": job_id, "metric_code": request.metric_code}
+
+
+@router.get("/tft-models/training-status/{job_id}")
+async def get_training_status(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Get training job status"""
+    result = await db.execute(text("""
+        SELECT * FROM tft_training_jobs WHERE job_id = :job_id
+    """), {"job_id": job_id})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    return {
+        "job_id": str(row.job_id),
+        "metric_code": row.metric_code,
+        "status": row.status,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "progress_pct": row.progress_pct,
+        "current_epoch": row.current_epoch,
+        "total_epochs": row.total_epochs,
+        "error_message": row.error_message
+    }
+
+
+from fastapi.responses import StreamingResponse
+import io
+
+
+@router.get("/tft-models/{model_id}/download")
+async def download_model(
+    model_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Download a trained model file"""
+    result = await db.execute(text("""
+        SELECT file_path, model_name, metric_code FROM tft_models WHERE id = :id
+    """), {"id": model_id})
+    row = result.fetchone()
+
+    if not row or not row.file_path:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    from pathlib import Path
+    file_path = Path(row.file_path)
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Model file not found on disk")
+
+    with open(file_path, "rb") as f:
+        content = f.read()
+
+    filename = f"{row.metric_code}_{row.model_name}.pt"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+from fastapi import UploadFile, File, Form
+
+
+@router.post("/tft-models/upload")
+async def upload_model(
+    file: UploadFile = File(...),
+    metric_code: str = Form(...),
+    model_name: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Upload/import a trained model file"""
+    import torch
+    from pathlib import Path
+    from datetime import datetime
+
+    username = current_user.get("username", "import")
+
+    # Read file content
+    content = await file.read()
+
+    # Validate it's a valid PyTorch file
+    try:
+        buffer = io.BytesIO(content)
+        checkpoint = torch.load(buffer, map_location="cpu")
+        if "model_state_dict" not in checkpoint:
+            raise HTTPException(status_code=400, detail="Invalid model file: missing model_state_dict")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid model file: {str(e)}")
+
+    # Save to disk
+    model_dir = Path("/app/models/tft") / metric_code
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = model_name.replace(" ", "_").lower()
+    filename = f"{safe_name}_{timestamp}.pt"
+    file_path = model_dir / filename
+
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # Get config from checkpoint
+    training_config = checkpoint.get("training_config", {})
+
+    # Register in database
+    await db.execute(text("""
+        INSERT INTO tft_models (
+            metric_code, model_name, file_path, file_size_bytes,
+            training_config, is_active, created_by, notes
+        ) VALUES (
+            :metric_code, :model_name, :file_path, :file_size,
+            :config, FALSE, :created_by, 'Imported model'
+        )
+    """), {
+        "metric_code": metric_code,
+        "model_name": model_name,
+        "file_path": str(file_path),
+        "file_size": len(content),
+        "config": training_config,
+        "created_by": username
+    })
+    await db.commit()
+
+    return {"status": "uploaded", "metric_code": metric_code, "model_name": model_name}
+
+
+@router.post("/tft-models/{model_id}/activate")
+async def activate_model(
+    model_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Set a model as the active model for predictions"""
+    # Get model info
+    result = await db.execute(text("""
+        SELECT metric_code FROM tft_models WHERE id = :id
+    """), {"id": model_id})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    metric_code = row.metric_code
+
+    # Deactivate all models for this metric
+    await db.execute(text("""
+        UPDATE tft_models SET is_active = FALSE WHERE metric_code = :metric_code
+    """), {"metric_code": metric_code})
+
+    # Activate the specified model
+    await db.execute(text("""
+        UPDATE tft_models SET is_active = TRUE WHERE id = :id
+    """), {"id": model_id})
+
+    await db.commit()
+    return {"status": "activated", "model_id": model_id, "metric_code": metric_code}
+
+
+@router.delete("/tft-models/{model_id}")
+async def delete_model(
+    model_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a model"""
+    from pathlib import Path
+
+    # Get model info
+    result = await db.execute(text("""
+        SELECT file_path, is_active FROM tft_models WHERE id = :id
+    """), {"id": model_id})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    if row.is_active:
+        raise HTTPException(status_code=400, detail="Cannot delete active model")
+
+    # Delete file if exists
+    if row.file_path:
+        file_path = Path(row.file_path)
+        if file_path.exists():
+            file_path.unlink()
+
+    # Delete from database
+    await db.execute(text("DELETE FROM tft_models WHERE id = :id"), {"id": model_id})
+    await db.commit()
+
+    return {"status": "deleted", "model_id": model_id}
+
+
+async def _run_tft_training(job_id: str, metric_code: str, model_name: str, created_by: str):
+    """Background task to run TFT training"""
+    from database import SyncSessionLocal
+    from sqlalchemy import text
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db = SyncSessionLocal()
+
+    try:
+        # Update job status to running
+        db.execute(text("""
+            UPDATE tft_training_jobs
+            SET status = 'running', started_at = NOW()
+            WHERE job_id = :job_id
+        """), {"job_id": job_id})
+        db.commit()
+
+        # Get TFT settings
+        result = db.execute(text("""
+            SELECT config_key, config_value FROM system_config WHERE config_key LIKE 'tft_%'
+        """))
+        settings = {}
+        for row in result.fetchall():
+            key = row.config_key.replace('tft_', '')
+            value = row.config_value
+            if key in ('encoder_length', 'prediction_length', 'hidden_size',
+                       'attention_heads', 'batch_size', 'max_epochs', 'training_days'):
+                settings[key] = int(value) if value else 0
+            elif key in ('learning_rate', 'dropout'):
+                settings[key] = float(value) if value else 0.0
+            elif key in ('use_gpu', 'auto_retrain', 'use_cached_model'):
+                settings[key] = value.lower() == 'true' if value else False
+
+        # Import and run TFT training
+        from services.forecasting.tft_trainer import train_tft_model_with_progress
+
+        result = train_tft_model_with_progress(
+            db=db,
+            metric_code=metric_code,
+            model_name=model_name,
+            config=settings,
+            job_id=job_id,
+            created_by=created_by
+        )
+
+        # Update job status
+        db.execute(text("""
+            UPDATE tft_training_jobs
+            SET status = 'completed', completed_at = NOW(), progress_pct = 100
+            WHERE job_id = :job_id
+        """), {"job_id": job_id})
+        db.commit()
+
+        logger.info(f"TFT training completed for {metric_code}")
+
+    except Exception as e:
+        logger.error(f"TFT training failed: {e}")
+        db.execute(text("""
+            UPDATE tft_training_jobs
+            SET status = 'failed', completed_at = NOW(), error_message = :error
+            WHERE job_id = :job_id
+        """), {"job_id": job_id, "error": str(e)})
+        db.commit()
+
+    finally:
+        db.close()

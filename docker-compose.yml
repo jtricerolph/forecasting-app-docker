@@ -37,6 +37,8 @@ services:
       - NEWBOOK_REGION=${NEWBOOK_REGION}
       - RESOS_API_KEY=${RESOS_API_KEY}
       - TFT_USE_GPU=false
+    volumes:
+      - tft_models:/app/models/tft
     depends_on:
       db:
         condition: service_healthy
@@ -69,6 +71,8 @@ services:
       - NEWBOOK_REGION=${NEWBOOK_REGION}
       - RESOS_API_KEY=${RESOS_API_KEY}
       - TFT_USE_GPU=false
+    volumes:
+      - tft_models:/app/models/tft
     depends_on:
       db:
         condition: service_healthy
@@ -99,3 +103,4 @@ services:
 
 volumes:
   postgres_data:
+  tft_models:

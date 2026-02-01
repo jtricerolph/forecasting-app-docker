@@ -13,7 +13,7 @@ import {
   shadows,
 } from '../utils/theme'
 
-type SettingsPage = 'newbook' | 'users' | 'database' | 'special-dates'
+type SettingsPage = 'newbook' | 'users' | 'database' | 'special-dates' | 'tft-training'
 
 const Settings: React.FC = () => {
   const [activePage, setActivePage] = useState<SettingsPage>('newbook')
@@ -21,6 +21,7 @@ const Settings: React.FC = () => {
   const menuItems: { id: SettingsPage; label: string }[] = [
     { id: 'newbook', label: 'Newbook' },
     { id: 'special-dates', label: 'Special Dates' },
+    { id: 'tft-training', label: 'TFT Training' },
     { id: 'users', label: 'Users' },
     { id: 'database', label: 'Database Browser' },
   ]
@@ -48,6 +49,7 @@ const Settings: React.FC = () => {
       <main style={styles.content}>
         {activePage === 'newbook' && <NewbookPage />}
         {activePage === 'special-dates' && <SpecialDatesPage />}
+        {activePage === 'tft-training' && <TFTTrainingPage />}
         {activePage === 'users' && <UsersPage />}
         {activePage === 'database' && <DatabasePage />}
       </main>
@@ -2391,6 +2393,583 @@ const SpecialDatesPage: React.FC = () => {
 }
 
 // ============================================
+// TFT TRAINING PAGE
+// ============================================
+
+interface TFTSettings {
+  encoder_length: number
+  prediction_length: number
+  hidden_size: number
+  attention_heads: number
+  learning_rate: number
+  batch_size: number
+  max_epochs: number
+  training_days: number
+  dropout: number
+  use_gpu: boolean
+  auto_retrain: boolean
+  use_cached_model: boolean
+}
+
+interface TFTModel {
+  id: number
+  metric_code: string
+  model_name: string
+  file_path: string | null
+  file_size_bytes: number | null
+  trained_at: string
+  training_config: Record<string, number | boolean>
+  training_time_seconds: number | null
+  validation_loss: number | null
+  epochs_completed: number | null
+  is_active: boolean
+  created_by: string | null
+  notes: string | null
+}
+
+interface TrainingJob {
+  job_id: string
+  metric_code: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  started_at: string | null
+  completed_at: string | null
+  progress_pct: number
+  current_epoch: number
+  total_epochs: number
+  error_message: string | null
+}
+
+const TFTTrainingPage: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [settings, setSettings] = useState<TFTSettings | null>(null)
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
+  const [selectedMetric, setSelectedMetric] = useState('hotel_occupancy_pct')
+  const [modelName, setModelName] = useState('')
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle')
+  const [uploadMessage, setUploadMessage] = useState('')
+  const fileInputRef = React.useRef<HTMLInputElement>(null)
+
+  // Fetch TFT settings
+  const { data: settingsData, isLoading: settingsLoading } = useQuery<TFTSettings>({
+    queryKey: ['tft-settings'],
+    queryFn: async () => {
+      const response = await fetch('/api/config/tft-settings', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch settings')
+      return response.json()
+    },
+  })
+
+  // Fetch TFT models
+  const { data: models, isLoading: modelsLoading, refetch: refetchModels } = useQuery<TFTModel[]>({
+    queryKey: ['tft-models'],
+    queryFn: async () => {
+      const response = await fetch('/api/config/tft-models', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+  })
+
+  // Update local state when settings load
+  React.useEffect(() => {
+    if (settingsData) {
+      setSettings(settingsData)
+    }
+  }, [settingsData])
+
+  // Poll training job status
+  React.useEffect(() => {
+    if (trainingJob && ['pending', 'running'].includes(trainingJob.status)) {
+      const interval = setInterval(async () => {
+        try {
+          const response = await fetch(`/api/config/tft-models/training-status/${trainingJob.job_id}`, {
+            headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+          })
+          if (response.ok) {
+            const job: TrainingJob = await response.json()
+            setTrainingJob(job)
+            if (['completed', 'failed'].includes(job.status)) {
+              clearInterval(interval)
+              refetchModels()
+            }
+          }
+        } catch {
+          // Ignore polling errors
+        }
+      }, 2000)
+      return () => clearInterval(interval)
+    }
+  }, [trainingJob, refetchModels])
+
+  // Save settings
+  const handleSaveSettings = async () => {
+    if (!settings) return
+    setSaveStatus('saving')
+    try {
+      const response = await fetch('/api/config/tft-settings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify(settings)
+      })
+      if (response.ok) {
+        setSaveStatus('saved')
+        queryClient.invalidateQueries({ queryKey: ['tft-settings'] })
+        setTimeout(() => setSaveStatus('idle'), 2000)
+      } else {
+        setSaveStatus('error')
+        setTimeout(() => setSaveStatus('idle'), 3000)
+      }
+    } catch {
+      setSaveStatus('error')
+      setTimeout(() => setSaveStatus('idle'), 3000)
+    }
+  }
+
+  // Start training
+  const handleStartTraining = async () => {
+    try {
+      const name = modelName || `model_${new Date().toISOString().slice(0, 10)}`
+      const response = await fetch('/api/config/tft-models/train', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ metric_code: selectedMetric, model_name: name })
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setTrainingJob({
+          job_id: data.job_id,
+          metric_code: selectedMetric,
+          status: 'pending',
+          started_at: null,
+          completed_at: null,
+          progress_pct: 0,
+          current_epoch: 0,
+          total_epochs: settings?.max_epochs || 100,
+          error_message: null
+        })
+        setModelName('')
+      }
+    } catch (err) {
+      console.error('Failed to start training', err)
+    }
+  }
+
+  // Download model
+  const handleDownloadModel = async (model: TFTModel) => {
+    try {
+      const response = await fetch(`/api/config/tft-models/${model.id}/download`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (response.ok) {
+        const blob = await response.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `${model.metric_code}_${model.model_name}.pt`
+        a.click()
+        URL.revokeObjectURL(url)
+      }
+    } catch (err) {
+      console.error('Failed to download model', err)
+    }
+  }
+
+  // Upload model
+  const handleUploadModel = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setUploadStatus('uploading')
+    setUploadMessage('')
+
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('metric_code', selectedMetric)
+    formData.append('model_name', modelName || `imported_${new Date().toISOString().slice(0, 10)}`)
+
+    try {
+      const response = await fetch('/api/config/tft-models/upload', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
+        body: formData
+      })
+      if (response.ok) {
+        setUploadStatus('success')
+        setUploadMessage('Model uploaded successfully')
+        refetchModels()
+        setModelName('')
+      } else {
+        const data = await response.json()
+        setUploadStatus('error')
+        setUploadMessage(data.detail || 'Upload failed')
+      }
+    } catch {
+      setUploadStatus('error')
+      setUploadMessage('Upload failed')
+    }
+    setTimeout(() => {
+      setUploadStatus('idle')
+      setUploadMessage('')
+    }, 3000)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  // Activate model
+  const handleActivateModel = async (model: TFTModel) => {
+    try {
+      await fetch(`/api/config/tft-models/${model.id}/activate`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      refetchModels()
+    } catch (err) {
+      console.error('Failed to activate model', err)
+    }
+  }
+
+  // Delete model
+  const handleDeleteModel = async (model: TFTModel) => {
+    if (!confirm(`Delete model "${model.model_name}"?`)) return
+    try {
+      await fetch(`/api/config/tft-models/${model.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      refetchModels()
+    } catch (err) {
+      console.error('Failed to delete model', err)
+    }
+  }
+
+  const formatBytes = (bytes: number | null) => {
+    if (!bytes) return '-'
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  }
+
+  const formatDuration = (seconds: number | null) => {
+    if (!seconds) return '-'
+    if (seconds < 60) return `${seconds}s`
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+  }
+
+  return (
+    <div style={styles.pageContent}>
+      <h2 style={styles.pageTitle}>TFT Model Training</h2>
+      <p style={styles.pageSubtitle}>
+        Configure and train Temporal Fusion Transformer models for forecasting.
+        Trained models can be exported and imported between machines.
+      </p>
+
+      {/* Settings Section */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Training Hyperparameters</h3>
+
+        {settingsLoading ? (
+          <div style={styles.loading}>Loading settings...</div>
+        ) : settings ? (
+          <>
+            <div style={styles.settingsGrid}>
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>Encoder Length</label>
+                <input
+                  type="number"
+                  value={settings.encoder_length}
+                  onChange={(e) => setSettings({ ...settings, encoder_length: parseInt(e.target.value) || 60 })}
+                  style={styles.settingInput}
+                  min={30}
+                  max={180}
+                />
+                <span style={styles.settingHint}>Days of historical context</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>Hidden Size</label>
+                <select
+                  value={settings.hidden_size}
+                  onChange={(e) => setSettings({ ...settings, hidden_size: parseInt(e.target.value) })}
+                  style={styles.settingSelect}
+                >
+                  <option value={32}>32 (Fast)</option>
+                  <option value={64}>64 (Balanced)</option>
+                  <option value={128}>128 (Accurate)</option>
+                </select>
+                <span style={styles.settingHint}>Model complexity</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>Max Epochs</label>
+                <input
+                  type="number"
+                  value={settings.max_epochs}
+                  onChange={(e) => setSettings({ ...settings, max_epochs: parseInt(e.target.value) || 100 })}
+                  style={styles.settingInput}
+                  min={10}
+                  max={500}
+                />
+                <span style={styles.settingHint}>Training iterations</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>Learning Rate</label>
+                <select
+                  value={settings.learning_rate}
+                  onChange={(e) => setSettings({ ...settings, learning_rate: parseFloat(e.target.value) })}
+                  style={styles.settingSelect}
+                >
+                  <option value={0.0001}>0.0001 (Slow)</option>
+                  <option value={0.001}>0.001 (Default)</option>
+                  <option value={0.01}>0.01 (Fast)</option>
+                </select>
+                <span style={styles.settingHint}>Training speed</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>Batch Size</label>
+                <select
+                  value={settings.batch_size}
+                  onChange={(e) => setSettings({ ...settings, batch_size: parseInt(e.target.value) })}
+                  style={styles.settingSelect}
+                >
+                  <option value={32}>32</option>
+                  <option value={64}>64</option>
+                  <option value={128}>128</option>
+                  <option value={256}>256</option>
+                </select>
+                <span style={styles.settingHint}>Samples per batch</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>Training Days</label>
+                <input
+                  type="number"
+                  value={settings.training_days}
+                  onChange={(e) => setSettings({ ...settings, training_days: parseInt(e.target.value) || 2555 })}
+                  style={styles.settingInput}
+                  min={365}
+                  max={3650}
+                />
+                <span style={styles.settingHint}>Historical data to use</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>
+                  <input
+                    type="checkbox"
+                    checked={settings.use_gpu}
+                    onChange={(e) => setSettings({ ...settings, use_gpu: e.target.checked })}
+                    style={styles.checkbox}
+                  />
+                  Use GPU
+                </label>
+                <span style={styles.settingHint}>CUDA acceleration if available</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel}>
+                  <input
+                    type="checkbox"
+                    checked={settings.use_cached_model}
+                    onChange={(e) => setSettings({ ...settings, use_cached_model: e.target.checked })}
+                    style={styles.checkbox}
+                  />
+                  Use Cached Model
+                </label>
+                <span style={styles.settingHint}>Use trained model for previews</span>
+              </div>
+            </div>
+
+            <div style={styles.buttonRow}>
+              <button
+                onClick={handleSaveSettings}
+                disabled={saveStatus === 'saving'}
+                style={mergeStyles(
+                  buttonStyle('primary'),
+                  saveStatus === 'saved' ? { background: colors.success } : {}
+                )}
+              >
+                {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved!' : 'Save Settings'}
+              </button>
+            </div>
+          </>
+        ) : null}
+      </div>
+
+      {/* Training Section */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Train Model</h3>
+
+        <div style={styles.trainControlRow}>
+          <div style={styles.trainControl}>
+            <label style={styles.settingLabel}>Metric</label>
+            <select
+              value={selectedMetric}
+              onChange={(e) => setSelectedMetric(e.target.value)}
+              style={styles.settingSelect}
+              disabled={trainingJob && ['pending', 'running'].includes(trainingJob.status)}
+            >
+              <option value="hotel_occupancy_pct">Hotel Occupancy %</option>
+              <option value="hotel_room_nights">Hotel Room Nights</option>
+            </select>
+          </div>
+
+          <div style={styles.trainControl}>
+            <label style={styles.settingLabel}>Model Name (optional)</label>
+            <input
+              type="text"
+              value={modelName}
+              onChange={(e) => setModelName(e.target.value)}
+              placeholder="e.g., weekly_retrain"
+              style={styles.settingInput}
+              disabled={trainingJob && ['pending', 'running'].includes(trainingJob.status)}
+            />
+          </div>
+
+          <button
+            onClick={handleStartTraining}
+            disabled={trainingJob && ['pending', 'running'].includes(trainingJob.status)}
+            style={buttonStyle('primary')}
+          >
+            {trainingJob && ['pending', 'running'].includes(trainingJob.status)
+              ? 'Training...'
+              : 'Start Training'}
+          </button>
+        </div>
+
+        {trainingJob && (
+          <div style={styles.trainingProgress}>
+            <div style={styles.progressHeader}>
+              <span>Training {trainingJob.metric_code}</span>
+              <span style={styles.progressStatus}>
+                {trainingJob.status === 'completed' ? 'Completed' :
+                 trainingJob.status === 'failed' ? 'Failed' :
+                 `Epoch ${trainingJob.current_epoch}/${trainingJob.total_epochs}`}
+              </span>
+            </div>
+            <div style={styles.progressBarOuter}>
+              <div
+                style={{
+                  ...styles.progressBarInner,
+                  width: `${trainingJob.progress_pct}%`,
+                  background: trainingJob.status === 'failed' ? colors.error :
+                              trainingJob.status === 'completed' ? colors.success : colors.primary
+                }}
+              />
+            </div>
+            {trainingJob.error_message && (
+              <div style={{ color: colors.error, marginTop: spacing.xs }}>{trainingJob.error_message}</div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Import/Export Section */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Import Model</h3>
+        <p style={styles.hint}>Import a trained model from another machine.</p>
+
+        <div style={styles.buttonRow}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pt"
+            onChange={handleUploadModel}
+            style={{ display: 'none' }}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploadStatus === 'uploading'}
+            style={buttonStyle('outline')}
+          >
+            {uploadStatus === 'uploading' ? 'Uploading...' : 'Upload Model (.pt)'}
+          </button>
+          {uploadMessage && (
+            <span style={{
+              color: uploadStatus === 'success' ? colors.success : colors.error,
+              marginLeft: spacing.sm
+            }}>
+              {uploadMessage}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Models List Section */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Saved Models</h3>
+
+        {modelsLoading ? (
+          <div style={styles.loading}>Loading models...</div>
+        ) : models && models.length > 0 ? (
+          <div style={styles.modelsList}>
+            {models.map((model) => (
+              <div key={model.id} style={styles.modelCard}>
+                <div style={styles.modelHeader}>
+                  <span style={styles.modelName}>{model.model_name}</span>
+                  {model.is_active && (
+                    <span style={{ ...badgeStyle('success'), marginLeft: spacing.xs }}>Active</span>
+                  )}
+                </div>
+                <div style={styles.modelMeta}>
+                  <span>Metric: {model.metric_code}</span>
+                  <span>Size: {formatBytes(model.file_size_bytes)}</span>
+                  <span>Training: {formatDuration(model.training_time_seconds)}</span>
+                  {model.validation_loss && <span>Loss: {model.validation_loss.toFixed(4)}</span>}
+                  {model.epochs_completed && <span>Epochs: {model.epochs_completed}</span>}
+                </div>
+                <div style={styles.modelMeta}>
+                  <span>Trained: {new Date(model.trained_at).toLocaleString()}</span>
+                  {model.created_by && <span>By: {model.created_by}</span>}
+                </div>
+                <div style={styles.modelActions}>
+                  <button
+                    onClick={() => handleDownloadModel(model)}
+                    style={buttonStyle('outline')}
+                  >
+                    Export
+                  </button>
+                  {!model.is_active && (
+                    <button
+                      onClick={() => handleActivateModel(model)}
+                      style={buttonStyle('outline')}
+                    >
+                      Activate
+                    </button>
+                  )}
+                  {!model.is_active && (
+                    <button
+                      onClick={() => handleDeleteModel(model)}
+                      style={{ ...buttonStyle('outline'), color: colors.error, borderColor: colors.error }}
+                    >
+                      Delete
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={styles.emptyState}>
+            No trained models yet. Train a model or import one to get started.
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ============================================
 // USERS PAGE
 // ============================================
 
@@ -3327,6 +3906,126 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: 'pointer',
     fontSize: typography.sm,
     fontWeight: typography.medium,
+  },
+  // TFT Training styles
+  settingsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
+    gap: spacing.md,
+    marginBottom: spacing.md,
+  },
+  settingItem: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: spacing.xs,
+  },
+  settingLabel: {
+    fontSize: typography.sm,
+    fontWeight: typography.medium,
+    color: colors.text,
+    display: 'flex',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  settingInput: {
+    padding: spacing.sm,
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+    fontSize: typography.base,
+    background: colors.surface,
+    color: colors.text,
+    width: '100%',
+  },
+  settingSelect: {
+    padding: spacing.sm,
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+    fontSize: typography.base,
+    background: colors.surface,
+    color: colors.text,
+    cursor: 'pointer',
+  },
+  settingHint: {
+    fontSize: typography.xs,
+    color: colors.textMuted,
+  },
+  trainControlRow: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: spacing.md,
+    alignItems: 'flex-end',
+    marginBottom: spacing.md,
+  },
+  trainControl: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: spacing.xs,
+    minWidth: '200px',
+  },
+  trainingProgress: {
+    background: colors.background,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+  },
+  progressHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    marginBottom: spacing.sm,
+    fontSize: typography.sm,
+    color: colors.text,
+  },
+  progressStatus: {
+    fontWeight: typography.medium,
+    color: colors.primary,
+  },
+  progressBarOuter: {
+    height: '8px',
+    background: colors.borderLight,
+    borderRadius: radius.full,
+    overflow: 'hidden',
+  },
+  progressBarInner: {
+    height: '100%',
+    background: colors.primary,
+    transition: 'width 0.3s ease',
+  },
+  modelsList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: spacing.md,
+  },
+  modelCard: {
+    background: colors.background,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+  },
+  modelHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  modelName: {
+    fontSize: typography.md,
+    fontWeight: typography.semibold,
+    color: colors.text,
+  },
+  modelMeta: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: spacing.md,
+    fontSize: typography.sm,
+    color: colors.textMuted,
+    marginBottom: spacing.sm,
+  },
+  modelActions: {
+    display: 'flex',
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+    paddingTop: spacing.sm,
+    borderTop: `1px solid ${colors.borderLight}`,
   },
 }
 
