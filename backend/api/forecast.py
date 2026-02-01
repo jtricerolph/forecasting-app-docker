@@ -1394,9 +1394,10 @@ async def _tft_predict_with_cached_model(
 
     # Read feature lists from checkpoint to know what the model expects
     time_varying_known = dataset_params.get('time_varying_known_reals', [
-        'day_of_week', 'month', 'week_of_year', 'is_weekend',
-        'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
+        'month', 'week_of_year', 'month_sin', 'month_cos'
     ])
+    # Categorical features - day_of_week is categorical so each day has its own embedding
+    time_varying_known_cats = dataset_params.get('time_varying_known_categoricals', ['day_of_week'])
     time_varying_unknown = dataset_params.get('time_varying_unknown_reals', [
         'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
         'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
@@ -1410,13 +1411,16 @@ async def _tft_predict_with_cached_model(
 
     logging.info(f"Loading cached model for {metric_code}")
     logging.info(f"  Features: special_dates={use_special_dates}, otb={use_otb_data}, lag_364={use_lag_364}")
-    logging.info(f"  Known features: {time_varying_known}")
-    logging.info(f"  Unknown features: {time_varying_unknown}")
+    logging.info(f"  Known categoricals: {time_varying_known_cats}")
+    logging.info(f"  Known reals: {time_varying_known}")
+    logging.info(f"  Unknown reals: {time_varying_unknown}")
 
     # Calculate how much history we need
-    HISTORY_DAYS = ENCODER_LENGTH + 90
+    # Need: encoder_length + prediction_length + buffer for TimeSeriesDataSet
+    HISTORY_DAYS = ENCODER_LENGTH + PREDICTION_LENGTH + 60
     if use_lag_364:
-        HISTORY_DAYS = max(HISTORY_DAYS, 400)  # Need 364+ days for lag_364
+        # With lag_364, we skip first 364 rows, so need 364 + encoder + prediction + buffer
+        HISTORY_DAYS = 364 + ENCODER_LENGTH + PREDICTION_LENGTH + 60
 
     history_start = today - timedelta(days=HISTORY_DAYS)
     history_result = await db.execute(text("""
@@ -1446,12 +1450,10 @@ async def _tft_predict_with_cached_model(
             df["y"] = (df["y"] / total_rooms) * 100
 
         # Create base calendar features
-        df['day_of_week'] = df['ds'].dt.dayofweek
+        # CRITICAL: day_of_week must be string for categorical encoding
+        df['day_of_week'] = df['ds'].dt.dayofweek.astype(str)
         df['month'] = df['ds'].dt.month
         df['week_of_year'] = df['ds'].dt.isocalendar().week.astype(int)
-        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-        df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-        df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
         df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
         df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
@@ -1524,6 +1526,7 @@ async def _tft_predict_with_cached_model(
             min_prediction_length=1,
             max_prediction_length=PREDICTION_LENGTH,
             static_categoricals=["group"],
+            time_varying_known_categoricals=time_varying_known_cats,  # day_of_week as categorical!
             time_varying_known_reals=time_varying_known,
             time_varying_unknown_reals=time_varying_unknown,
             add_relative_time_idx=True,
@@ -1561,12 +1564,10 @@ async def _tft_predict_with_cached_model(
     future_df['y'] = last_known_y
 
     # Base calendar features
-    future_df['day_of_week'] = future_df['ds'].dt.dayofweek
+    # CRITICAL: day_of_week must be string for categorical encoding
+    future_df['day_of_week'] = future_df['ds'].dt.dayofweek.astype(str)
     future_df['month'] = future_df['ds'].dt.month
     future_df['week_of_year'] = future_df['ds'].dt.isocalendar().week.astype(int)
-    future_df['is_weekend'] = (future_df['day_of_week'] >= 5).astype(int)
-    future_df['dow_sin'] = np.sin(2 * np.pi * future_df['day_of_week'] / 7)
-    future_df['dow_cos'] = np.cos(2 * np.pi * future_df['day_of_week'] / 7)
     future_df['month_sin'] = np.sin(2 * np.pi * future_df['month'] / 12)
     future_df['month_cos'] = np.cos(2 * np.pi * future_df['month'] / 12)
 
@@ -2030,15 +2031,11 @@ async def get_tft_preview(
     if metric == "occupancy" and total_rooms > 0:
         df["y"] = (df["y"] / total_rooms) * 100
 
-    # Create features (same as tft_model.py)
-    df['day_of_week'] = df['ds'].dt.dayofweek
+    # Create features
+    # CRITICAL: day_of_week must be string for categorical encoding
+    df['day_of_week'] = df['ds'].dt.dayofweek.astype(str)
     df['month'] = df['ds'].dt.month
     df['week_of_year'] = df['ds'].dt.isocalendar().week.astype(int)
-    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-
-    # Cyclical encoding
-    df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-    df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
@@ -2070,9 +2067,10 @@ async def get_tft_preview(
     PREDICTION_LENGTH = min(28, (end - start).days + 1)
 
     # Define features
-    time_varying_known = [
-        'day_of_week', 'month', 'week_of_year', 'is_weekend',
-        'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
+    # day_of_week is CATEGORICAL for distinct day patterns
+    time_varying_known_cats = ['day_of_week']
+    time_varying_known_reals = [
+        'month', 'week_of_year', 'month_sin', 'month_cos'
     ]
 
     time_varying_unknown = [
@@ -2094,7 +2092,8 @@ async def get_tft_preview(
         min_prediction_length=1,
         max_prediction_length=PREDICTION_LENGTH,
         static_categoricals=["group"],
-        time_varying_known_reals=time_varying_known,
+        time_varying_known_categoricals=time_varying_known_cats,  # day_of_week as categorical!
+        time_varying_known_reals=time_varying_known_reals,
         time_varying_unknown_reals=time_varying_unknown,
         add_relative_time_idx=True,
         add_target_scales=True,
@@ -2155,12 +2154,10 @@ async def get_tft_preview(
     future_df['y'] = last_known_y
 
     # Add features for future dates
-    future_df['day_of_week'] = future_df['ds'].dt.dayofweek
+    # CRITICAL: day_of_week must be string for categorical encoding
+    future_df['day_of_week'] = future_df['ds'].dt.dayofweek.astype(str)
     future_df['month'] = future_df['ds'].dt.month
     future_df['week_of_year'] = future_df['ds'].dt.isocalendar().week.astype(int)
-    future_df['is_weekend'] = (future_df['day_of_week'] >= 5).astype(int)
-    future_df['dow_sin'] = np.sin(2 * np.pi * future_df['day_of_week'] / 7)
-    future_df['dow_cos'] = np.cos(2 * np.pi * future_df['day_of_week'] / 7)
     future_df['month_sin'] = np.sin(2 * np.pi * future_df['month'] / 12)
     future_df['month_cos'] = np.cos(2 * np.pi * future_df['month'] / 12)
 

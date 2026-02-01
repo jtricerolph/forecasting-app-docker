@@ -236,14 +236,24 @@ def train_tft_model_with_progress(
         training_cutoff = len(df) - prediction_length
 
         # Define feature columns - base features always included
-        time_varying_known = [
-            'day_of_week', 'month', 'week_of_year', 'is_weekend',
-            'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
+        # Note: Removed dow_sin/dow_cos and is_weekend as they caused pattern issues
+        # day_of_week is CATEGORICAL so model learns distinct patterns per day
+        time_varying_known_reals = [
+            'month', 'week_of_year',
+            'month_sin', 'month_cos'
         ]
+
+        # CRITICAL: day_of_week as CATEGORICAL lets model learn unique pattern per day
+        # As continuous: model interpolates between days (causes Saturday=6 issues)
+        # As categorical: each day has its own learned embedding
+        time_varying_known_cats = ['day_of_week']
+
+        # Ensure day_of_week is string type for categorical encoding
+        df['day_of_week'] = df['day_of_week'].astype(str)
 
         # Add holiday features if special dates enabled
         if use_special_dates:
-            time_varying_known.extend(['is_holiday', 'days_to_holiday'])
+            time_varying_known_reals.extend(['is_holiday', 'days_to_holiday'])
 
         time_varying_unknown = [
             'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
@@ -279,7 +289,8 @@ def train_tft_model_with_progress(
             min_prediction_length=1,
             max_prediction_length=prediction_length,
             static_categoricals=["group"],
-            time_varying_known_reals=time_varying_known,
+            time_varying_known_categoricals=time_varying_known_cats,  # day_of_week as categorical!
+            time_varying_known_reals=time_varying_known_reals,
             time_varying_unknown_reals=time_varying_unknown,
             add_relative_time_idx=True,
             add_target_scales=True,
@@ -428,15 +439,13 @@ def _create_tft_features(df: pd.DataFrame, special_dates: set = None) -> pd.Data
     df['ds'] = pd.to_datetime(df['ds'])
 
     # Time-varying known features
-    df['day_of_week'] = df['ds'].dt.dayofweek
+    # CRITICAL: day_of_week must be string for categorical encoding
+    df['day_of_week'] = df['ds'].dt.dayofweek.astype(str)
     df['month'] = df['ds'].dt.month
     df['day_of_month'] = df['ds'].dt.day
     df['week_of_year'] = df['ds'].dt.isocalendar().week.astype(int)
-    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
 
-    # Cyclical encoding
-    df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-    df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+    # Cyclical encoding for month only (day_of_week is categorical, not cyclical)
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
