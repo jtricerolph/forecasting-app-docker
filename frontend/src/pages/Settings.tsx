@@ -2817,7 +2817,7 @@ const TFTTrainingPage: React.FC = () => {
               value={selectedMetric}
               onChange={(e) => setSelectedMetric(e.target.value)}
               style={styles.settingSelect}
-              disabled={trainingJob && ['pending', 'running'].includes(trainingJob.status)}
+              disabled={!!(trainingJob && ['pending', 'running'].includes(trainingJob.status))}
             >
               <option value="hotel_occupancy_pct">Hotel Occupancy %</option>
               <option value="hotel_room_nights">Hotel Room Nights</option>
@@ -2832,13 +2832,13 @@ const TFTTrainingPage: React.FC = () => {
               onChange={(e) => setModelName(e.target.value)}
               placeholder="e.g., weekly_retrain"
               style={styles.settingInput}
-              disabled={trainingJob && ['pending', 'running'].includes(trainingJob.status)}
+              disabled={!!(trainingJob && ['pending', 'running'].includes(trainingJob.status))}
             />
           </div>
 
           <button
             onClick={handleStartTraining}
-            disabled={trainingJob && ['pending', 'running'].includes(trainingJob.status)}
+            disabled={!!(trainingJob && ['pending', 'running'].includes(trainingJob.status))}
             style={buttonStyle('primary')}
           >
             {trainingJob && ['pending', 'running'].includes(trainingJob.status)
@@ -4008,7 +4008,7 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: spacing.sm,
   },
   modelName: {
-    fontSize: typography.md,
+    fontSize: typography.base,
     fontWeight: typography.semibold,
     color: colors.text,
   },
