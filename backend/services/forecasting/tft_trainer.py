@@ -82,6 +82,8 @@ def train_tft_model_with_progress(
 
         forecast_from = date.today()
         training_from = forecast_from - timedelta(days=training_days + encoder_length)
+        # Query 364 extra days back for lag_364 calculation
+        data_from = training_from - timedelta(days=364)
 
         # Map metric to column
         metric_column_map = {
@@ -103,19 +105,19 @@ def train_tft_model_with_progress(
             ORDER BY date
             """),
             {
-                "from_date": training_from,
+                "from_date": data_from,  # Query extra 364 days for lag_364
                 "to_date": forecast_from - timedelta(days=1)
             }
         )
         rows = result.fetchall()
 
-        min_required = encoder_length + 90
+        min_required = encoder_length + 90 + 364  # Need extra for lag_364
         if len(rows) < min_required:
             raise ValueError(
                 f"Insufficient data: {len(rows)} records, need at least {min_required}"
             )
 
-        logger.info(f"Loaded {len(rows)} training records")
+        logger.info(f"Loaded {len(rows)} records (includes 364 extra for lag_364)")
         update_training_job(db, job_id, progress_pct=15)
 
         # Prepare DataFrame
@@ -152,7 +154,14 @@ def train_tft_model_with_progress(
         df['time_idx'] = range(len(df))
         df['group'] = metric_code
 
-        # Drop NaN from lag features
+        # Drop the first 364 rows (they were only needed to calculate lag_364)
+        # Then drop any remaining NaN from other lag features
+        if 'lag_364' in df.columns:
+            # Keep only rows where lag_364 is valid (after row 364)
+            df = df.iloc[364:].copy()
+            df = df.reset_index(drop=True)
+            logger.info(f"Dropped first 364 rows, now have {len(df)} rows for training")
+
         df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
 
         if len(df) < min_required:
@@ -179,8 +188,10 @@ def train_tft_model_with_progress(
             'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
         ]
 
-        # lag_364 disabled - see _create_tft_features
-        # Year-over-year seasonality is captured by the 90-day encoder window
+        # Add lag_364 for year-over-year seasonality
+        if 'lag_364' in df.columns:
+            time_varying_unknown.append('lag_364')
+            logger.info("Including lag_364 feature for year-over-year patterns")
 
         # Add OTB features if enabled - these are "unknown" because we learn from historical pickup patterns
         if use_otb_data and 'otb_at_30d' in df.columns:
@@ -386,11 +397,10 @@ def _create_tft_features(df: pd.DataFrame, special_dates: set = None) -> pd.Data
     for lag in [7, 14, 21, 28]:
         df[f'lag_{lag}'] = df['y'].shift(lag)
 
-    # Year-over-year - disabled for now to avoid NaN issues
-    # The first 364 rows will always be NaN (no prior year data to shift from)
-    # TODO: Re-enable when we have strategy for handling structural NaN
-    # if len(df) > 450:
-    #     df['lag_364'] = df['y'].shift(364)
+    # Year-over-year lag (364 days for DOW alignment)
+    # We query 364 extra days of data, so this should have no NaN after we drop the prefix rows
+    if len(df) > 364:
+        df['lag_364'] = df['y'].shift(364)
 
     # Rolling statistics
     for window in [7, 14, 28]:

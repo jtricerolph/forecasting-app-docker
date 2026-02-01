@@ -150,9 +150,10 @@ def create_tft_features(df: pd.DataFrame, holidays_df: Optional[pd.DataFrame] = 
     for lag in [7, 14, 21, 28]:
         df[f'lag_{lag}'] = df['y'].shift(lag)
 
-    # Year-over-year disabled - causes NaN issues with TFT
-    # The first 364 rows would always be NaN (no prior year data)
-    # Seasonality is captured by the 90-day encoder window instead
+    # Year-over-year lag (364 days for DOW alignment)
+    # We query 364 extra days of data, so lag_364 will be valid after dropping prefix rows
+    if len(df) > 364:
+        df['lag_364'] = df['y'].shift(364)
 
     # Rolling statistics
     for window in [7, 14, 28]:
@@ -311,7 +312,10 @@ async def _generate_forecasts_from_pretrained_model(
         time_varying_unknown = dataset_params.get("time_varying_unknown_reals", [])
 
         # Load historical data for encoder context
-        context_from = forecast_from - timedelta(days=training_days + encoder_length)
+        # If model uses lag_364, we need 364 extra days
+        has_lag_364 = 'lag_364' in time_varying_unknown
+        extra_days = 364 if has_lag_364 else 0
+        context_from = forecast_from - timedelta(days=training_days + encoder_length + extra_days)
 
         # Map metric to column
         metric_column_map = {
@@ -380,7 +384,13 @@ async def _generate_forecasts_from_pretrained_model(
         df['time_idx'] = range(len(df))
         df['group'] = metric_code
 
-        # Drop NaN from lag features
+        # Drop the first 364 rows if lag_364 is used (they were for lag calculation)
+        if has_lag_364 and 'lag_364' in df.columns:
+            df = df.iloc[364:].copy()
+            df = df.reset_index(drop=True)
+            logger.debug(f"Dropped 364 prefix rows, now have {len(df)} rows")
+
+        # Drop any remaining NaN from lag features
         df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
 
         if len(df) < min_required:
