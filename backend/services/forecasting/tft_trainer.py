@@ -123,8 +123,12 @@ def train_tft_model_with_progress(
         } for row in rows])
         df = df.sort_values('ds').reset_index(drop=True)
 
-        # Create features
-        df = _create_tft_features(df)
+        # Load special dates from Settings
+        special_dates = _load_special_dates(db, training_from, forecast_from + timedelta(days=prediction_length))
+        logger.info(f"Using {len(special_dates)} special dates from Settings for training")
+
+        # Create features (now includes holiday features)
+        df = _create_tft_features(df, special_dates)
 
         # Add time index for TFT
         df['time_idx'] = range(len(df))
@@ -141,9 +145,10 @@ def train_tft_model_with_progress(
         # Define training cutoff
         training_cutoff = len(df) - prediction_length
 
-        # Define feature columns
+        # Define feature columns (now includes holiday features from Settings)
         time_varying_known = [
             'day_of_week', 'month', 'week_of_year', 'is_weekend',
+            'is_holiday', 'days_to_holiday',
             'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
         ]
 
@@ -308,7 +313,7 @@ def train_tft_model_with_progress(
         raise
 
 
-def _create_tft_features(df: pd.DataFrame) -> pd.DataFrame:
+def _create_tft_features(df: pd.DataFrame, special_dates: set = None) -> pd.DataFrame:
     """Create features for TFT model"""
     df = df.copy()
 
@@ -328,6 +333,22 @@ def _create_tft_features(df: pd.DataFrame) -> pd.DataFrame:
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
+    # Special dates / holidays from Settings
+    if special_dates and len(special_dates) > 0:
+        df['is_holiday'] = df['ds'].dt.date.apply(lambda x: 1 if x in special_dates else 0)
+
+        # Days to nearest special date (known future feature)
+        def days_to_holiday(d):
+            future_dates = [h for h in special_dates if h >= d]
+            if future_dates:
+                return min((h - d).days for h in future_dates)
+            return 30  # Default if no dates in range
+
+        df['days_to_holiday'] = df['ds'].dt.date.apply(days_to_holiday)
+    else:
+        df['is_holiday'] = 0
+        df['days_to_holiday'] = 30
+
     # Lag features
     for lag in [7, 14, 21, 28]:
         df[f'lag_{lag}'] = df['y'].shift(lag)
@@ -342,3 +363,59 @@ def _create_tft_features(df: pd.DataFrame) -> pd.DataFrame:
         df[f'rolling_std_{window}'] = df['y'].rolling(window=window, min_periods=1).std().fillna(0)
 
     return df
+
+
+def _load_special_dates(db, from_date: date, to_date: date) -> set:
+    """Load special dates from Settings database for training."""
+    try:
+        from api.special_dates import resolve_special_date
+
+        result = db.execute(text("""
+            SELECT
+                id, name, pattern_type,
+                fixed_month, fixed_day,
+                nth_week, weekday, month,
+                relative_to_month, relative_to_day,
+                relative_weekday, relative_direction,
+                duration_days, is_recurring, one_off_year
+            FROM special_dates
+            WHERE is_active = TRUE
+        """))
+        rows = result.fetchall()
+
+        if not rows:
+            logger.info("No special dates configured in Settings")
+            return set()
+
+        all_dates = set()
+        years = set(range(from_date.year - 1, to_date.year + 2))
+
+        for row in rows:
+            sd = {
+                'pattern_type': row.pattern_type,
+                'fixed_month': row.fixed_month,
+                'fixed_day': row.fixed_day,
+                'nth_week': row.nth_week,
+                'weekday': row.weekday,
+                'month': row.month,
+                'relative_to_month': row.relative_to_month,
+                'relative_to_day': row.relative_to_day,
+                'relative_weekday': row.relative_weekday,
+                'relative_direction': row.relative_direction,
+                'duration_days': row.duration_days or 1,
+                'is_recurring': row.is_recurring,
+                'one_off_year': row.one_off_year
+            }
+
+            for year in years:
+                resolved = resolve_special_date(sd, year)
+                for d in resolved:
+                    if from_date - timedelta(days=30) <= d <= to_date + timedelta(days=365):
+                        all_dates.add(d)
+
+        logger.info(f"Loaded {len(all_dates)} special date occurrences from Settings")
+        return all_dates
+
+    except Exception as e:
+        logger.warning(f"Failed to load special dates: {e}")
+        return set()

@@ -200,38 +200,27 @@ async def run_tft_forecast(
     forecast_to: date,
     training_days: int = None,  # Load from DB config if None
     use_gpu: bool = None,  # Load from DB config if None
-    save_model: bool = True,
-    force_retrain: bool = False  # Force training even if cached model exists
 ) -> List[dict]:
     """
-    Run TFT forecast for a metric.
+    Run TFT forecast for a metric using a pre-trained model from Settings.
 
-    Uses same data source as Prophet/XGBoost (newbook_bookings_stats table).
-    Applies same floor/cap logic as pickup model.
-
-    If a cached model exists and use_cached_model is enabled, uses the cached
-    model for faster predictions. Set force_retrain=True to train a new model.
+    This function ONLY uses models that have been trained or uploaded via the
+    Settings page. If no active model exists for the metric, it returns an
+    empty list. On-the-fly training is not supported - train models via Settings.
 
     Args:
         db: Database session
         metric_code: Metric to forecast
         forecast_from: Start date for forecasts
         forecast_to: End date for forecasts
-        training_days: Days of historical data to use (None = from DB)
+        training_days: Days of historical data for encoder context (None = from DB)
         use_gpu: Whether to use GPU acceleration (None = from DB)
-        save_model: Whether to persist trained model
-        force_retrain: Force training even if cached model exists
 
     Returns:
-        List of forecast records
+        List of forecast records, or empty list if no active model exists
     """
     try:
         import torch
-        from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-        from pytorch_forecasting.metrics import QuantileLoss
-        # Use lightning.pytorch (not pytorch_lightning) to match pytorch_forecasting's internal imports
-        from lightning.pytorch import Trainer
-        from lightning.pytorch.callbacks import EarlyStopping
 
         import warnings
         warnings.filterwarnings("ignore", category=UserWarning)
@@ -242,33 +231,87 @@ async def run_tft_forecast(
         # Use provided values or fall back to config
         if training_days is None:
             training_days = config['training_days']
-        if use_gpu is None:
-            use_gpu = config['use_gpu']
 
-        use_cached = config.get('use_cached_model', True)
+        logger.info(f"TFT forecast for {metric_code}: loading pre-trained model from Settings")
 
-        # Check GPU availability
-        device = "gpu" if use_gpu and torch.cuda.is_available() else "cpu"
-        accelerator = "cuda" if device == "gpu" else "cpu"
-        logger.info(f"TFT forecast for {metric_code} on {device}")
+        # Try to load active model checkpoint from tft_models table
+        checkpoint, model_info = await _load_active_model(db, metric_code)
 
-        # Try to load cached model if not forcing retrain
-        if use_cached and not force_retrain:
-            cached_model, checkpoint = await _try_load_cached_model(db, metric_code)
-            if cached_model is not None:
-                logger.info(f"Using cached TFT model for {metric_code}")
-                # Generate predictions using cached model
-                return await _generate_forecasts_from_cached_model(
-                    db, cached_model, checkpoint, metric_code,
-                    forecast_from, forecast_to
-                )
+        if checkpoint is None:
+            logger.warning(
+                f"No active TFT model found for {metric_code}. "
+                f"Train or upload a model in Settings > TFT Model Training, then activate it."
+            )
+            return []
 
-        logger.info(f"Training new TFT model for {metric_code}")
+        logger.info(
+            f"Using TFT model '{model_info['model_name']}' "
+            f"(trained: {model_info['trained_at']}) for {metric_code}"
+        )
 
-        # Get historical data from newbook_bookings_stats (forecast_data database)
-        training_from = forecast_from - timedelta(days=training_days + ENCODER_LENGTH)
+        # Generate predictions using the pre-trained model checkpoint
+        forecasts = await _generate_forecasts_from_pretrained_model(
+            db, checkpoint, metric_code,
+            forecast_from, forecast_to, training_days
+        )
 
-        # Map metric_code to the correct column in newbook_bookings_stats
+        logger.info(f"TFT forecast generated for {metric_code}: {len(forecasts)} records")
+        return forecasts
+
+    except ImportError as e:
+        logger.error(f"PyTorch Forecasting not installed: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"TFT forecast failed for {metric_code}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return []
+
+
+async def _load_active_model(db, metric_code: str):
+    """
+    Load the active TFT model checkpoint for a metric from tft_models table.
+
+    Returns:
+        Tuple of (checkpoint, model_info) if found, (None, None) otherwise
+    """
+    try:
+        from services.model_storage import load_model
+        return load_model(db, metric_code)
+    except Exception as e:
+        logger.warning(f"Failed to load active model for {metric_code}: {e}")
+        return None, None
+
+
+async def _generate_forecasts_from_pretrained_model(
+    db, checkpoint, metric_code: str,
+    forecast_from: date, forecast_to: date,
+    training_days: int
+) -> List[dict]:
+    """
+    Generate forecasts using a pre-trained TFT model checkpoint.
+
+    Loads historical data needed for encoder context, reconstructs the model
+    from the checkpoint, and generates predictions.
+    """
+    try:
+        import torch
+        from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+        from pytorch_forecasting.metrics import QuantileLoss
+        import pandas as pd
+        import numpy as np
+
+        # Get dataset parameters from checkpoint
+        dataset_params = checkpoint.get("dataset_parameters", {})
+        encoder_length = dataset_params.get("max_encoder_length", 90)
+        prediction_length = dataset_params.get("max_prediction_length", 28)
+        time_varying_known = dataset_params.get("time_varying_known_reals", [])
+        time_varying_unknown = dataset_params.get("time_varying_unknown_reals", [])
+
+        # Load historical data for encoder context
+        context_from = forecast_from - timedelta(days=training_days + encoder_length)
+
+        # Map metric to column
         metric_column_map = {
             'hotel_occupancy_pct': 'total_occupancy_pct',
             'hotel_room_nights': 'booking_count',
@@ -289,18 +332,15 @@ async def run_tft_forecast(
             ORDER BY date
             """),
             {
-                "from_date": training_from,
+                "from_date": context_from,
                 "to_date": forecast_from - timedelta(days=1)
             }
         )
         rows = result.fetchall()
 
-        min_required = ENCODER_LENGTH + 90  # Need enough for training + validation
+        min_required = encoder_length + 30
         if len(rows) < min_required:
-            logger.warning(
-                f"Insufficient data for TFT: {metric_code} has {len(rows)} records, "
-                f"need at least {min_required}"
-            )
+            logger.warning(f"Insufficient historical data for TFT prediction: {len(rows)} rows, need {min_required}")
             return []
 
         # Prepare DataFrame
@@ -310,15 +350,15 @@ async def run_tft_forecast(
         } for row in rows])
         df = df.sort_values('ds').reset_index(drop=True)
 
-        # Load holidays (using Prophet's holiday calendar)
+        # Load holidays
         holidays_df = await _load_holidays(forecast_from, forecast_to)
 
         # Create features
         df = create_tft_features(df, holidays_df)
 
-        # Add time index for TFT
+        # Add time index and group
         df['time_idx'] = range(len(df))
-        df['group'] = metric_code  # Single series per metric
+        df['group'] = metric_code
 
         # Drop NaN from lag features
         df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
@@ -327,122 +367,72 @@ async def run_tft_forecast(
             logger.warning(f"Insufficient data after feature creation for {metric_code}")
             return []
 
-        # Define training cutoff (leave some for validation)
-        training_cutoff = len(df) - PREDICTION_LENGTH
-
-        # Define feature columns
-        time_varying_known = [
+        # Default feature lists if not stored in checkpoint
+        default_known = [
             'day_of_week', 'month', 'week_of_year', 'is_weekend',
             'is_holiday', 'days_to_holiday',
             'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
         ]
-
-        time_varying_unknown = [
+        default_unknown = [
             'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
             'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
             'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
         ]
 
-        # Add lag_364 if available
-        if 'lag_364' in df.columns and df['lag_364'].notna().sum() > 30:
-            time_varying_unknown.append('lag_364')
+        known_reals = time_varying_known if time_varying_known else default_known
+        unknown_reals = time_varying_unknown if time_varying_unknown else default_unknown
 
-        # Create TimeSeriesDataSet
-        training_data = df.iloc[:training_cutoff].copy()
-
+        # Recreate the training dataset structure (needed for prediction)
         training = TimeSeriesDataSet(
-            training_data,
+            df.copy(),
             time_idx="time_idx",
             target="y",
             group_ids=["group"],
-            min_encoder_length=ENCODER_LENGTH // 2,
-            max_encoder_length=ENCODER_LENGTH,
+            min_encoder_length=encoder_length // 2,
+            max_encoder_length=encoder_length,
             min_prediction_length=1,
-            max_prediction_length=PREDICTION_LENGTH,
+            max_prediction_length=prediction_length,
             static_categoricals=["group"],
-            time_varying_known_reals=time_varying_known,
-            time_varying_unknown_reals=time_varying_unknown,
+            time_varying_known_reals=known_reals,
+            time_varying_unknown_reals=unknown_reals,
             add_relative_time_idx=True,
             add_target_scales=True,
             add_encoder_length=True,
         )
 
-        # Create dataloaders
-        train_dataloader = training.to_dataloader(
-            train=True, batch_size=BATCH_SIZE, num_workers=0
-        )
+        # Reconstruct the model from the checkpoint using the dataset structure
+        hparams = checkpoint.get("model_hparams", {})
 
-        # Validation dataloader
-        validation = TimeSeriesDataSet.from_dataset(
-            training, df.iloc[training_cutoff - ENCODER_LENGTH:], predict=False
-        )
-        val_dataloader = validation.to_dataloader(
-            train=False, batch_size=BATCH_SIZE, num_workers=0
-        )
-
-        # Create TFT model
-        tft = TemporalFusionTransformer.from_dataset(
+        # Create a fresh model with the same architecture using the dataset
+        model = TemporalFusionTransformer.from_dataset(
             training,
-            learning_rate=LEARNING_RATE,
-            hidden_size=HIDDEN_SIZE,
-            attention_head_size=ATTENTION_HEAD_SIZE,
-            dropout=DROPOUT,
-            hidden_continuous_size=16,
-            output_size=7,  # 7 quantiles for uncertainty
+            learning_rate=hparams.get("learning_rate", 0.001),
+            hidden_size=hparams.get("hidden_size", 64),
+            attention_head_size=hparams.get("attention_head_size", 4),
+            dropout=hparams.get("dropout", 0.1),
+            hidden_continuous_size=hparams.get("hidden_continuous_size", 16),
+            output_size=hparams.get("output_size", 7),
             loss=QuantileLoss(),
             reduce_on_plateau_patience=4,
         )
 
-        # Training callbacks
-        early_stop_callback = EarlyStopping(
-            monitor="val_loss",
-            min_delta=1e-4,
-            patience=10,
-            verbose=False,
-            mode="min"
-        )
+        # Load the trained weights
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()  # Set to evaluation mode
 
-        # Train model
-        import time
-        start_time = time.time()
+        logger.info(f"Reconstructed TFT model for {metric_code} with {sum(p.numel() for p in model.parameters()):,} parameters")
 
-        trainer = Trainer(
-            max_epochs=MAX_EPOCHS,
-            accelerator=accelerator,
-            devices=1,
-            enable_model_summary=False,
-            callbacks=[early_stop_callback],
-            enable_progress_bar=False,
-            logger=False,
-        )
-
-        trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
-
-        training_time = int(time.time() - start_time)
-        logger.info(f"TFT training completed in {training_time}s for {metric_code}")
-
-        # Generate forecasts for future dates
+        # Generate forecasts
         forecasts = await _generate_forecasts(
-            db, tft, training, df, metric_code,
-            forecast_from, forecast_to, holidays_df, time_varying_known, time_varying_unknown
+            db, model, training, df, metric_code,
+            forecast_from, forecast_to, holidays_df,
+            known_reals, unknown_reals
         )
 
-        # Log training run
-        if save_model:
-            await _log_training_run(
-                db, metric_code, training_from, forecast_from,
-                len(df), training_time, use_gpu,
-                time_varying_known + time_varying_unknown
-            )
-
-        logger.info(f"TFT forecast generated for {metric_code}: {len(forecasts)} records")
         return forecasts
 
-    except ImportError as e:
-        logger.error(f"PyTorch Forecasting not installed: {e}")
-        return []
     except Exception as e:
-        logger.error(f"TFT forecast failed for {metric_code}: {e}")
+        logger.error(f"Failed to generate forecasts from pre-trained model: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return []
@@ -637,35 +627,89 @@ async def _log_training_run(
         logger.warning(f"Failed to log TFT training run: {e}")
 
 
-async def _load_holidays(from_date: date, to_date: date) -> pd.DataFrame:
-    """Load UK holidays using Prophet's holiday calendar."""
+async def _load_holidays(from_date: date, to_date: date, db=None) -> pd.DataFrame:
+    """
+    Load special dates from Settings database.
+
+    Uses the special_dates table configured in Settings > Special Dates,
+    which includes school holidays, local events, conferences, etc.
+    Falls back to empty if no special dates configured.
+    """
     try:
-        from prophet import Prophet
+        from api.special_dates import resolve_special_date
+        from database import SyncSessionLocal
 
-        # Create minimal Prophet model to get holidays
-        m = Prophet()
-        m.add_country_holidays(country_name='GB')
+        # Use provided db or create new session
+        if db is None:
+            db = SyncSessionLocal()
+            close_db = True
+        else:
+            close_db = False
 
-        # Fit on dummy data
-        dummy_df = pd.DataFrame({
-            'ds': pd.date_range(start=from_date - timedelta(days=365), end=to_date, freq='D'),
-            'y': 0
-        })
-        m.fit(dummy_df)
+        try:
+            # Query active special dates from settings
+            result = db.execute(text("""
+                SELECT
+                    id, name, pattern_type,
+                    fixed_month, fixed_day,
+                    nth_week, weekday, month,
+                    relative_to_month, relative_to_day,
+                    relative_weekday, relative_direction,
+                    duration_days, is_recurring, one_off_year
+                FROM special_dates
+                WHERE is_active = TRUE
+            """))
+            rows = result.fetchall()
 
-        # Generate future dataframe to get holidays
-        future = m.make_future_dataframe(periods=0)
+            if not rows:
+                logger.info("No special dates configured in Settings")
+                return pd.DataFrame()
 
-        # Return holiday dates
-        if hasattr(m, 'train_holiday_names') and m.train_holiday_names:
-            holidays = pd.DataFrame({
-                'ds': pd.date_range(start=from_date, end=to_date, freq='D')
-            })
-            return holidays
-        return pd.DataFrame()
+            # Resolve all special dates for the years in our range
+            all_dates = []
+            years = set(range(from_date.year - 1, to_date.year + 2))  # Include buffer years
+
+            for row in rows:
+                sd = {
+                    'pattern_type': row.pattern_type,
+                    'fixed_month': row.fixed_month,
+                    'fixed_day': row.fixed_day,
+                    'nth_week': row.nth_week,
+                    'weekday': row.weekday,
+                    'month': row.month,
+                    'relative_to_month': row.relative_to_month,
+                    'relative_to_day': row.relative_to_day,
+                    'relative_weekday': row.relative_weekday,
+                    'relative_direction': row.relative_direction,
+                    'duration_days': row.duration_days or 1,
+                    'is_recurring': row.is_recurring,
+                    'one_off_year': row.one_off_year
+                }
+
+                for year in years:
+                    resolved = resolve_special_date(sd, year)
+                    for d in resolved:
+                        if from_date - timedelta(days=365) <= d <= to_date + timedelta(days=365):
+                            all_dates.append({
+                                'ds': pd.Timestamp(d),
+                                'name': row.name
+                            })
+
+            if all_dates:
+                holidays_df = pd.DataFrame(all_dates)
+                logger.info(f"Loaded {len(holidays_df)} special date occurrences from Settings")
+                return holidays_df
+
+            return pd.DataFrame()
+
+        finally:
+            if close_db:
+                db.close()
 
     except Exception as e:
-        logger.warning(f"Failed to load holidays: {e}")
+        logger.warning(f"Failed to load special dates from Settings: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return pd.DataFrame()
 
 
@@ -674,147 +718,3 @@ try:
     from pytorch_forecasting import TimeSeriesDataSet
 except ImportError:
     TimeSeriesDataSet = None
-
-
-async def _try_load_cached_model(db, metric_code: str):
-    """
-    Try to load a cached TFT model for the given metric.
-
-    Returns:
-        Tuple of (model, checkpoint) if found, (None, None) otherwise
-    """
-    try:
-        from services.model_storage import load_model
-        model, checkpoint = load_model(db, metric_code)
-        return model, checkpoint
-    except Exception as e:
-        logger.warning(f"Failed to load cached model for {metric_code}: {e}")
-        return None, None
-
-
-async def _generate_forecasts_from_cached_model(
-    db, model, checkpoint, metric_code: str,
-    forecast_from: date, forecast_to: date
-) -> List[dict]:
-    """
-    Generate forecasts using a cached TFT model.
-
-    This function rebuilds the dataset and generates predictions without
-    retraining the model.
-    """
-    try:
-        import torch
-        from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
-        import pandas as pd
-        import numpy as np
-
-        logger.info(f"Generating forecasts from cached model for {metric_code}")
-
-        # Get effective config
-        config = get_effective_config(db)
-        encoder_length = config['encoder_length']
-        prediction_length = config['prediction_length']
-        training_days = config['training_days']
-
-        # Load historical data needed for encoder context
-        training_from = forecast_from - timedelta(days=training_days + encoder_length)
-
-        # Map metric to column
-        metric_column_map = {
-            'hotel_occupancy_pct': 'total_occupancy_pct',
-            'hotel_room_nights': 'booking_count',
-            'hotel_guests': 'guests_count',
-        }
-
-        column_name = metric_column_map.get(metric_code)
-        if not column_name:
-            logger.warning(f"Unknown metric_code for TFT: {metric_code}")
-            return []
-
-        result = db.execute(
-            text(f"""
-            SELECT date, {column_name} as actual_value
-            FROM newbook_bookings_stats
-            WHERE date BETWEEN :from_date AND :to_date
-                AND {column_name} IS NOT NULL
-            ORDER BY date
-            """),
-            {
-                "from_date": training_from,
-                "to_date": forecast_from - timedelta(days=1)
-            }
-        )
-        rows = result.fetchall()
-
-        if len(rows) < encoder_length + 30:
-            logger.warning(f"Insufficient data for TFT prediction: {len(rows)} rows")
-            return []
-
-        # Prepare DataFrame
-        df = pd.DataFrame([{
-            "ds": pd.Timestamp(row.date),
-            "y": float(row.actual_value)
-        } for row in rows])
-        df = df.sort_values('ds').reset_index(drop=True)
-
-        # Load holidays
-        holidays_df = await _load_holidays(forecast_from, forecast_to)
-
-        # Create features
-        df = create_tft_features(df, holidays_df)
-
-        # Add time index and group
-        df['time_idx'] = range(len(df))
-        df['group'] = metric_code
-
-        # Drop NaN from lag features
-        df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
-
-        # Define feature columns (same as training)
-        time_varying_known = [
-            'day_of_week', 'month', 'week_of_year', 'is_weekend',
-            'is_holiday', 'days_to_holiday',
-            'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
-        ]
-
-        time_varying_unknown = [
-            'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
-            'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
-            'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
-        ]
-
-        if 'lag_364' in df.columns and df['lag_364'].notna().sum() > 30:
-            time_varying_unknown.append('lag_364')
-
-        # Recreate the training dataset structure
-        training = TimeSeriesDataSet(
-            df.copy(),
-            time_idx="time_idx",
-            target="y",
-            group_ids=["group"],
-            min_encoder_length=encoder_length // 2,
-            max_encoder_length=encoder_length,
-            min_prediction_length=1,
-            max_prediction_length=prediction_length,
-            static_categoricals=["group"],
-            time_varying_known_reals=time_varying_known,
-            time_varying_unknown_reals=time_varying_unknown,
-            add_relative_time_idx=True,
-            add_target_scales=True,
-            add_encoder_length=True,
-        )
-
-        # Generate forecasts using the same logic as _generate_forecasts
-        forecasts = await _generate_forecasts(
-            db, model, training, df, metric_code,
-            forecast_from, forecast_to, holidays_df,
-            time_varying_known, time_varying_unknown
-        )
-
-        return forecasts
-
-    except Exception as e:
-        logger.error(f"Failed to generate forecasts from cached model: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return []
