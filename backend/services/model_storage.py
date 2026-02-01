@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 # Model storage directory
 MODEL_DIR = Path("/app/models/tft")
 
+# In-memory model cache to avoid reloading from disk
+# Key: model_id or "active_{metric_code}", Value: (checkpoint, model_info, file_mtime)
+_model_cache: Dict[str, tuple] = {}
+
 
 @dataclass
 class ModelInfo:
@@ -60,9 +64,10 @@ def get_tft_config(db) -> Dict[str, Any]:
 
         # Convert to appropriate types
         if key in ('encoder_length', 'prediction_length', 'hidden_size',
-                   'attention_heads', 'batch_size', 'max_epochs', 'training_days'):
+                   'attention_heads', 'batch_size', 'max_epochs', 'training_days',
+                   'early_stop_patience'):
             config[key] = int(value)
-        elif key in ('learning_rate', 'dropout'):
+        elif key in ('learning_rate', 'dropout', 'early_stop_min_delta'):
             config[key] = float(value)
         elif key in ('use_gpu', 'auto_retrain', 'use_cached_model', 'use_special_dates', 'use_otb_data'):
             config[key] = value.lower() == 'true'
@@ -197,6 +202,13 @@ def save_model(
         })
 
         db.commit()
+
+        # Clear cache for this metric to ensure fresh loads
+        keys_to_remove = [k for k in _model_cache if k.startswith("model_")]
+        for k in keys_to_remove:
+            del _model_cache[k]
+        logger.info(f"Cleared model cache after saving")
+
         logger.info(f"Saved TFT model for {metric_code}: {file_path}")
         return str(file_path)
 
@@ -211,8 +223,7 @@ def load_model(db, metric_code: str):
     Load the active TFT model checkpoint for a metric.
 
     This function loads the saved checkpoint containing the model state dict
-    and training parameters. The actual model reconstruction happens in the
-    forecasting code using the dataset structure.
+    and training parameters. Uses in-memory cache to avoid disk reads.
 
     Args:
         db: Database session
@@ -245,7 +256,18 @@ def load_model(db, metric_code: str):
             logger.warning(f"Model file not found: {file_path}")
             return None, None
 
-        # Load checkpoint
+        # Check cache - use model_id as key for active model
+        cache_key = f"model_{row.id}"
+        file_mtime = file_path.stat().st_mtime
+
+        if cache_key in _model_cache:
+            cached_checkpoint, cached_info, cached_mtime = _model_cache[cache_key]
+            if cached_mtime == file_mtime:
+                logger.info(f"Using cached TFT model '{row.model_name}' for {metric_code}")
+                return cached_checkpoint, cached_info
+
+        # Load checkpoint from disk
+        logger.info(f"Loading TFT checkpoint from disk: {file_path}")
         checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
 
         # Validate checkpoint format
@@ -260,7 +282,10 @@ def load_model(db, metric_code: str):
             "file_path": str(file_path)
         }
 
-        logger.info(f"Loaded TFT checkpoint '{row.model_name}' for {metric_code} from {file_path}")
+        # Cache the loaded model
+        _model_cache[cache_key] = (checkpoint, model_info, file_mtime)
+        logger.info(f"Cached TFT model '{row.model_name}' for {metric_code}")
+
         return checkpoint, model_info
 
     except Exception as e:
@@ -271,13 +296,12 @@ def load_model(db, metric_code: str):
 
 
 def load_model_by_id(db, model_id: int):
-    """Load a specific model by ID"""
+    """Load a specific model by ID with caching"""
     try:
         import torch
-        from pytorch_forecasting import TemporalFusionTransformer
 
         result = db.execute(text("""
-            SELECT file_path FROM tft_models WHERE id = :id
+            SELECT file_path, model_name FROM tft_models WHERE id = :id
         """), {"id": model_id})
         row = result.fetchone()
 
@@ -288,7 +312,25 @@ def load_model_by_id(db, model_id: int):
         if not file_path.exists():
             return None, None
 
-        checkpoint = torch.load(file_path, map_location="cpu")
+        # Check cache
+        cache_key = f"model_{model_id}"
+        file_mtime = file_path.stat().st_mtime
+
+        if cache_key in _model_cache:
+            cached_checkpoint, cached_info, cached_mtime = _model_cache[cache_key]
+            if cached_mtime == file_mtime:
+                logger.info(f"Using cached TFT model ID {model_id}")
+                return cached_checkpoint, file_path
+
+        # Load from disk
+        logger.info(f"Loading TFT model {model_id} from disk: {file_path}")
+        checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
+
+        # Cache the loaded model
+        model_info = {"id": model_id, "model_name": row.model_name}
+        _model_cache[cache_key] = (checkpoint, model_info, file_mtime)
+        logger.info(f"Cached TFT model ID {model_id}")
+
         return checkpoint, file_path
 
     except Exception as e:

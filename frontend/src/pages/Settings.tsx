@@ -2411,6 +2411,8 @@ interface TFTSettings {
   use_cached_model: boolean
   use_special_dates: boolean
   use_otb_data: boolean
+  early_stop_patience: number
+  early_stop_min_delta: number
 }
 
 interface TFTModel {
@@ -2684,7 +2686,7 @@ const TFTTrainingPage: React.FC = () => {
           <>
             <div style={styles.settingsGrid}>
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>Encoder Length</label>
+                <label style={styles.settingLabel} title="How many days of past data the model looks at when making a prediction. Longer = more context but slower training. 90 days captures quarterly patterns.">Encoder Length</label>
                 <input
                   type="number"
                   value={settings.encoder_length}
@@ -2697,7 +2699,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>Hidden Size</label>
+                <label style={styles.settingLabel} title="Size of the neural network's hidden layers. Larger = more capacity to learn complex patterns but requires more data and training time. 64 is a good balance for most datasets.">Hidden Size</label>
                 <select
                   value={settings.hidden_size}
                   onChange={(e) => setSettings({ ...settings, hidden_size: parseInt(e.target.value) })}
@@ -2711,7 +2713,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>Max Epochs</label>
+                <label style={styles.settingLabel} title="Maximum number of training passes through the data. Training will stop earlier if early stopping triggers. Higher values allow more learning but increase training time.">Max Epochs</label>
                 <input
                   type="number"
                   value={settings.max_epochs}
@@ -2720,11 +2722,39 @@ const TFTTrainingPage: React.FC = () => {
                   min={10}
                   max={500}
                 />
-                <span style={styles.settingHint}>Training iterations</span>
+                <span style={styles.settingHint}>Training iterations (ceiling)</span>
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>Learning Rate</label>
+                <label style={styles.settingLabel} title="Number of epochs to wait for improvement before stopping. Higher values = train longer but risk overfitting. Lower values = stop sooner but might miss optimal performance. 10-20 is typical.">Early Stop Patience</label>
+                <input
+                  type="number"
+                  value={settings.early_stop_patience ?? 10}
+                  onChange={(e) => setSettings({ ...settings, early_stop_patience: parseInt(e.target.value) || 10 })}
+                  style={styles.settingInput}
+                  min={3}
+                  max={50}
+                />
+                <span style={styles.settingHint}>Epochs without improvement before stopping</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel} title="Minimum reduction in validation loss to count as improvement. Smaller values = more sensitive to tiny improvements (trains longer). Larger values = only count significant improvements (stops sooner).">Early Stop Min Delta</label>
+                <select
+                  value={settings.early_stop_min_delta ?? 0.0001}
+                  onChange={(e) => setSettings({ ...settings, early_stop_min_delta: parseFloat(e.target.value) })}
+                  style={styles.settingSelect}
+                >
+                  <option value={0.00001}>0.00001 (Very sensitive)</option>
+                  <option value={0.0001}>0.0001 (Default)</option>
+                  <option value={0.001}>0.001 (Less sensitive)</option>
+                  <option value={0.01}>0.01 (Least sensitive)</option>
+                </select>
+                <span style={styles.settingHint}>Minimum loss improvement to count</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel} title="How fast the model learns. Lower = slower but more stable learning, less likely to overshoot. Higher = faster training but might miss optimal weights. 0.001 is a safe default.">Learning Rate</label>
                 <select
                   value={settings.learning_rate}
                   onChange={(e) => setSettings({ ...settings, learning_rate: parseFloat(e.target.value) })}
@@ -2738,7 +2768,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>Batch Size</label>
+                <label style={styles.settingLabel} title="Number of samples processed before updating model weights. Larger batches = faster training, more memory usage, smoother gradients. Smaller batches = slower, less memory, more noise (can help escape local minima).">Batch Size</label>
                 <select
                   value={settings.batch_size}
                   onChange={(e) => setSettings({ ...settings, batch_size: parseInt(e.target.value) })}
@@ -2753,7 +2783,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>Training Days</label>
+                <label style={styles.settingLabel} title="How many days of historical data to use for training. More data = better seasonality capture but longer training. 2555 days (~7 years) captures multi-year trends. Minimum 365 for yearly patterns.">Training Days</label>
                 <input
                   type="number"
                   value={settings.training_days}
@@ -2766,7 +2796,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>
+                <label style={styles.settingLabel} title="Use NVIDIA GPU for training if available. Significantly faster for large models/datasets. Requires CUDA-compatible GPU and drivers. Falls back to CPU if unavailable.">
                   <input
                     type="checkbox"
                     checked={settings.use_gpu}
@@ -2779,7 +2809,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>
+                <label style={styles.settingLabel} title="When enabled, TFT preview uses the active trained model instead of training a new one. Much faster for previews. Disable to always train fresh (slower but uses current settings).">
                   <input
                     type="checkbox"
                     checked={settings.use_cached_model}
@@ -2792,7 +2822,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>
+                <label style={styles.settingLabel} title="Include holidays and special events (from Settings > Special Dates) as model features. Helps capture demand spikes around holidays. Model trained with this must have matching data at inference time.">
                   <input
                     type="checkbox"
                     checked={settings.use_special_dates}
@@ -2805,7 +2835,7 @@ const TFTTrainingPage: React.FC = () => {
               </div>
 
               <div style={styles.settingItem}>
-                <label style={styles.settingLabel}>
+                <label style={styles.settingLabel} title="Include On-The-Books booking data (reservations at 30d, 14d, 7d out) as features. Helps model learn pickup patterns and improve short-term accuracy. Requires booking_pace data to be populated.">
                   <input
                     type="checkbox"
                     checked={settings.use_otb_data}

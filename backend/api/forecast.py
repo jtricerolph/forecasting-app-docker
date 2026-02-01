@@ -16,6 +16,10 @@ from api.special_dates import resolve_special_date
 
 router = APIRouter()
 
+# TFT dataset cache - avoids expensive TimeSeriesDataSet recreation
+# Key: (metric, today_str), Value: (training_dataset, df, cache_time)
+_tft_dataset_cache = {}
+
 
 class ForecastResponse(BaseModel):
     date: date
@@ -758,18 +762,34 @@ async def get_prophet_preview(
             prior_year_final=round(prior_final, 1) if prior_final is not None else None
         ))
 
-    return ProphetResponse(
-        data=data_points,
-        summary=ProphetSummary(
-            otb_total=round(otb_total, 1),
-            prior_otb_total=round(prior_otb_total, 1),
-            forecast_total=round(forecast_total, 1),
-            prior_final_total=round(prior_final_total, 1),
-            days_count=len(data_points),
-            days_forecasting_more=days_forecasting_more,
-            days_forecasting_less=days_forecasting_less
+    # For occupancy (percentage), show averages; for rooms/guests (counts), show sums
+    days_count = len(data_points)
+    if metric == "occupancy" and days_count > 0:
+        return ProphetResponse(
+            data=data_points,
+            summary=ProphetSummary(
+                otb_total=round(otb_total / days_count, 1),
+                prior_otb_total=round(prior_otb_total / days_count, 1) if prior_otb_total > 0 else 0,
+                forecast_total=round(forecast_total / days_count, 1),
+                prior_final_total=round(prior_final_total / days_count, 1) if prior_final_total > 0 else 0,
+                days_count=days_count,
+                days_forecasting_more=days_forecasting_more,
+                days_forecasting_less=days_forecasting_less
+            )
         )
-    )
+    else:
+        return ProphetResponse(
+            data=data_points,
+            summary=ProphetSummary(
+                otb_total=round(otb_total, 1),
+                prior_otb_total=round(prior_otb_total, 1),
+                forecast_total=round(forecast_total, 1),
+                prior_final_total=round(prior_final_total, 1),
+                days_count=days_count,
+                days_forecasting_more=days_forecasting_more,
+                days_forecasting_less=days_forecasting_less
+            )
+        )
 
 
 # ============================================
@@ -1158,16 +1178,17 @@ async def get_xgboost_preview(
                 prior_year_final=round(prior_final) if prior_final is not None else None
             ))
 
-    # Round summary totals appropriately
-    if metric == "occupancy":
+    # For occupancy (percentage), show averages; for rooms/guests (counts), show sums
+    days_count = len(data_points)
+    if metric == "occupancy" and days_count > 0:
         return XGBoostResponse(
             data=data_points,
             summary=XGBoostSummary(
-                otb_total=round(otb_total, 1),
-                prior_otb_total=round(prior_otb_total, 1),
-                forecast_total=round(forecast_total, 1),
-                prior_final_total=round(prior_final_total, 1),
-                days_count=len(data_points),
+                otb_total=round(otb_total / days_count, 1),
+                prior_otb_total=round(prior_otb_total / days_count, 1) if prior_otb_total > 0 else 0,
+                forecast_total=round(forecast_total / days_count, 1),
+                prior_final_total=round(prior_final_total / days_count, 1) if prior_final_total > 0 else 0,
+                days_count=days_count,
                 days_forecasting_more=days_forecasting_more,
                 days_forecasting_less=days_forecasting_less
             )
@@ -1180,7 +1201,7 @@ async def get_xgboost_preview(
                 prior_otb_total=round(prior_otb_total),
                 forecast_total=round(forecast_total),
                 prior_final_total=round(prior_final_total),
-                days_count=len(data_points),
+                days_count=days_count,
                 days_forecasting_more=days_forecasting_more,
                 days_forecasting_less=days_forecasting_less
             )
@@ -1212,10 +1233,12 @@ async def _tft_predict_with_cached_model(
 
     from pytorch_forecasting import TimeSeriesDataSet
 
-    # Get historical data for encoder context (need ~60-90 days)
+    # Get historical data for encoder context
+    # Only need ~150 days: encoder_length + lag features (28) + buffer
     ENCODER_LENGTH = checkpoint.get('dataset_parameters', {}).get('max_encoder_length', 60)
+    HISTORY_DAYS = ENCODER_LENGTH + 90  # Enough for encoder + feature calculation
 
-    history_start = today - timedelta(days=730)
+    history_start = today - timedelta(days=HISTORY_DAYS)
     history_result = await db.execute(text("""
         SELECT date as ds, booking_count as y
         FROM newbook_bookings_stats
@@ -1226,68 +1249,82 @@ async def _tft_predict_with_cached_model(
     """), {"history_start": history_start, "today": today})
     history_rows = history_result.fetchall()
 
-    if len(history_rows) < 90:
-        raise HTTPException(status_code=400, detail="Insufficient historical data for TFT model (need 90+ days)")
-
-    # Build training dataframe
-    df = pd.DataFrame([{"ds": pd.Timestamp(row.ds), "y": float(row.y)} for row in history_rows])
-
-    # Convert to occupancy if needed
-    if metric == "occupancy" and total_rooms > 0:
-        df["y"] = (df["y"] / total_rooms) * 100
-
-    # Create features
-    df['day_of_week'] = df['ds'].dt.dayofweek
-    df['month'] = df['ds'].dt.month
-    df['week_of_year'] = df['ds'].dt.isocalendar().week.astype(int)
-    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-    df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-    df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
-    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
-
-    for lag in [7, 14, 21, 28]:
-        df[f'lag_{lag}'] = df['y'].shift(lag)
-
-    for window in [7, 14, 28]:
-        df[f'rolling_mean_{window}'] = df['y'].rolling(window=window, min_periods=1).mean()
-        df[f'rolling_std_{window}'] = df['y'].rolling(window=window, min_periods=1).std().fillna(0)
-
-    df['time_idx'] = range(len(df))
-    df['group'] = 'hotel'
-    df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
+    if len(history_rows) < 60:
+        raise HTTPException(status_code=400, detail="Insufficient historical data for TFT model (need 60+ days)")
 
     PREDICTION_LENGTH = min(28, (end - start).days + 1)
 
-    # Define features
-    time_varying_known = [
-        'day_of_week', 'month', 'week_of_year', 'is_weekend',
-        'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
-    ]
+    # Check dataset cache
+    cache_key = (metric, str(today), PREDICTION_LENGTH)
+    if cache_key in _tft_dataset_cache:
+        training, df = _tft_dataset_cache[cache_key]
+        import logging
+        logging.info(f"Using cached TFT dataset for {metric}")
+    else:
+        # Build training dataframe
+        df = pd.DataFrame([{"ds": pd.Timestamp(row.ds), "y": float(row.y)} for row in history_rows])
 
-    time_varying_unknown = [
-        'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
-        'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
-        'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
-    ]
+        # Convert to occupancy if needed
+        if metric == "occupancy" and total_rooms > 0:
+            df["y"] = (df["y"] / total_rooms) * 100
 
-    # Create TimeSeriesDataSet for prediction context
-    training = TimeSeriesDataSet(
-        df.copy(),
-        time_idx="time_idx",
-        target="y",
-        group_ids=["group"],
-        min_encoder_length=ENCODER_LENGTH // 2,
-        max_encoder_length=ENCODER_LENGTH,
-        min_prediction_length=1,
-        max_prediction_length=PREDICTION_LENGTH,
-        static_categoricals=["group"],
-        time_varying_known_reals=time_varying_known,
-        time_varying_unknown_reals=time_varying_unknown,
-        add_relative_time_idx=True,
-        add_target_scales=True,
-        add_encoder_length=True,
-    )
+        # Create features
+        df['day_of_week'] = df['ds'].dt.dayofweek
+        df['month'] = df['ds'].dt.month
+        df['week_of_year'] = df['ds'].dt.isocalendar().week.astype(int)
+        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+        df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+        df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+
+        for lag in [7, 14, 21, 28]:
+            df[f'lag_{lag}'] = df['y'].shift(lag)
+
+        for window in [7, 14, 28]:
+            df[f'rolling_mean_{window}'] = df['y'].rolling(window=window, min_periods=1).mean()
+            df[f'rolling_std_{window}'] = df['y'].rolling(window=window, min_periods=1).std().fillna(0)
+
+        df['time_idx'] = range(len(df))
+        df['group'] = 'hotel'
+        df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
+
+        # Define features
+        time_varying_known = [
+            'day_of_week', 'month', 'week_of_year', 'is_weekend',
+            'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
+        ]
+
+        time_varying_unknown = [
+            'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
+            'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
+            'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
+        ]
+
+        # Create TimeSeriesDataSet for prediction context
+        training = TimeSeriesDataSet(
+            df.copy(),
+            time_idx="time_idx",
+            target="y",
+            group_ids=["group"],
+            min_encoder_length=ENCODER_LENGTH // 2,
+            max_encoder_length=ENCODER_LENGTH,
+            min_prediction_length=1,
+            max_prediction_length=PREDICTION_LENGTH,
+            static_categoricals=["group"],
+            time_varying_known_reals=time_varying_known,
+            time_varying_unknown_reals=time_varying_unknown,
+            add_relative_time_idx=True,
+            add_target_scales=True,
+            add_encoder_length=True,
+        )
+
+        # Cache for subsequent requests (clear old entries to prevent memory bloat)
+        if len(_tft_dataset_cache) > 10:
+            _tft_dataset_cache.clear()
+        _tft_dataset_cache[cache_key] = (training, df)
+        import logging
+        logging.info(f"Created and cached TFT dataset for {metric}")
 
     # Generate forecasts for future dates
     future_dates = []
@@ -1346,7 +1383,7 @@ async def _tft_predict_with_cached_model(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TFT prediction failed: {str(e)}")
 
-    # Build response
+    # Build response - batch fetch all data for performance (avoid N queries per day)
     data_points = []
     otb_total = 0.0
     prior_otb_total = 0.0
@@ -1355,55 +1392,39 @@ async def _tft_predict_with_cached_model(
     days_forecasting_more = 0
     days_forecasting_less = 0
 
+    # Pre-fetch all current OTB data in one query
+    if not is_backtest:
+        current_otb_result = await db.execute(text("""
+            SELECT date, booking_count as current_otb
+            FROM newbook_bookings_stats
+            WHERE date >= :start_date AND date <= :end_date
+        """), {"start_date": start, "end_date": end})
+        current_otb_map = {row.date: row.current_otb for row in current_otb_result.fetchall()}
+    else:
+        current_otb_map = {}
+
+    # Pre-fetch all prior year final data in one query
+    prior_year_start = start - timedelta(days=364)
+    prior_year_end = end - timedelta(days=364)
+    prior_final_result = await db.execute(text("""
+        SELECT date, booking_count as prior_final
+        FROM newbook_bookings_stats
+        WHERE date >= :start_date AND date <= :end_date
+    """), {"start_date": prior_year_start, "end_date": prior_year_end})
+    prior_final_map = {row.date: row.prior_final for row in prior_final_result.fetchall()}
+
     for i, forecast_date in enumerate(future_dates):
         if i >= pred_values.shape[1]:
             break
 
         lead_days = (forecast_date - today).days
-        lead_col = get_lead_time_column(lead_days)
         prior_year_date = forecast_date - timedelta(days=364)
         day_of_week = forecast_date.strftime("%a")
 
-        # Get current OTB
-        if is_backtest:
-            current_otb_query = text(f"""
-                SELECT {lead_col} as current_otb
-                FROM newbook_booking_pace
-                WHERE arrival_date = :arrival_date
-            """)
-            current_result = await db.execute(current_otb_query, {"arrival_date": forecast_date})
-            current_row = current_result.fetchone()
-        else:
-            current_query = text("""
-                SELECT booking_count as current_otb
-                FROM newbook_bookings_stats
-                WHERE date = :arrival_date
-            """)
-            current_result = await db.execute(current_query, {"arrival_date": forecast_date})
-            current_row = current_result.fetchone()
-
-        # Get prior year OTB
-        prior_year_for_otb = forecast_date - timedelta(days=364)
-        prior_otb_query = text(f"""
-            SELECT {lead_col} as prior_otb
-            FROM newbook_booking_pace
-            WHERE arrival_date = :prior_date
-        """)
-        prior_otb_result = await db.execute(prior_otb_query, {"prior_date": prior_year_for_otb})
-        prior_otb_row = prior_otb_result.fetchone()
-
-        # Get prior year final
-        prior_query = text("""
-            SELECT booking_count as prior_final
-            FROM newbook_bookings_stats
-            WHERE date = :prior_date
-        """)
-        prior_result = await db.execute(prior_query, {"prior_date": prior_year_date})
-        prior_row = prior_result.fetchone()
-
-        current_otb = current_row.current_otb if current_row and current_row.current_otb is not None else 0
-        prior_otb = prior_otb_row.prior_otb if prior_otb_row and prior_otb_row.prior_otb is not None else None
-        prior_final = prior_row.prior_final if prior_row and prior_row.prior_final is not None else 0
+        # Get values from pre-fetched maps
+        current_otb = current_otb_map.get(forecast_date, 0) or 0
+        prior_final = prior_final_map.get(prior_year_date, 0) or 0
+        prior_otb = None  # Skip prior year OTB pace lookup for performance
 
         if metric == "occupancy" and total_rooms > 0:
             if current_otb is not None:
@@ -1461,18 +1482,34 @@ async def _tft_predict_with_cached_model(
             prior_year_final=round(prior_final, 1) if prior_final is not None else None
         ))
 
-    return TFTResponse(
-        data=data_points,
-        summary=TFTSummary(
-            otb_total=round(otb_total, 1),
-            prior_otb_total=round(prior_otb_total, 1),
-            forecast_total=round(forecast_total, 1),
-            prior_final_total=round(prior_final_total, 1),
-            days_count=len(data_points),
-            days_forecasting_more=days_forecasting_more,
-            days_forecasting_less=days_forecasting_less
+    # For occupancy (percentage), show averages; for rooms/guests (counts), show sums
+    days_count = len(data_points)
+    if metric == "occupancy" and days_count > 0:
+        return TFTResponse(
+            data=data_points,
+            summary=TFTSummary(
+                otb_total=round(otb_total / days_count, 1),
+                prior_otb_total=round(prior_otb_total / days_count, 1) if prior_otb_total > 0 else 0,
+                forecast_total=round(forecast_total / days_count, 1),
+                prior_final_total=round(prior_final_total / days_count, 1) if prior_final_total > 0 else 0,
+                days_count=days_count,
+                days_forecasting_more=days_forecasting_more,
+                days_forecasting_less=days_forecasting_less
+            )
         )
-    )
+    else:
+        return TFTResponse(
+            data=data_points,
+            summary=TFTSummary(
+                otb_total=round(otb_total, 1),
+                prior_otb_total=round(prior_otb_total, 1),
+                forecast_total=round(forecast_total, 1),
+                prior_final_total=round(prior_final_total, 1),
+                days_count=days_count,
+                days_forecasting_more=days_forecasting_more,
+                days_forecasting_less=days_forecasting_less
+            )
+        )
 
 
 class TFTDataPoint(BaseModel):
@@ -1506,6 +1543,7 @@ async def get_tft_preview(
     start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     end_date: str = Query(..., description="End date (YYYY-MM-DD)"),
     metric: str = Query("occupancy", description="Metric: occupancy or rooms"),
+    model_id: Optional[int] = Query(None, description="Specific TFT model ID to use (defaults to active model)"),
     perception_date: Optional[str] = Query(None, description="Optional: Generate forecast as if it was this date (YYYY-MM-DD) for backtesting"),
     use_cached: bool = Query(True, description="Use cached model if available (faster)"),
     force_retrain: bool = Query(False, description="Force retrain even if cached model exists"),
@@ -1583,16 +1621,23 @@ async def get_tft_preview(
     # Try to use cached model if enabled
     if use_cached and not force_retrain and not is_backtest:
         try:
-            from services.model_storage import load_model
+            from services.model_storage import load_model, load_model_by_id
             from database import SyncSessionLocal
 
             # Need sync session for model loading
             sync_db = SyncSessionLocal()
             try:
-                cached_model, checkpoint = load_model(sync_db, metric_code)
+                # Load specific model if model_id provided, otherwise use active model
+                if model_id:
+                    cached_model, checkpoint = load_model_by_id(sync_db, model_id)
+                else:
+                    cached_model, checkpoint = load_model(sync_db, metric_code)
                 if cached_model is not None:
                     import logging
-                    logging.info(f"Using cached TFT model for {metric_code}")
+                    if model_id:
+                        logging.info(f"Using TFT model ID {model_id} for {metric_code}")
+                    else:
+                        logging.info(f"Using active TFT model for {metric_code}")
 
                     # Use cached model for predictions
                     return await _tft_predict_with_cached_model(
@@ -1915,18 +1960,34 @@ async def get_tft_preview(
             prior_year_final=round(prior_final, 1) if prior_final is not None else None
         ))
 
-    return TFTResponse(
-        data=data_points,
-        summary=TFTSummary(
-            otb_total=round(otb_total, 1),
-            prior_otb_total=round(prior_otb_total, 1),
-            forecast_total=round(forecast_total, 1),
-            prior_final_total=round(prior_final_total, 1),
-            days_count=len(data_points),
-            days_forecasting_more=days_forecasting_more,
-            days_forecasting_less=days_forecasting_less
+    # For occupancy (percentage), show averages; for rooms/guests (counts), show sums
+    days_count = len(data_points)
+    if metric == "occupancy" and days_count > 0:
+        return TFTResponse(
+            data=data_points,
+            summary=TFTSummary(
+                otb_total=round(otb_total / days_count, 1),
+                prior_otb_total=round(prior_otb_total / days_count, 1) if prior_otb_total > 0 else 0,
+                forecast_total=round(forecast_total / days_count, 1),
+                prior_final_total=round(prior_final_total / days_count, 1) if prior_final_total > 0 else 0,
+                days_count=days_count,
+                days_forecasting_more=days_forecasting_more,
+                days_forecasting_less=days_forecasting_less
+            )
         )
-    )
+    else:
+        return TFTResponse(
+            data=data_points,
+            summary=TFTSummary(
+                otb_total=round(otb_total, 1),
+                prior_otb_total=round(prior_otb_total, 1),
+                forecast_total=round(forecast_total, 1),
+                prior_final_total=round(prior_final_total, 1),
+                days_count=days_count,
+                days_forecasting_more=days_forecasting_more,
+                days_forecasting_less=days_forecasting_less
+            )
+        )
 
 
 class PreviewDataPoint(BaseModel):
@@ -2166,17 +2227,32 @@ async def get_forecast_preview(
     if prior_otb_total > 0:
         pace_pct = round(((otb_total - prior_otb_total) / prior_otb_total) * 100, 1)
 
-    return PreviewResponse(
-        data=data_points,
-        summary=PreviewSummary(
-            otb_total=round(otb_total, 1),
-            forecast_total=round(forecast_total, 1),
-            prior_otb_total=round(prior_otb_total, 1),
-            prior_final_total=round(prior_final_total, 1),
-            pace_pct=pace_pct,
-            days_count=len(data_points)
+    # For occupancy (percentage), show averages; for rooms/guests (counts), show sums
+    days_count = len(data_points)
+    if metric == "occupancy" and days_count > 0:
+        return PreviewResponse(
+            data=data_points,
+            summary=PreviewSummary(
+                otb_total=round(otb_total / days_count, 1),
+                forecast_total=round(forecast_total / days_count, 1),
+                prior_otb_total=round(prior_otb_total / days_count, 1) if prior_otb_total > 0 else 0,
+                prior_final_total=round(prior_final_total / days_count, 1) if prior_final_total > 0 else 0,
+                pace_pct=pace_pct,
+                days_count=days_count
+            )
         )
-    )
+    else:
+        return PreviewResponse(
+            data=data_points,
+            summary=PreviewSummary(
+                otb_total=round(otb_total, 1),
+                forecast_total=round(forecast_total, 1),
+                prior_otb_total=round(prior_otb_total, 1),
+                prior_final_total=round(prior_final_total, 1),
+                pace_pct=pace_pct,
+                days_count=days_count
+            )
+        )
 
 
 class PaceCurvePoint(BaseModel):

@@ -40,7 +40,9 @@ INSERT INTO system_config (config_key, config_value, description) VALUES
 ('tft_auto_retrain', 'true', 'Enable weekly auto-retrain'),
 ('tft_use_cached_model', 'true', 'Use cached model for live preview'),
 ('tft_use_special_dates', 'true', 'Include special dates/holidays as features'),
-('tft_use_otb_data', 'true', 'Include OTB (On-The-Books) pickup data as features')
+('tft_use_otb_data', 'true', 'Include OTB (On-The-Books) pickup data as features'),
+('tft_early_stop_patience', '10', 'Epochs without improvement before stopping'),
+('tft_early_stop_min_delta', '0.0001', 'Minimum loss improvement to count as progress')
 ON CONFLICT (config_key) DO NOTHING;
 
 -- Training job status table

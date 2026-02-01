@@ -45,9 +45,10 @@ def get_tft_config_from_db(db) -> Dict[str, Any]:
 
             # Convert to appropriate types
             if key in ('encoder_length', 'prediction_length', 'hidden_size',
-                       'attention_heads', 'batch_size', 'max_epochs', 'training_days'):
+                       'attention_heads', 'batch_size', 'max_epochs', 'training_days',
+                       'early_stop_patience'):
                 config[key] = int(value) if value else 0
-            elif key in ('learning_rate', 'dropout'):
+            elif key in ('learning_rate', 'dropout', 'early_stop_min_delta'):
                 config[key] = float(value) if value else 0.0
             elif key in ('use_gpu', 'auto_retrain', 'use_cached_model', 'use_special_dates', 'use_otb_data'):
                 config[key] = value.lower() == 'true' if value else False

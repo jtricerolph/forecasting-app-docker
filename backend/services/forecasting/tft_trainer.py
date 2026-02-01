@@ -64,9 +64,17 @@ def train_tft_model_with_progress(
     use_gpu = config.get('use_gpu', False)
     use_special_dates = config.get('use_special_dates', True)
     use_otb_data = config.get('use_otb_data', True)
+    early_stop_patience = config.get('early_stop_patience', 10)
+    early_stop_min_delta = config.get('early_stop_min_delta', 0.0001)
 
-    logger.info(f"Starting TFT training for {metric_code} with config: "
-                f"epochs={max_epochs}, hidden={hidden_size}, lr={learning_rate}")
+    logger.info(f"Starting TFT training for {metric_code}")
+    logger.info(f"  Config: encoder_length={encoder_length}, prediction_length={prediction_length}")
+    logger.info(f"  Config: hidden_size={hidden_size}, attention_heads={attention_heads}")
+    logger.info(f"  Config: learning_rate={learning_rate}, batch_size={batch_size}")
+    logger.info(f"  Config: max_epochs={max_epochs}, training_days={training_days}")
+    logger.info(f"  Config: dropout={dropout}, use_gpu={use_gpu}")
+    logger.info(f"  Config: use_special_dates={use_special_dates}, use_otb_data={use_otb_data}")
+    logger.info(f"  Config: early_stop_patience={early_stop_patience}, early_stop_min_delta={early_stop_min_delta}")
 
     # Update job status to running
     update_training_job(db, job_id, status="running", progress_pct=5)
@@ -309,8 +317,8 @@ def train_tft_model_with_progress(
         # Training callbacks
         early_stop_callback = EarlyStopping(
             monitor="val_loss",
-            min_delta=1e-4,
-            patience=10,
+            min_delta=early_stop_min_delta,
+            patience=early_stop_patience,
             verbose=False,
             mode="min"
         )

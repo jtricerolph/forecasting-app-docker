@@ -1226,11 +1226,12 @@ async def _run_tft_training(job_id: str, metric_code: str, model_name: str, crea
             key = row.config_key.replace('tft_', '')
             value = row.config_value
             if key in ('encoder_length', 'prediction_length', 'hidden_size',
-                       'attention_heads', 'batch_size', 'max_epochs', 'training_days'):
+                       'attention_heads', 'batch_size', 'max_epochs', 'training_days',
+                       'early_stop_patience'):
                 settings[key] = int(value) if value else 0
-            elif key in ('learning_rate', 'dropout'):
+            elif key in ('learning_rate', 'dropout', 'early_stop_min_delta'):
                 settings[key] = float(value) if value else 0.0
-            elif key in ('use_gpu', 'auto_retrain', 'use_cached_model'):
+            elif key in ('use_gpu', 'auto_retrain', 'use_cached_model', 'use_special_dates', 'use_otb_data'):
                 settings[key] = value.lower() == 'true' if value else False
 
         # Import and run TFT training

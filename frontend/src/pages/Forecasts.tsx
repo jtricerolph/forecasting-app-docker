@@ -144,6 +144,15 @@ interface TFTResponse {
   summary: TFTSummary
 }
 
+interface TFTModel {
+  id: number
+  metric_code: string
+  model_name: string
+  is_active: boolean
+  trained_at: string
+  validation_loss: number | null
+}
+
 const Forecasts: React.FC = () => {
   const { forecastId } = useParams<{ forecastId?: string }>()
   const navigate = useNavigate()
@@ -1562,6 +1571,33 @@ const TFTPreview: React.FC = () => {
   const [endDate, setEndDate] = useState(defaultEnd.toISOString().split('T')[0])
   const [metric, setMetric] = useState<'occupancy' | 'rooms'>('rooms')
   const [showTable, setShowTable] = useState(false)
+  const [selectedModelId, setSelectedModelId] = useState<number | null>(null)
+  const [shouldFetch, setShouldFetch] = useState(false)
+
+  // Fetch available TFT models
+  const { data: tftModels } = useQuery<TFTModel[]>({
+    queryKey: ['tft-models'],
+    queryFn: async () => {
+      const response = await fetch('/api/config/tft-models', {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+    enabled: !!token,
+    staleTime: 60000, // Cache for 1 minute
+  })
+
+  // Filter models for current metric
+  const metricCode = metric === 'occupancy' ? 'hotel_occupancy_pct' : 'hotel_room_nights'
+  const availableModels = tftModels?.filter(m => m.metric_code === metricCode) ?? []
+
+  // Reset state when metric changes
+  const handleMetricChange = (newMetric: 'occupancy' | 'rooms') => {
+    setMetric(newMetric)
+    setSelectedModelId(null)
+    setShouldFetch(false)
+  }
 
   // Generate month options
   const monthOptions = useMemo(() => getNext12Months(), [])
@@ -1588,13 +1624,16 @@ const TFTPreview: React.FC = () => {
 
   // Fetch TFT forecast data
   const { data: tftData, isLoading: tftLoading, error: tftError } = useQuery<TFTResponse>({
-    queryKey: ['tft-preview', startDate, endDate, metric],
+    queryKey: ['tft-preview', startDate, endDate, metric, selectedModelId],
     queryFn: async () => {
       const params = new URLSearchParams({
         start_date: startDate,
         end_date: endDate,
         metric: metric,
       })
+      if (selectedModelId) {
+        params.append('model_id', selectedModelId.toString())
+      }
       const response = await fetch(`/api/forecast/tft-preview?${params}`, {
         headers: { Authorization: `Bearer ${token}` },
       })
@@ -1604,10 +1643,11 @@ const TFTPreview: React.FC = () => {
       }
       return response.json()
     },
-    enabled: !!token && !!startDate && !!endDate,
+    enabled: !!token && !!startDate && !!endDate && shouldFetch && availableModels.length > 0,
     retry: false,  // TFT can take time, don't retry automatically
   })
 
+  const hasModels = availableModels.length > 0
   const metricLabel = metric === 'occupancy' ? 'Occupancy %' : 'Room Nights'
   const unit = metric === 'occupancy' ? '%' : ' rooms'
 
@@ -1713,6 +1753,22 @@ const TFTPreview: React.FC = () => {
             Temporal Fusion Transformer with attention-based explainability and uncertainty quantiles
           </p>
         </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
+          <label style={{ ...styles.label, marginBottom: 0 }}>Model:</label>
+          <select
+            value={selectedModelId ?? ''}
+            onChange={(e) => setSelectedModelId(e.target.value ? Number(e.target.value) : null)}
+            style={{ ...styles.monthSelect, minWidth: '180px' }}
+            disabled={availableModels.length === 0}
+          >
+            <option value="">Active Model</option>
+            {availableModels.map(m => (
+              <option key={m.id} value={m.id}>
+                {m.model_name || `Model ${m.id}`}{m.is_active ? ' (active)' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Controls */}
@@ -1724,14 +1780,14 @@ const TFTPreview: React.FC = () => {
             <input
               type="date"
               value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
+              onChange={(e) => { setStartDate(e.target.value); setShouldFetch(false) }}
               style={styles.dateInput}
             />
             <span style={styles.dateSeparator}>to</span>
             <input
               type="date"
               value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
+              onChange={(e) => { setEndDate(e.target.value); setShouldFetch(false) }}
               style={styles.dateInput}
             />
           </div>
@@ -1744,7 +1800,7 @@ const TFTPreview: React.FC = () => {
             {(['occupancy', 'rooms'] as const).map((m) => (
               <button
                 key={m}
-                onClick={() => setMetric(m)}
+                onClick={() => handleMetricChange(m)}
                 style={{
                   ...styles.toggleButton,
                   ...(metric === m ? styles.toggleButtonActive : {}),
@@ -1763,7 +1819,7 @@ const TFTPreview: React.FC = () => {
             {[7, 14, 30, 60, 90].map((days) => (
               <button
                 key={days}
-                onClick={() => handleQuickSelect(days)}
+                onClick={() => { handleQuickSelect(days); setShouldFetch(false) }}
                 style={styles.quickSelectButton}
               >
                 {days}d
@@ -1771,7 +1827,7 @@ const TFTPreview: React.FC = () => {
             ))}
           </div>
           <select
-            onChange={(e) => handleMonthSelect(e.target.value)}
+            onChange={(e) => { handleMonthSelect(e.target.value); setShouldFetch(false) }}
             style={{ ...styles.monthSelect, marginTop: spacing.xs }}
             defaultValue=""
           >
@@ -1783,13 +1839,41 @@ const TFTPreview: React.FC = () => {
             ))}
           </select>
         </div>
+
+        {/* Generate Button */}
+        <div style={{ ...styles.controlGroup, display: 'flex', alignItems: 'flex-end' }}>
+          <button
+            onClick={() => setShouldFetch(true)}
+            disabled={!hasModels || tftLoading}
+            style={{
+              ...styles.quickSelectButton,
+              padding: `${spacing.sm} ${spacing.lg}`,
+              background: hasModels ? colors.primary : colors.textMuted,
+              color: '#fff',
+              fontWeight: typography.semibold,
+              cursor: hasModels ? 'pointer' : 'not-allowed',
+              opacity: hasModels ? 1 : 0.5,
+            }}
+          >
+            {tftLoading ? 'Loading...' : 'Generate'}
+          </button>
+        </div>
       </div>
+
+      {/* No Models Warning */}
+      {!hasModels && (
+        <div style={{ ...styles.loadingContainer, background: '#fff7ed', border: `1px solid #fed7aa` }}>
+          <p style={{ ...styles.loadingText, color: '#ea580c' }}>
+            No trained TFT models available for {metricLabel}. Train a model in Settings → TFT Training first.
+          </p>
+        </div>
+      )}
 
       {/* Loading and Error States */}
       {tftLoading && (
         <div style={styles.loadingContainer}>
           <div style={styles.spinner} />
-          <p style={styles.loadingText}>Training TFT model... This may take 1-2 minutes.</p>
+          <p style={styles.loadingText}>Loading TFT forecast...</p>
         </div>
       )}
 
