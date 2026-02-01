@@ -62,6 +62,8 @@ def train_tft_model_with_progress(
     training_days = config.get('training_days', 2555)
     dropout = config.get('dropout', 0.1)
     use_gpu = config.get('use_gpu', False)
+    use_special_dates = config.get('use_special_dates', True)
+    use_otb_data = config.get('use_otb_data', True)
 
     logger.info(f"Starting TFT training for {metric_code} with config: "
                 f"epochs={max_epochs}, hidden={hidden_size}, lr={learning_rate}")
@@ -123,12 +125,28 @@ def train_tft_model_with_progress(
         } for row in rows])
         df = df.sort_values('ds').reset_index(drop=True)
 
-        # Load special dates from Settings
-        special_dates = _load_special_dates(db, training_from, forecast_from + timedelta(days=prediction_length))
-        logger.info(f"Using {len(special_dates)} special dates from Settings for training")
+        # Load special dates from Settings (conditionally)
+        special_dates = None
+        if use_special_dates:
+            special_dates = _load_special_dates(db, training_from, forecast_from + timedelta(days=prediction_length))
+            logger.info(f"Using {len(special_dates)} special dates from Settings for training")
+        else:
+            logger.info("Special dates disabled - not including holiday features")
 
-        # Create features (now includes holiday features)
+        # Create base features (includes holiday features if special_dates provided)
         df = _create_tft_features(df, special_dates)
+
+        # Load and add OTB features (conditionally)
+        if use_otb_data:
+            otb_df = _load_otb_data(db, training_from, forecast_from)
+            if len(otb_df) > 0:
+                df = _add_otb_features(df, otb_df)
+                logger.info("Added OTB pickup features to training data")
+            else:
+                logger.info("No OTB data found - using zero defaults")
+                df = _add_otb_features(df, None)
+        else:
+            logger.info("OTB data disabled - not including pickup features")
 
         # Add time index for TFT
         df['time_idx'] = range(len(df))
@@ -145,12 +163,15 @@ def train_tft_model_with_progress(
         # Define training cutoff
         training_cutoff = len(df) - prediction_length
 
-        # Define feature columns (now includes holiday features from Settings)
+        # Define feature columns - base features always included
         time_varying_known = [
             'day_of_week', 'month', 'week_of_year', 'is_weekend',
-            'is_holiday', 'days_to_holiday',
             'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
         ]
+
+        # Add holiday features if special dates enabled
+        if use_special_dates:
+            time_varying_known.extend(['is_holiday', 'days_to_holiday'])
 
         time_varying_unknown = [
             'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
@@ -160,6 +181,16 @@ def train_tft_model_with_progress(
 
         if 'lag_364' in df.columns and df['lag_364'].notna().sum() > 30:
             time_varying_unknown.append('lag_364')
+
+        # Add OTB features if enabled - these are "unknown" because we learn from historical pickup patterns
+        if use_otb_data and 'otb_at_30d' in df.columns:
+            otb_features = [
+                'otb_at_30d', 'otb_at_14d', 'otb_at_7d',
+                'pickup_30d_to_14d', 'pickup_14d_to_7d',
+                'otb_pct_at_30d', 'otb_pct_at_14d', 'otb_pct_at_7d'
+            ]
+            time_varying_unknown.extend(otb_features)
+            logger.info(f"Including OTB features: {otb_features}")
 
         # Create TimeSeriesDataSet
         training_data = df.iloc[:training_cutoff].copy()
@@ -277,6 +308,8 @@ def train_tft_model_with_progress(
             "training_days": training_days,
             "dropout": dropout,
             "use_gpu": use_gpu,
+            "use_special_dates": use_special_dates,
+            "use_otb_data": use_otb_data,
         }
 
         file_path = save_model(
@@ -419,3 +452,123 @@ def _load_special_dates(db, from_date: date, to_date: date) -> set:
     except Exception as e:
         logger.warning(f"Failed to load special dates: {e}")
         return set()
+
+
+def _load_otb_data(db, from_date: date, to_date: date) -> pd.DataFrame:
+    """
+    Load OTB (On-The-Books) data from booking_pace table.
+
+    Returns DataFrame with columns:
+    - arrival_date
+    - otb_at_90d, otb_at_60d, otb_at_30d, otb_at_14d, otb_at_7d (historical pickup levels)
+    - final_bookings (d0 = actual final)
+    """
+    try:
+        result = db.execute(text("""
+            SELECT
+                arrival_date,
+                d90 as otb_at_90d,
+                d60 as otb_at_60d,
+                d30 as otb_at_30d,
+                d14 as otb_at_14d,
+                d7 as otb_at_7d,
+                d0 as final_bookings
+            FROM newbook_booking_pace
+            WHERE arrival_date BETWEEN :from_date AND :to_date
+            ORDER BY arrival_date
+        """), {"from_date": from_date, "to_date": to_date})
+        rows = result.fetchall()
+
+        if not rows:
+            logger.info("No OTB data found in booking_pace table")
+            return pd.DataFrame()
+
+        df = pd.DataFrame([{
+            "arrival_date": row.arrival_date,
+            "otb_at_90d": float(row.otb_at_90d) if row.otb_at_90d else 0,
+            "otb_at_60d": float(row.otb_at_60d) if row.otb_at_60d else 0,
+            "otb_at_30d": float(row.otb_at_30d) if row.otb_at_30d else 0,
+            "otb_at_14d": float(row.otb_at_14d) if row.otb_at_14d else 0,
+            "otb_at_7d": float(row.otb_at_7d) if row.otb_at_7d else 0,
+            "final_bookings": float(row.final_bookings) if row.final_bookings else 0
+        } for row in rows])
+
+        logger.info(f"Loaded OTB data for {len(df)} dates")
+        return df
+
+    except Exception as e:
+        logger.warning(f"Failed to load OTB data: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return pd.DataFrame()
+
+
+def _add_otb_features(df: pd.DataFrame, otb_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add OTB features to the training dataframe.
+
+    Creates features that teach the model pickup patterns:
+    - otb_at_30d, otb_at_14d, otb_at_7d: Historical OTB levels
+    - pickup_30d_to_14d, pickup_14d_to_7d: Pickup between windows
+    - otb_pct_at_30d, otb_pct_at_14d, otb_pct_at_7d: OTB as % of final
+    """
+    df = df.copy()
+
+    if otb_df is None or len(otb_df) == 0:
+        # No OTB data - set defaults
+        df['otb_at_30d'] = 0
+        df['otb_at_14d'] = 0
+        df['otb_at_7d'] = 0
+        df['pickup_30d_to_14d'] = 0
+        df['pickup_14d_to_7d'] = 0
+        df['otb_pct_at_30d'] = 0
+        df['otb_pct_at_14d'] = 0
+        df['otb_pct_at_7d'] = 0
+        return df
+
+    # Create date column for merging
+    df['date_only'] = df['ds'].dt.date
+
+    # Merge OTB data
+    otb_df = otb_df.copy()
+    otb_df['date_only'] = pd.to_datetime(otb_df['arrival_date']).dt.date
+
+    df = df.merge(
+        otb_df[['date_only', 'otb_at_90d', 'otb_at_60d', 'otb_at_30d',
+                'otb_at_14d', 'otb_at_7d', 'final_bookings']],
+        on='date_only',
+        how='left'
+    )
+
+    # Fill NaN with 0
+    for col in ['otb_at_90d', 'otb_at_60d', 'otb_at_30d', 'otb_at_14d', 'otb_at_7d', 'final_bookings']:
+        df[col] = df[col].fillna(0)
+
+    # Calculate pickup between windows
+    df['pickup_30d_to_14d'] = df['otb_at_14d'] - df['otb_at_30d']
+    df['pickup_14d_to_7d'] = df['otb_at_7d'] - df['otb_at_14d']
+
+    # Calculate OTB as percentage of final (capped at 100%)
+    df['otb_pct_at_30d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_30d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+    df['otb_pct_at_14d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_14d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+    df['otb_pct_at_7d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_7d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+
+    # Drop temporary column
+    df = df.drop(columns=['date_only'], errors='ignore')
+
+    logger.info(f"Added OTB features: mean OTB at 30d={df['otb_at_30d'].mean():.1f}, "
+                f"14d={df['otb_at_14d'].mean():.1f}, 7d={df['otb_at_7d'].mean():.1f}")
+
+    return df

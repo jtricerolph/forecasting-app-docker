@@ -38,7 +38,9 @@ INSERT INTO system_config (config_key, config_value, description) VALUES
 ('tft_dropout', '0.1', 'Dropout rate'),
 ('tft_use_gpu', 'false', 'Use GPU for training'),
 ('tft_auto_retrain', 'true', 'Enable weekly auto-retrain'),
-('tft_use_cached_model', 'true', 'Use cached model for live preview')
+('tft_use_cached_model', 'true', 'Use cached model for live preview'),
+('tft_use_special_dates', 'true', 'Include special dates/holidays as features'),
+('tft_use_otb_data', 'true', 'Include OTB (On-The-Books) pickup data as features')
 ON CONFLICT (config_key) DO NOTHING;
 
 -- Training job status table

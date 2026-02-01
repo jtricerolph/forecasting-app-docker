@@ -64,7 +64,7 @@ def get_tft_config(db) -> Dict[str, Any]:
             config[key] = int(value)
         elif key in ('learning_rate', 'dropout'):
             config[key] = float(value)
-        elif key in ('use_gpu', 'auto_retrain', 'use_cached_model'):
+        elif key in ('use_gpu', 'auto_retrain', 'use_cached_model', 'use_special_dates', 'use_otb_data'):
             config[key] = value.lower() == 'true'
         else:
             config[key] = value
@@ -208,18 +208,23 @@ def save_model(
 
 def load_model(db, metric_code: str):
     """
-    Load the active TFT model for a metric.
+    Load the active TFT model checkpoint for a metric.
+
+    This function loads the saved checkpoint containing the model state dict
+    and training parameters. The actual model reconstruction happens in the
+    forecasting code using the dataset structure.
 
     Args:
         db: Database session
         metric_code: Metric to load model for
 
     Returns:
-        Tuple of (model, checkpoint, model_info) if found, (None, None, None) otherwise
+        Tuple of (checkpoint, model_info) if found, (None, None) otherwise
+        - checkpoint: Dict with model_state_dict, model_hparams, dataset_parameters, etc.
+        - model_info: Dict with id, model_name, trained_at, file_path
     """
     try:
         import torch
-        from pytorch_forecasting import TemporalFusionTransformer
 
         # Get active model path
         result = db.execute(text("""
@@ -233,44 +238,20 @@ def load_model(db, metric_code: str):
 
         if not row or not row.file_path:
             logger.info(f"No active TFT model found for {metric_code}")
-            return None, None, None
+            return None, None
 
         file_path = Path(row.file_path)
         if not file_path.exists():
             logger.warning(f"Model file not found: {file_path}")
-            return None, None, None
+            return None, None
 
         # Load checkpoint
         checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
 
-        # Reconstruct model from checkpoint
-        # We need to recreate the model architecture from saved hparams
+        # Validate checkpoint format
         if "model_state_dict" not in checkpoint:
             logger.error(f"Invalid checkpoint format: missing model_state_dict")
-            return None, None, None
-
-        # Create model from hparams and load state dict
-        hparams = checkpoint.get("model_hparams", {})
-
-        # Build model with the same architecture
-        from pytorch_forecasting.metrics import QuantileLoss
-        model = TemporalFusionTransformer(
-            hidden_size=hparams.get("hidden_size", 64),
-            attention_head_size=hparams.get("attention_head_size", 4),
-            dropout=hparams.get("dropout", 0.1),
-            hidden_continuous_size=hparams.get("hidden_continuous_size", 16),
-            output_size=hparams.get("output_size", 7),
-            loss=QuantileLoss(),
-            learning_rate=hparams.get("learning_rate", 0.001),
-            **{k: v for k, v in hparams.items() if k not in [
-                "hidden_size", "attention_head_size", "dropout",
-                "hidden_continuous_size", "output_size", "learning_rate", "loss"
-            ]}
-        )
-
-        # Load the trained weights
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()  # Set to evaluation mode
+            return None, None
 
         model_info = {
             "id": row.id,
@@ -279,14 +260,14 @@ def load_model(db, metric_code: str):
             "file_path": str(file_path)
         }
 
-        logger.info(f"Loaded TFT model '{row.model_name}' for {metric_code} from {file_path}")
-        return model, checkpoint, model_info
+        logger.info(f"Loaded TFT checkpoint '{row.model_name}' for {metric_code} from {file_path}")
+        return checkpoint, model_info
 
     except Exception as e:
         logger.error(f"Failed to load TFT model for {metric_code}: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return None, None, None
+        return None, None
 
 
 def load_model_by_id(db, model_id: int):
