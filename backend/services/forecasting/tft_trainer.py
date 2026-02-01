@@ -82,8 +82,8 @@ def train_tft_model_with_progress(
 
         forecast_from = date.today()
         training_from = forecast_from - timedelta(days=training_days + encoder_length)
-        # Query 364 extra days back for lag_364 calculation
-        data_from = training_from - timedelta(days=364)
+        # Ideally query 364 extra days back for lag_364 calculation
+        ideal_data_from = training_from - timedelta(days=364)
 
         # Map metric to column
         metric_column_map = {
@@ -96,6 +96,30 @@ def train_tft_model_with_progress(
         if not column_name:
             raise ValueError(f"Unknown metric_code: {metric_code}")
 
+        # Check oldest available date in database
+        oldest_result = db.execute(
+            text(f"""
+            SELECT MIN(date) as oldest_date
+            FROM newbook_bookings_stats
+            WHERE {column_name} IS NOT NULL
+            """)
+        )
+        oldest_row = oldest_result.fetchone()
+        oldest_available = oldest_row.oldest_date if oldest_row and oldest_row.oldest_date else ideal_data_from
+
+        # Adjust data_from to oldest available if we're asking for data before it exists
+        if ideal_data_from < oldest_available:
+            data_from = oldest_available
+            days_short = (ideal_data_from - oldest_available).days
+            logger.info(f"Adjusted data_from to oldest available: {oldest_available} "
+                       f"(requested {abs(days_short)} days before available history)")
+        else:
+            data_from = ideal_data_from
+
+        # Calculate how many days we have for lag_364
+        days_before_training = (training_from - data_from).days
+        can_use_lag_364 = days_before_training >= 364
+
         result = db.execute(
             text(f"""
             SELECT date, {column_name} as actual_value
@@ -105,19 +129,27 @@ def train_tft_model_with_progress(
             ORDER BY date
             """),
             {
-                "from_date": data_from,  # Query extra 364 days for lag_364
+                "from_date": data_from,
                 "to_date": forecast_from - timedelta(days=1)
             }
         )
         rows = result.fetchall()
 
-        min_required = encoder_length + 90 + 364  # Need extra for lag_364
+        # Minimum required: encoder_length + 90 for basic training
+        # If we can use lag_364, we need 364 extra rows
+        min_required = encoder_length + 90
+        if can_use_lag_364:
+            min_required += 364
+
         if len(rows) < min_required:
             raise ValueError(
                 f"Insufficient data: {len(rows)} records, need at least {min_required}"
             )
 
-        logger.info(f"Loaded {len(rows)} records (includes 364 extra for lag_364)")
+        if can_use_lag_364:
+            logger.info(f"Loaded {len(rows)} records (includes {days_before_training} days for lag_364)")
+        else:
+            logger.info(f"Loaded {len(rows)} records (lag_364 disabled - only {days_before_training} days before training_from)")
         update_training_job(db, job_id, progress_pct=15)
 
         # Prepare DataFrame
@@ -154,13 +186,17 @@ def train_tft_model_with_progress(
         df['time_idx'] = range(len(df))
         df['group'] = metric_code
 
-        # Drop the first 364 rows (they were only needed to calculate lag_364)
+        # Drop prefix rows used for lag_364 calculation (if we have them)
         # Then drop any remaining NaN from other lag features
-        if 'lag_364' in df.columns:
+        if can_use_lag_364 and 'lag_364' in df.columns:
             # Keep only rows where lag_364 is valid (after row 364)
             df = df.iloc[364:].copy()
             df = df.reset_index(drop=True)
-            logger.info(f"Dropped first 364 rows, now have {len(df)} rows for training")
+            logger.info(f"Dropped first 364 rows for lag_364, now have {len(df)} rows")
+        elif 'lag_364' in df.columns:
+            # Not enough history for lag_364 - drop the column
+            df = df.drop(columns=['lag_364'])
+            logger.info("Dropped lag_364 column - insufficient history")
 
         df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
 
