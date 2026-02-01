@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from typing import List, Optional
 import pandas as pd
 import numpy as np
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ async def run_prophet_forecast(
     metric_code: str,
     forecast_from: date,
     forecast_to: date,
-    training_days: int = 365
+    training_days: int = 2555  # ~7 years - use all available history
 ) -> List[dict]:
     """
     Run Prophet forecast for a metric
@@ -34,19 +35,30 @@ async def run_prophet_forecast(
     try:
         from prophet import Prophet
 
-        # Get historical data
+        # Get historical data from newbook_bookings_stats (forecast_data database)
         training_from = forecast_from - timedelta(days=training_days)
 
+        # Map metric_code to the correct column in newbook_bookings_stats
+        metric_column_map = {
+            'hotel_occupancy_pct': 'total_occupancy_pct',
+            'hotel_room_nights': 'booking_count',
+            'hotel_guests': 'guests_count',
+        }
+
+        column_name = metric_column_map.get(metric_code)
+        if not column_name:
+            logger.warning(f"Unknown metric_code for Prophet: {metric_code}")
+            return []
+
         result = db.execute(
-            """
-            SELECT date, actual_value
-            FROM daily_metrics
-            WHERE metric_code = :metric_code
-                AND date BETWEEN :from_date AND :to_date
-                AND actual_value IS NOT NULL
+            text(f"""
+            SELECT date, {column_name} as actual_value
+            FROM newbook_bookings_stats
+            WHERE date BETWEEN :from_date AND :to_date
+                AND {column_name} IS NOT NULL
             ORDER BY date
-            """,
-            {"metric_code": metric_code, "from_date": training_from, "to_date": forecast_from - timedelta(days=1)}
+            """),
+            {"from_date": training_from, "to_date": forecast_from - timedelta(days=1)}
         )
         rows = result.fetchall()
 
@@ -84,15 +96,15 @@ async def run_prophet_forecast(
                 "forecast_date": row["ds"].date(),
                 "forecast_type": metric_code,
                 "model_type": "prophet",
-                "predicted_value": round(row["yhat"], 2),
-                "lower_bound": round(row["yhat_lower"], 2),
-                "upper_bound": round(row["yhat_upper"], 2)
+                "predicted_value": round(float(row["yhat"]), 2),
+                "lower_bound": round(float(row["yhat_lower"]), 2),
+                "upper_bound": round(float(row["yhat_upper"]), 2)
             }
             forecasts.append(forecast_record)
 
-            # Store in database
+            # Store in database - simple insert (latest value wins)
             db.execute(
-                """
+                text("""
                 INSERT INTO forecasts (
                     forecast_date, forecast_type, model_type,
                     predicted_value, lower_bound, upper_bound, generated_at
@@ -100,33 +112,32 @@ async def run_prophet_forecast(
                     :forecast_date, :forecast_type, :model_type,
                     :predicted_value, :lower_bound, :upper_bound, NOW()
                 )
-                ON CONFLICT (forecast_date, forecast_type, model_type, generated_at)
-                DO UPDATE SET predicted_value = :predicted_value,
-                    lower_bound = :lower_bound, upper_bound = :upper_bound
-                """,
+                """),
                 forecast_record
             )
 
             # Store decomposition for explainability
-            db.execute(
-                """
-                INSERT INTO prophet_decomposition (
-                    forecast_date, forecast_type, trend,
-                    yearly_seasonality, weekly_seasonality, generated_at
-                ) VALUES (
-                    :date, :metric, :trend, :yearly, :weekly, NOW()
+            # Simple insert - decomposition stored per generation
+            try:
+                db.execute(
+                    text("""
+                    INSERT INTO prophet_decomposition (
+                        forecast_date, forecast_type, trend,
+                        yearly_seasonality, weekly_seasonality, generated_at
+                    ) VALUES (
+                        :date, :metric, :trend, :yearly, :weekly, NOW()
+                    )
+                    """),
+                    {
+                        "date": row["ds"].date(),
+                        "metric": metric_code,
+                        "trend": round(float(row.get("trend", 0)), 4),
+                        "yearly": round(float(row.get("yearly", 0)), 4),
+                        "weekly": round(float(row.get("weekly", 0)), 4)
+                    }
                 )
-                ON CONFLICT (run_id, forecast_date, forecast_type)
-                DO UPDATE SET trend = :trend, yearly_seasonality = :yearly
-                """,
-                {
-                    "date": row["ds"].date(),
-                    "metric": metric_code,
-                    "trend": round(row.get("trend", 0), 4),
-                    "yearly": round(row.get("yearly", 0), 4),
-                    "weekly": round(row.get("weekly", 0), 4)
-                }
-            )
+            except Exception:
+                pass  # Skip if conflict, decomposition is supplementary
 
         db.commit()
         logger.info(f"Prophet forecast generated for {metric_code}: {len(forecasts)} records")

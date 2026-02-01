@@ -8,6 +8,7 @@ from typing import List, Optional
 import pandas as pd
 import numpy as np
 import json
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,10 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         df[f'rolling_mean_{window}'] = df['y'].rolling(window=window, min_periods=1).mean()
         df[f'rolling_std_{window}'] = df['y'].rolling(window=window, min_periods=1).std()
 
-    # Year-over-year comparison (if enough data)
+    # Year-over-year feature: uses 365 days (same calendar date, not DOW-aligned)
+    # This is intentional for ML: captures date-specific patterns like holidays
+    # Combined with day_of_week features, the model learns both patterns
+    # Note: For direct comparisons (pickup model), use 364 days for DOW alignment
     if len(df) > 365:
         df['lag_365'] = df['y'].shift(365)
 
@@ -64,7 +68,7 @@ async def run_xgboost_forecast(
     metric_code: str,
     forecast_from: date,
     forecast_to: date,
-    training_days: int = 365
+    training_days: int = 2555  # ~7 years - use all available history
 ) -> List[dict]:
     """
     Run XGBoost forecast for a metric
@@ -83,19 +87,30 @@ async def run_xgboost_forecast(
         import xgboost as xgb
         from sklearn.model_selection import train_test_split
 
-        # Get historical data
+        # Get historical data from newbook_bookings_stats (forecast_data database)
         training_from = forecast_from - timedelta(days=training_days + 60)  # Extra for lag features
 
+        # Map metric_code to the correct column in newbook_bookings_stats
+        metric_column_map = {
+            'hotel_occupancy_pct': 'total_occupancy_pct',
+            'hotel_room_nights': 'booking_count',
+            'hotel_guests': 'guests_count',
+        }
+
+        column_name = metric_column_map.get(metric_code)
+        if not column_name:
+            logger.warning(f"Unknown metric_code for XGBoost: {metric_code}")
+            return []
+
         result = db.execute(
-            """
-            SELECT date, actual_value
-            FROM daily_metrics
-            WHERE metric_code = :metric_code
-                AND date BETWEEN :from_date AND :to_date
-                AND actual_value IS NOT NULL
+            text(f"""
+            SELECT date, {column_name} as actual_value
+            FROM newbook_bookings_stats
+            WHERE date BETWEEN :from_date AND :to_date
+                AND {column_name} IS NOT NULL
             ORDER BY date
-            """,
-            {"metric_code": metric_code, "from_date": training_from, "to_date": forecast_from - timedelta(days=1)}
+            """),
+            {"from_date": training_from, "to_date": forecast_from - timedelta(days=1)}
         )
         rows = result.fetchall()
 
@@ -150,10 +165,10 @@ async def run_xgboost_forecast(
             current_df = create_features(current_df)
 
             # Get features for prediction
-            X_pred = current_df[feature_cols].iloc[-1:].fillna(method='ffill')
+            X_pred = current_df[feature_cols].iloc[-1:].ffill()
 
             # Make prediction
-            prediction = model.predict(X_pred)[0]
+            prediction = float(model.predict(X_pred)[0])
 
             # Update y value for lag features
             current_df.iloc[-1, current_df.columns.get_loc('y')] = prediction
@@ -162,21 +177,24 @@ async def run_xgboost_forecast(
                 "forecast_date": forecast_date.date(),
                 "forecast_type": metric_code,
                 "model_type": "xgboost",
-                "predicted_value": round(prediction, 2)
+                "predicted_value": round(float(prediction), 2)
             }
             forecasts.append(forecast_record)
 
             # Store in database
             db.execute(
-                """
+                text("""
                 INSERT INTO forecasts (
                     forecast_date, forecast_type, model_type, predicted_value, generated_at
                 ) VALUES (
                     :forecast_date, :forecast_type, :model_type, :predicted_value, NOW()
                 )
-                """,
+                """),
                 forecast_record
             )
+
+        # Commit forecasts before SHAP calculations
+        db.commit()
 
         # Calculate SHAP values for explainability
         try:
@@ -186,7 +204,7 @@ async def run_xgboost_forecast(
             # Get SHAP values for last few predictions
             for i, forecast_date in enumerate(pd.date_range(start=forecast_from, end=min(forecast_from + timedelta(days=7), forecast_to), freq='D')):
                 idx = len(df) + i
-                X_explain = current_df[feature_cols].iloc[idx:idx+1].fillna(method='ffill')
+                X_explain = current_df[feature_cols].iloc[idx:idx+1].ffill()
                 shap_values = explainer.shap_values(X_explain)
 
                 # Store SHAP explanation
@@ -200,26 +218,29 @@ async def run_xgboost_forecast(
                     key=lambda x: x["contribution"]
                 )[:3]
 
-                db.execute(
-                    """
-                    INSERT INTO xgboost_explanations (
-                        forecast_date, forecast_type, base_value,
-                        feature_values, shap_values, top_positive, top_negative, generated_at
-                    ) VALUES (
-                        :date, :metric, :base_value, :feature_values,
-                        :shap_values, :top_positive, :top_negative, NOW()
+                try:
+                    db.execute(
+                        text("""
+                        INSERT INTO xgboost_explanations (
+                            forecast_date, forecast_type, base_value,
+                            feature_values, shap_values, top_positive, top_negative, generated_at
+                        ) VALUES (
+                            :date, :metric, :base_value, :feature_values,
+                            :shap_values, :top_positive, :top_negative, NOW()
+                        )
+                        """),
+                        {
+                            "date": forecast_date.date(),
+                            "metric": metric_code,
+                            "base_value": float(explainer.expected_value),
+                            "feature_values": json.dumps(X_explain.iloc[0].to_dict()),
+                            "shap_values": json.dumps(feature_contributions),
+                            "top_positive": json.dumps(top_positive),
+                            "top_negative": json.dumps(top_negative)
+                        }
                     )
-                    """,
-                    {
-                        "date": forecast_date.date(),
-                        "metric": metric_code,
-                        "base_value": float(explainer.expected_value),
-                        "feature_values": json.dumps(X_explain.iloc[0].to_dict()),
-                        "shap_values": json.dumps(feature_contributions),
-                        "top_positive": json.dumps(top_positive),
-                        "top_negative": json.dumps(top_negative)
-                    }
-                )
+                except Exception:
+                    pass  # Skip if conflict, explanations are supplementary
         except Exception as e:
             logger.warning(f"SHAP calculation failed: {e}")
 

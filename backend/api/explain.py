@@ -19,7 +19,7 @@ router = APIRouter()
 async def explain_forecast(
     forecast_date: date = Query(...),
     forecast_type: str = Query(...),
-    model: str = Query("prophet", description="Model: prophet, xgboost, pickup"),
+    model: str = Query("prophet", description="Model: prophet, xgboost, pickup, tft"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -60,6 +60,8 @@ async def explain_forecast(
         return await _get_xgboost_explanation(db, forecast_date, forecast_type, forecast)
     elif model == "pickup":
         return await _get_pickup_explanation(db, forecast_date, forecast_type, forecast)
+    elif model == "tft":
+        return await _get_tft_explanation(db, forecast_date, forecast_type, forecast)
     else:
         return {
             "forecast_date": forecast_date,
@@ -235,20 +237,20 @@ async def _get_pickup_explanation(db, forecast_date, forecast_type, forecast):
 
     if pickup:
         explanation["current_state"] = {
-            "on_the_books": float(pickup.current_otb) if pickup.current_otb else None,
+            "on_the_books": float(pickup.current_otb) if pickup.current_otb is not None else None,
             "days_out": pickup.days_out
         }
         explanation["comparison"] = {
             "date": pickup.comparison_date,
-            "otb_at_same_lead_time": float(pickup.comparison_otb) if pickup.comparison_otb else None,
-            "final_actual": float(pickup.comparison_final) if pickup.comparison_final else None
+            "otb_at_same_lead_time": float(pickup.comparison_otb) if pickup.comparison_otb is not None else None,
+            "final_actual": float(pickup.comparison_final) if pickup.comparison_final is not None else None
         }
         explanation["pickup_curve"] = {
-            "avg_pct_of_final": float(pickup.pickup_curve_pct) if pickup.pickup_curve_pct else None,
-            "std_dev": float(pickup.pickup_curve_stddev) if pickup.pickup_curve_stddev else None
+            "avg_pct_of_final": float(pickup.pickup_curve_pct) if pickup.pickup_curve_pct is not None else None,
+            "std_dev": float(pickup.pickup_curve_stddev) if pickup.pickup_curve_stddev is not None else None
         }
         explanation["pace_analysis"] = {
-            "vs_prior_year_pct": float(pickup.pace_vs_prior_pct) if pickup.pace_vs_prior_pct else None,
+            "vs_prior_year_pct": float(pickup.pace_vs_prior_pct) if pickup.pace_vs_prior_pct is not None else None,
             "projection_method": pickup.projection_method,
             "projected_final": float(pickup.projected_value) if pickup.projected_value else None
         }
@@ -321,6 +323,98 @@ async def get_pickup_breakdown(
         db, forecast_date, forecast_type,
         type('obj', (object,), {
             'predicted_value': 0,
+            'generated_at': None
+        })()
+    )
+
+
+async def _get_tft_explanation(db, forecast_date, forecast_type, forecast):
+    """Get TFT attention-based explanation"""
+    query = """
+        SELECT
+            encoder_attention,
+            decoder_attention,
+            variable_importance,
+            quantile_10,
+            quantile_50,
+            quantile_90,
+            top_historical_drivers,
+            top_future_drivers
+        FROM tft_explanations
+        WHERE forecast_date = :forecast_date
+            AND forecast_type = :forecast_type
+        ORDER BY generated_at DESC
+        LIMIT 1
+    """
+
+    result = await db.execute(text(query), {
+        "forecast_date": forecast_date,
+        "forecast_type": forecast_type
+    })
+    tft = result.fetchone()
+
+    explanation = {
+        "forecast_date": forecast_date,
+        "forecast_type": forecast_type,
+        "model": "tft",
+        "predicted_value": float(forecast.predicted_value),
+        "lower_bound": float(forecast.lower_bound) if forecast.lower_bound else None,
+        "upper_bound": float(forecast.upper_bound) if forecast.upper_bound else None,
+        "generated_at": forecast.generated_at
+    }
+
+    if tft:
+        explanation["quantiles"] = {
+            "p10": float(tft.quantile_10) if tft.quantile_10 else None,
+            "p50": float(tft.quantile_50) if tft.quantile_50 else None,
+            "p90": float(tft.quantile_90) if tft.quantile_90 else None
+        }
+        explanation["variable_importance"] = tft.variable_importance
+        explanation["top_drivers"] = {
+            "historical": tft.top_historical_drivers or [],
+            "future_known": tft.top_future_drivers or []
+        }
+        explanation["attention"] = {
+            "encoder": tft.encoder_attention,
+            "decoder": tft.decoder_attention
+        }
+
+        # Build human-readable summary
+        summary_parts = []
+        if tft.top_historical_drivers:
+            for item in tft.top_historical_drivers[:2]:
+                if isinstance(item, dict):
+                    summary_parts.append(
+                        f"{item.get('feature', 'Unknown')} ({item.get('importance', 0):.2f})"
+                    )
+        if tft.top_future_drivers:
+            for item in tft.top_future_drivers[:2]:
+                if isinstance(item, dict):
+                    summary_parts.append(
+                        f"{item.get('feature', 'Unknown')} ({item.get('importance', 0):.2f})"
+                    )
+
+        explanation["summary"] = f"Key drivers: {', '.join(summary_parts)}" if summary_parts else None
+
+    return explanation
+
+
+@router.get("/tft")
+async def get_tft_attention(
+    forecast_date: date = Query(...),
+    forecast_type: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get TFT attention weights and variable importance for a forecast.
+    """
+    return await _get_tft_explanation(
+        db, forecast_date, forecast_type,
+        type('obj', (object,), {
+            'predicted_value': 0,
+            'lower_bound': None,
+            'upper_bound': None,
             'generated_at': None
         })()
     )

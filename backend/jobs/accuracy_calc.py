@@ -5,6 +5,7 @@ Compares forecasts to actuals once dates have passed
 import logging
 from datetime import date, timedelta
 
+from sqlalchemy import text
 from database import SyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -25,19 +26,19 @@ async def run_accuracy_calculation():
 
         # Get all metrics
         metrics_result = db.execute(
-            """
+            text("""
             SELECT metric_code FROM forecast_metrics WHERE is_active = TRUE
-            """
+            """)
         )
         metrics = [row.metric_code for row in metrics_result.fetchall()]
 
         for metric_code in metrics:
             # Get actual value from daily_metrics
             actual_result = db.execute(
-                """
+                text("""
                 SELECT actual_value FROM daily_metrics
                 WHERE date = :calc_date AND metric_code = :metric_code
-                """,
+                """),
                 {"calc_date": calc_date, "metric_code": metric_code}
             )
             actual_row = actual_result.fetchone()
@@ -48,11 +49,11 @@ async def run_accuracy_calculation():
 
             # Get forecasts for this date
             forecast_result = db.execute(
-                """
+                text("""
                 SELECT model_type, predicted_value, lower_bound, upper_bound
                 FROM forecasts
                 WHERE forecast_date = :calc_date AND forecast_type = :metric_code
-                """,
+                """),
                 {"calc_date": calc_date, "metric_code": metric_code}
             )
             forecasts = {row.model_type: row for row in forecast_result.fetchall()}
@@ -60,6 +61,7 @@ async def run_accuracy_calculation():
             prophet_forecast = forecasts.get('prophet')
             xgboost_forecast = forecasts.get('xgboost')
             pickup_forecast = forecasts.get('pickup')
+            tft_forecast = forecasts.get('tft')
 
             # Calculate errors
             def calc_error(forecast_val):
@@ -78,6 +80,9 @@ async def run_accuracy_calculation():
             pickup_error, pickup_pct = calc_error(
                 pickup_forecast.predicted_value if pickup_forecast else None
             )
+            tft_error, tft_pct = calc_error(
+                tft_forecast.predicted_value if tft_forecast else None
+            )
 
             # Determine best model
             errors = []
@@ -87,15 +92,17 @@ async def run_accuracy_calculation():
                 errors.append(('xgboost', abs(xgboost_error)))
             if pickup_error is not None:
                 errors.append(('pickup', abs(pickup_error)))
+            if tft_error is not None:
+                errors.append(('tft', abs(tft_error)))
 
             best_model = min(errors, key=lambda x: x[1])[0] if errors else None
 
             # Get budget value
             budget_result = db.execute(
-                """
+                text("""
                 SELECT budget_value FROM daily_budgets
                 WHERE date = :calc_date AND budget_type = :metric_code
-                """,
+                """),
                 {"calc_date": calc_date, "metric_code": metric_code}
             )
             budget_row = budget_result.fetchone()
@@ -103,22 +110,28 @@ async def run_accuracy_calculation():
 
             # Upsert accuracy record
             db.execute(
-                """
+                text("""
                 INSERT INTO actual_vs_forecast (
                     date, metric_type, actual_value,
                     prophet_forecast, prophet_lower, prophet_upper,
-                    xgboost_forecast, pickup_forecast, budget_value,
+                    xgboost_forecast, pickup_forecast,
+                    tft_forecast, tft_lower, tft_upper,
+                    budget_value,
                     prophet_error, prophet_pct_error,
                     xgboost_error, xgboost_pct_error,
                     pickup_error, pickup_pct_error,
+                    tft_error, tft_pct_error,
                     best_model, calculated_at
                 ) VALUES (
                     :date, :metric_type, :actual,
                     :prophet_val, :prophet_lower, :prophet_upper,
-                    :xgboost_val, :pickup_val, :budget,
+                    :xgboost_val, :pickup_val,
+                    :tft_val, :tft_lower, :tft_upper,
+                    :budget,
                     :prophet_error, :prophet_pct,
                     :xgboost_error, :xgboost_pct,
                     :pickup_error, :pickup_pct,
+                    :tft_error, :tft_pct,
                     :best_model, NOW()
                 )
                 ON CONFLICT (date, metric_type) DO UPDATE SET
@@ -129,9 +142,14 @@ async def run_accuracy_calculation():
                     xgboost_pct_error = :xgboost_pct,
                     pickup_error = :pickup_error,
                     pickup_pct_error = :pickup_pct,
+                    tft_forecast = :tft_val,
+                    tft_lower = :tft_lower,
+                    tft_upper = :tft_upper,
+                    tft_error = :tft_error,
+                    tft_pct_error = :tft_pct,
                     best_model = :best_model,
                     calculated_at = NOW()
-                """,
+                """),
                 {
                     "date": calc_date,
                     "metric_type": metric_code,
@@ -141,6 +159,9 @@ async def run_accuracy_calculation():
                     "prophet_upper": prophet_forecast.upper_bound if prophet_forecast else None,
                     "xgboost_val": xgboost_forecast.predicted_value if xgboost_forecast else None,
                     "pickup_val": pickup_forecast.predicted_value if pickup_forecast else None,
+                    "tft_val": tft_forecast.predicted_value if tft_forecast else None,
+                    "tft_lower": tft_forecast.lower_bound if tft_forecast else None,
+                    "tft_upper": tft_forecast.upper_bound if tft_forecast else None,
                     "budget": budget_value,
                     "prophet_error": prophet_error,
                     "prophet_pct": prophet_pct,
@@ -148,6 +169,8 @@ async def run_accuracy_calculation():
                     "xgboost_pct": xgboost_pct,
                     "pickup_error": pickup_error,
                     "pickup_pct": pickup_pct,
+                    "tft_error": tft_error,
+                    "tft_pct": tft_pct,
                     "best_model": best_model
                 }
             )

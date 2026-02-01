@@ -1,8 +1,10 @@
 """
 Newbook API Client
 
-CRITICAL: This client is READ-ONLY. All methods use GET/POST for reading only.
-NO data is written, modified, or deleted in Newbook.
+CRITICAL: This client is READ-ONLY.
+Newbook API uses POST for all requests - the "action" parameter determines the operation.
+This client ONLY uses read actions (bookings_list, site_list, report_*).
+NO write actions (booking_create, booking_update, booking_cancel, etc.) are used.
 Data flows ONE WAY: Newbook → Local Database
 """
 import os
@@ -28,7 +30,7 @@ class NewbookClient:
     Pagination: Uses data_offset/data_limit, max 1000 per request
     """
 
-    BASE_URL = "https://api.newbook.cloud/rest/"
+    BASE_URL = "https://api.newbook.cloud/rest"
 
     def __init__(self, api_key: str = None, username: str = None, password: str = None, region: str = None):
         # Use provided credentials or fall back to environment variables
@@ -39,6 +41,10 @@ class NewbookClient:
 
         if not all([self.api_key, self.username, self.password, self.region]):
             logger.warning("Newbook credentials not fully configured")
+
+    def _get_url(self, endpoint: str) -> str:
+        """Get full URL for an endpoint"""
+        return f"{self.BASE_URL}/{endpoint}"
 
     @classmethod
     async def from_db(cls, db):
@@ -60,11 +66,9 @@ class NewbookClient:
         await self.client.aclose()
 
     def _get_auth_payload(self) -> dict:
-        """Get base authentication payload"""
+        """Get base authentication payload (api_key and region only - username/password go in Basic Auth)"""
         return {
             "api_key": self.api_key,
-            "username": self.username,
-            "password": self.password,
             "region": self.region
         }
 
@@ -72,10 +76,9 @@ class NewbookClient:
         """Test API connection"""
         try:
             payload = self._get_auth_payload()
-            payload["action"] = "site_list"
 
             response = await self.client.post(
-                self.BASE_URL,
+                self._get_url("site_list"),
                 json=payload,
                 auth=(self.username, self.password)
             )
@@ -86,16 +89,101 @@ class NewbookClient:
 
     async def get_bookings(
         self,
-        from_date: date,
-        to_date: date,
+        modified_since: Optional[str] = None,
+        modified_until: Optional[str] = None,
         batch_size: int = 1000
     ) -> List[dict]:
         """
-        Fetch bookings for date range with pagination and rate limiting
+        Fetch all bookings with pagination and rate limiting.
+
+        Uses list_type="all" which returns all bookings (including cancelled).
+        period_from/period_to filter by created/modified timestamp, not stay dates.
 
         Args:
-            from_date: Start date
-            to_date: End date
+            modified_since: ISO timestamp - only bookings created/modified after this
+            modified_until: ISO timestamp - only bookings created/modified before this
+            batch_size: Records per request (max 1000)
+
+        Returns:
+            List of booking objects (all statuses including cancelled)
+        """
+        all_bookings = []
+        offset = 0
+
+        while True:
+            logger.info(f"Fetching Newbook bookings (all): modified_since={modified_since} (offset: {offset})")
+
+            payload = self._get_auth_payload()
+            payload.update({
+                "list_type": "all",
+                "data_offset": offset,
+                "data_limit": batch_size
+            })
+
+            # Add optional timestamp filters
+            if modified_since:
+                payload["period_from"] = modified_since
+            if modified_until:
+                payload["period_to"] = modified_until
+
+            response = await self.client.post(
+                self._get_url("bookings_list"),
+                json=payload,
+                auth=(self.username, self.password)
+            )
+
+            if response.status_code != 200:
+                logger.error(f"Newbook API error {response.status_code}: {response.text}")
+                raise NewbookAPIError(f"Failed to fetch bookings: {response.status_code}")
+
+            data = response.json()
+
+            if not data.get("success"):
+                raise NewbookAPIError(f"Newbook API returned failure: {data.get('message')}")
+
+            bookings = data.get("data", [])
+
+            if not bookings:
+                break
+
+            all_bookings.extend(bookings)
+            logger.info(f"Fetched {len(bookings)} bookings (offset {offset})")
+
+            # Check if we've got all records
+            total = data.get("data_total", 0)
+            if offset + len(bookings) >= total:
+                break
+
+            offset += batch_size
+
+            # Rate limiting: 0.75s delay
+            await asyncio.sleep(0.75)
+
+        logger.info(f"Total bookings fetched: {len(all_bookings)}")
+        return all_bookings
+
+    async def get_bookings_by_stay_dates(
+        self,
+        from_date: date,
+        to_date: date,
+        list_type: str = "staying",
+        batch_size: int = 1000
+    ) -> List[dict]:
+        """
+        Fetch bookings by stay dates (arrival/departure/staying period).
+
+        Args:
+            from_date: Start date for stay period
+            to_date: End date for stay period
+            list_type: Type of booking list:
+                       "staying" - bookings staying during dates (excludes cancelled)
+                       "arrived" - arrived during dates (add mode="projected" for expected)
+                       "arriving" - expected to arrive before period_to
+                       "departed" - departed during dates
+                       "departing" - expected to depart during dates
+                       "cancelled" - cancelled during dates
+                       "placed" - created during dates
+                       "no_show" - no shows for dates
             batch_size: Records per request (max 1000)
 
         Returns:
@@ -105,21 +193,19 @@ class NewbookClient:
         offset = 0
 
         while True:
-            logger.info(f"Fetching Newbook bookings: {from_date} to {to_date} (offset: {offset})")
+            logger.info(f"Fetching Newbook bookings ({list_type}): {from_date} to {to_date} (offset: {offset})")
 
             payload = self._get_auth_payload()
             payload.update({
-                "action": "booking_search",
+                "list_type": list_type,
                 "period_from": from_date.isoformat(),
                 "period_to": to_date.isoformat(),
-                "include_inventory_items": True,
-                "include_tariffs": True,
                 "data_offset": offset,
                 "data_limit": batch_size
             })
 
             response = await self.client.post(
-                self.BASE_URL,
+                self._get_url("bookings_list"),
                 json=payload,
                 auth=(self.username, self.password)
             )
@@ -158,23 +244,47 @@ class NewbookClient:
         self,
         from_date: date,
         to_date: date
-    ) -> dict:
+    ) -> List[dict]:
         """
-        Fetch occupancy report for date range
+        Fetch occupancy report for date range.
 
-        Returns dict keyed by date with occupancy data
+        Uses reports_occupancy endpoint which returns data by room category.
+        Returns all categories with nested occupancy data for each date in range.
+        No pagination needed - API returns full dataset in single response.
+
+        Response format:
+        [
+            {
+                "category_id": "1",
+                "category_name": "Single Room",
+                "occupancy": {
+                    "2024-08-01": {
+                        "date": "2024-08-01",
+                        "available": 5,
+                        "occupied": 3,
+                        "maintenance": 1,
+                        "allotted": 0,
+                        "revenue_gross": 450.00,
+                        "revenue_net": 375.00
+                    },
+                    ...
+                }
+            },
+            ...
+        ]
+
+        Returns list of category objects with nested occupancy by date
         """
         logger.info(f"Fetching occupancy report: {from_date} to {to_date}")
 
         payload = self._get_auth_payload()
         payload.update({
-            "action": "report_booking_occupancy",
-            "period_from": from_date.isoformat(),
-            "period_to": to_date.isoformat()
+            "period_from": f"{from_date.isoformat()} 00:00:00",
+            "period_to": f"{to_date.isoformat()} 23:59:59"
         })
 
         response = await self.client.post(
-            self.BASE_URL,
+            self._get_url("reports_occupancy"),
             json=payload,
             auth=(self.username, self.password)
         )
@@ -187,15 +297,16 @@ class NewbookClient:
         if not data.get("success"):
             raise NewbookAPIError(f"Newbook API returned failure: {data.get('message')}")
 
-        return data.get("data", {})
+        records = data.get("data", [])
+        logger.info(f"Fetched occupancy report: {len(records)} categories")
+        return records
 
     async def get_site_list(self) -> List[dict]:
         """Fetch list of rooms/sites with categories"""
         payload = self._get_auth_payload()
-        payload["action"] = "site_list"
 
         response = await self.client.post(
-            self.BASE_URL,
+            self._get_url("site_list"),
             json=payload,
             auth=(self.username, self.password)
         )
@@ -224,13 +335,12 @@ class NewbookClient:
 
             payload = self._get_auth_payload()
             payload.update({
-                "action": "report_earned_revenue",
                 "period_from": current_date.isoformat(),
                 "period_to": current_date.isoformat()
             })
 
             response = await self.client.post(
-                self.BASE_URL,
+                self._get_url("reports_earned_revenue"),
                 json=payload,
                 auth=(self.username, self.password)
             )
@@ -238,7 +348,12 @@ class NewbookClient:
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
-                    all_revenue[current_date.isoformat()] = data.get("data", {})
+                    day_data = data.get("data", {})
+                    # Debug: log first day's response structure
+                    if current_date == from_date:
+                        import json
+                        logger.info(f"Sample earned revenue response: {json.dumps(day_data)[:500]}")
+                    all_revenue[current_date.isoformat()] = day_data
 
             current_date += timedelta(days=1)
 

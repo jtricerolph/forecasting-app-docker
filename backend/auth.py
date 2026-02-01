@@ -2,13 +2,13 @@
 Authentication utilities - JWT based simple auth
 """
 import os
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,9 +19,6 @@ from database import get_db
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
-
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Security scheme
 security = HTTPBearer()
@@ -48,14 +45,21 @@ class UserResponse(BaseModel):
     is_active: bool
 
 
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    display_name: Optional[str] = None
+
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+    """Verify a password against its hash using bcrypt directly"""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 
 def get_password_hash(password: str) -> str:
-    """Generate password hash"""
-    return pwd_context.hash(password)
+    """Generate password hash using bcrypt directly"""
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -129,3 +133,80 @@ async def authenticate_user(db: AsyncSession, username: str, password: str) -> O
         "display_name": user.display_name,
         "is_active": user.is_active
     }
+
+
+async def get_all_users(db: AsyncSession) -> list:
+    """Get all users from database"""
+    from sqlalchemy import text
+    result = await db.execute(
+        text("SELECT id, username, display_name, is_active, created_at FROM users ORDER BY id")
+    )
+    users = result.fetchall()
+    return [
+        {
+            "id": u.id,
+            "username": u.username,
+            "display_name": u.display_name,
+            "is_active": u.is_active,
+            "created_at": u.created_at.isoformat() if u.created_at else None
+        }
+        for u in users
+    ]
+
+
+async def create_user(db: AsyncSession, username: str, password: str, display_name: Optional[str] = None) -> dict:
+    """Create a new user"""
+    from sqlalchemy import text
+
+    # Check if username already exists
+    existing = await db.execute(
+        text("SELECT id FROM users WHERE username = :username").bindparams(username=username)
+    )
+    if existing.fetchone():
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # Hash password and insert user
+    password_hash = get_password_hash(password)
+    result = await db.execute(
+        text("""
+            INSERT INTO users (username, password_hash, display_name, is_active, created_at)
+            VALUES (:username, :password_hash, :display_name, true, NOW())
+            RETURNING id, username, display_name, is_active, created_at
+        """).bindparams(
+            username=username,
+            password_hash=password_hash,
+            display_name=display_name or username
+        )
+    )
+    await db.commit()
+    user = result.fetchone()
+    return {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "is_active": user.is_active,
+        "created_at": user.created_at.isoformat() if user.created_at else None
+    }
+
+
+async def delete_user(db: AsyncSession, user_id: int, current_user_id: int) -> bool:
+    """Delete a user by ID"""
+    from sqlalchemy import text
+
+    # Prevent self-deletion
+    if user_id == current_user_id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+
+    # Check if user exists
+    existing = await db.execute(
+        text("SELECT id FROM users WHERE id = :user_id").bindparams(user_id=user_id)
+    )
+    if not existing.fetchone():
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Delete user
+    await db.execute(
+        text("DELETE FROM users WHERE id = :user_id").bindparams(user_id=user_id)
+    )
+    await db.commit()
+    return True

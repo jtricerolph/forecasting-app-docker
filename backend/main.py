@@ -2,8 +2,19 @@
 Forecasting Application - FastAPI Backend
 """
 import os
+import logging
+import sys
 from datetime import timedelta
 from contextlib import asynccontextmanager
+
+# Configure logging to output to stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,11 +23,13 @@ from sqlalchemy import text
 
 from database import get_db, async_engine
 from auth import (
-    Token, UserLogin, UserResponse,
+    Token, UserLogin, UserResponse, UserCreate,
     authenticate_user, create_access_token, get_current_user,
+    get_all_users, create_user, delete_user,
     ACCESS_TOKEN_EXPIRE_MINUTES
 )
-from api import forecast, sync, export, budget, accuracy, evolution, crossref, explain, config
+from typing import List
+from api import forecast, sync, export, budget, accuracy, evolution, crossref, explain, config, historical, resos, backtest, sync_bookings, reports, special_dates
 from scheduler import start_scheduler, shutdown_scheduler
 
 
@@ -56,6 +69,12 @@ app.include_router(evolution.router, prefix="/evolution", tags=["Forecast Evolut
 app.include_router(crossref.router, prefix="/crossref", tags=["Cross-Reference"])
 app.include_router(explain.router, prefix="/explain", tags=["Explainability"])
 app.include_router(config.router, prefix="/config", tags=["Configuration"])
+app.include_router(historical.router, prefix="/historical", tags=["Historical Data"])
+app.include_router(resos.router, prefix="/resos", tags=["Resos Mapping"])
+app.include_router(backtest.router, prefix="/backtest", tags=["Backtesting"])
+app.include_router(sync_bookings.router, prefix="/sync", tags=["Data Sync"])
+app.include_router(reports.router, prefix="/reports", tags=["Reports"])
+app.include_router(special_dates.router, prefix="/settings", tags=["Settings"])
 
 
 @app.get("/health")
@@ -95,6 +114,36 @@ async def login(user_login: UserLogin, db: AsyncSession = Depends(get_db)):
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     """Get current authenticated user info"""
     return current_user
+
+
+@app.get("/auth/users", response_model=List[dict])
+async def list_users(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List all users"""
+    return await get_all_users(db)
+
+
+@app.post("/auth/users", response_model=dict)
+async def add_user(
+    user_data: UserCreate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new user"""
+    return await create_user(db, user_data.username, user_data.password, user_data.display_name)
+
+
+@app.delete("/auth/users/{user_id}")
+async def remove_user(
+    user_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a user"""
+    await delete_user(db, user_id, current_user["id"])
+    return {"message": "User deleted successfully"}
 
 
 if __name__ == "__main__":

@@ -25,11 +25,32 @@ INSERT INTO users (username, password_hash, display_name) VALUES
 -- GRANULAR BOOKING DATA (from APIs)
 -- ============================================
 
+-- Room category lookup (populated from booking data)
+CREATE TABLE room_categories (
+    id SERIAL PRIMARY KEY,
+    category_id VARCHAR(50) NOT NULL UNIQUE,   -- Newbook category_id
+    category_name VARCHAR(255),                 -- Newbook category_name
+    first_seen_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Room types/categories from Newbook API site_list (for selecting which to include in occupancy)
+CREATE TABLE newbook_room_categories (
+    id SERIAL PRIMARY KEY,
+    site_id VARCHAR(50) NOT NULL UNIQUE,       -- Room type identifier from Newbook
+    site_name VARCHAR(255) NOT NULL,           -- Room type name (e.g., "Standard Room")
+    site_type VARCHAR(100),                    -- Type classification
+    room_count INTEGER DEFAULT 0,              -- Number of rooms of this type
+    is_included BOOLEAN DEFAULT TRUE,          -- Include in occupancy/guest calculations
+    display_order INTEGER DEFAULT 0,
+    fetched_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Individual hotel bookings from Newbook
 CREATE TABLE newbook_bookings (
     id SERIAL PRIMARY KEY,
-    newbook_id VARCHAR(50) NOT NULL,
-    booking_reference VARCHAR(100),
+    newbook_id VARCHAR(50) NOT NULL,           -- Internal Newbook booking ID
+    booking_reference VARCHAR(100),             -- 3rd party/OTA reference ID
     bookings_group_id VARCHAR(50),
     arrival_date DATE NOT NULL,
     departure_date DATE NOT NULL,
@@ -55,15 +76,19 @@ CREATE TABLE newbook_bookings (
     booking_parent_source_name VARCHAR(255),
     booking_method_id VARCHAR(50),
     booking_method_name VARCHAR(100),
+    -- Raw JSON from API (minus "guests" array to exclude PII)
+    -- Future-proofs data extraction without re-syncing history
+    raw_json JSONB,
     fetched_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(newbook_id)
 );
 
--- Per-night tariff/rate breakdown
+-- Per-night tariff/rate breakdown (including consolidated inventory items)
 CREATE TABLE newbook_booking_nights (
     id SERIAL PRIMARY KEY,
     booking_id INTEGER REFERENCES newbook_bookings(id) ON DELETE CASCADE,
     stay_date DATE NOT NULL,
+    -- Tariff data
     tariff_quoted_id VARCHAR(50),
     tariff_label VARCHAR(255),
     tariff_type_id VARCHAR(50),
@@ -73,24 +98,17 @@ CREATE TABLE newbook_booking_nights (
     charge_amount DECIMAL(12,2),
     taxes JSONB,
     occupant_charges JSONB,
+    -- Inventory items (consolidated from API inventory_items array)
+    -- Breakfast: matched by GL code against configured breakfast GL codes
+    breakfast_gross DECIMAL(12,2) DEFAULT 0,  -- Gross amount (inc VAT)
+    breakfast_net DECIMAL(12,2) DEFAULT 0,    -- Net amount (exc VAT)
+    -- Dinner: matched by GL code against configured dinner GL codes
+    dinner_gross DECIMAL(12,2) DEFAULT 0,     -- Gross amount (inc VAT)
+    dinner_net DECIMAL(12,2) DEFAULT 0,       -- Net amount (exc VAT)
+    -- Other inventory items (non-breakfast/dinner)
+    other_items JSONB,
     fetched_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(booking_id, stay_date)
-);
-
--- Meal allocations & charges per night
-CREATE TABLE newbook_inventory_items (
-    id SERIAL PRIMARY KEY,
-    booking_id INTEGER REFERENCES newbook_bookings(id) ON DELETE CASCADE,
-    stay_date DATE NOT NULL,
-    item_name VARCHAR(255),
-    gl_account_id VARCHAR(50),
-    gl_account_code VARCHAR(50),
-    amount_gross DECIMAL(12,2),
-    amount_net DECIMAL(12,2),
-    quantity INTEGER DEFAULT 1,
-    is_breakfast BOOLEAN DEFAULT FALSE,
-    is_dinner BOOLEAN DEFAULT FALSE,
-    fetched_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Individual restaurant bookings from Resos
@@ -109,9 +127,6 @@ CREATE TABLE resos_bookings (
     table_area VARCHAR(100),
     source VARCHAR(100),
     referrer VARCHAR(500),
-    guest_name VARCHAR(255),
-    guest_email VARCHAR(255),
-    guest_phone VARCHAR(50),
     is_hotel_guest BOOLEAN,
     is_dbb BOOLEAN,
     is_package BOOLEAN,
@@ -125,6 +140,101 @@ CREATE TABLE resos_bookings (
 );
 
 -- ============================================
+-- NEWBOOK OCCUPANCY REPORT (official capacity & revenue)
+-- ============================================
+
+-- Store Newbook's reports_occupancy data which provides:
+-- - Available rooms per category (accounts for maintenance/offline)
+-- - Official occupied rooms per Newbook
+-- - Maintenance/offline rooms
+-- - Official revenue figures (gross and net)
+CREATE TABLE newbook_occupancy_report (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    category_id VARCHAR(50) NOT NULL,        -- Room category ID
+    category_name VARCHAR(255),              -- Room category name
+    available INTEGER DEFAULT 0,             -- Rooms available (total capacity - maintenance)
+    occupied INTEGER DEFAULT 0,              -- Rooms occupied per Newbook
+    maintenance INTEGER DEFAULT 0,           -- Rooms offline/maintenance
+    allotted INTEGER DEFAULT 0,              -- Block allocations
+    revenue_gross DECIMAL(12,2) DEFAULT 0,   -- Gross revenue (inc VAT)
+    revenue_net DECIMAL(12,2) DEFAULT 0,     -- Net revenue (exc VAT)
+    occupancy_pct DECIMAL(5,2),              -- Calculated: occupied/available * 100
+    fetched_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(date, category_id)
+);
+
+CREATE INDEX idx_occupancy_report_date ON newbook_occupancy_report(date);
+
+-- View to aggregate across all categories for a given date
+-- Use this to get total available rooms (accounts for maintenance)
+CREATE VIEW daily_occupancy_totals AS
+SELECT
+    date,
+    SUM(available) as total_available,
+    SUM(occupied) as total_occupied,
+    SUM(maintenance) as total_maintenance,
+    SUM(allotted) as total_allotted,
+    SUM(revenue_gross) as total_revenue_gross,
+    SUM(revenue_net) as total_revenue_net,
+    CASE
+        WHEN SUM(available) > 0 THEN ROUND((SUM(occupied)::DECIMAL / SUM(available)) * 100, 2)
+        ELSE 0
+    END as occupancy_pct
+FROM newbook_occupancy_report
+GROUP BY date;
+
+-- ============================================
+-- NEWBOOK EARNED REVENUE (official financial figures)
+-- ============================================
+
+-- Store Newbook's report_earned_revenue data which provides:
+-- - Official financial figures by GL account
+-- - This is the declared accounting revenue
+-- Used to populate newbook_revenue_gross/net in daily_occupancy
+CREATE TABLE newbook_earned_revenue (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    gl_account_id VARCHAR(50),                   -- Newbook's internal GL account ID
+    gl_code VARCHAR(50),                         -- GL account code (e.g., "4100")
+    gl_name VARCHAR(255),                        -- Human-readable name (e.g., "Accommodation Revenue")
+    amount_gross DECIMAL(12,2) DEFAULT 0,        -- Gross amount (inc VAT)
+    amount_net DECIMAL(12,2) DEFAULT 0,          -- Net amount (exc VAT)
+    revenue_type VARCHAR(30),                    -- 'accommodation', 'food', 'beverage', 'other' (derived from config)
+    fetched_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(date, gl_account_id)
+);
+
+CREATE INDEX idx_earned_revenue_date ON newbook_earned_revenue(date);
+CREATE INDEX idx_earned_revenue_type ON newbook_earned_revenue(date, revenue_type);
+
+-- View to get daily accommodation revenue totals
+CREATE VIEW daily_accommodation_revenue AS
+SELECT
+    date,
+    SUM(amount_gross) as total_gross,
+    SUM(amount_net) as total_net
+FROM newbook_earned_revenue
+WHERE revenue_type = 'accommodation'
+GROUP BY date;
+
+-- Cache GL accounts from Newbook for easier configuration in Settings
+-- Populated automatically during earned revenue sync or manual fetch
+CREATE TABLE newbook_gl_accounts (
+    id SERIAL PRIMARY KEY,
+    gl_account_id VARCHAR(50) NOT NULL UNIQUE,  -- Newbook's internal GL account ID
+    gl_code VARCHAR(50),                         -- GL account code (e.g., "4100")
+    gl_name VARCHAR(255),                        -- Human-readable name
+    gl_group_id VARCHAR(50),                     -- Parent group ID from Newbook
+    gl_group_name VARCHAR(255),                  -- Parent group name (e.g., "FNB - Food & Beverage")
+    department VARCHAR(20),                      -- Revenue department: 'accommodation', 'dry', 'wet', or null
+    last_seen_date DATE,                         -- Most recent date this GL appeared
+    total_amount DECIMAL(14,2) DEFAULT 0,        -- Running total (for reference)
+    is_active BOOLEAN DEFAULT TRUE,
+    fetched_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ============================================
 -- AGGREGATED DATA (for dashboards & forecasting)
 -- ============================================
 
@@ -132,18 +242,41 @@ CREATE TABLE resos_bookings (
 CREATE TABLE daily_occupancy (
     id SERIAL PRIMARY KEY,
     date DATE NOT NULL UNIQUE,
-    total_rooms INTEGER,
-    occupied_rooms INTEGER,
-    occupancy_pct DECIMAL(5,2),
+    -- Room availability (from newbook_occupancy_report - preferred source)
+    total_rooms INTEGER,                       -- Total rooms available (from occupancy report or config fallback)
+    available_rooms INTEGER,                   -- Rooms available after maintenance (from occupancy report)
+    maintenance_rooms INTEGER,                 -- Rooms offline for maintenance
+    occupied_rooms INTEGER,                    -- Rooms occupied (from booking data)
+    occupancy_pct DECIMAL(5,2),               -- Calculated: occupied/available * 100
+    -- Official Newbook figures (from occupancy report)
+    newbook_occupied INTEGER,                  -- Official occupied per Newbook report
+    newbook_occupancy_pct DECIMAL(5,2),       -- Official occupancy % from Newbook
+    newbook_revenue_gross DECIMAL(12,2),      -- Official gross revenue from Newbook
+    newbook_revenue_net DECIMAL(12,2),        -- Official net revenue from Newbook
+    -- Guest counts (from booking data)
     total_guests INTEGER,
     total_adults INTEGER,
     total_children INTEGER,
     total_infants INTEGER,
     arrival_count INTEGER,
+    -- Booking movement stats
+    total_bookings INTEGER,                    -- Active bookings (confirmed, unconfirmed, arrived)
+    cancelled_bookings INTEGER,                -- Cancelled bookings that would have stayed
+    no_show_bookings INTEGER,                  -- No-shows for this date
+    -- Revenue metrics (calculated from booking data - NET values)
+    room_revenue DECIMAL(12,2),               -- NET room revenue (charge_amount / 1+VAT)
+    adr DECIMAL(12,2),                        -- Average Daily Rate (NET)
+    revpar DECIMAL(12,2),                     -- Revenue Per Available Room (NET)
+    agr DECIMAL(12,2),                        -- Actual Guest Rate (gross, from calculated_amount)
+    -- Meal allocations (from inventory items)
     breakfast_allocation_qty INTEGER,
     breakfast_allocation_value DECIMAL(12,2),
     dinner_allocation_qty INTEGER,
     dinner_allocation_value DECIMAL(12,2),
+    -- Breakdown by room type: {"Double": {"rooms": 15, "guests": 28, "adults": 25, "children": 3}, ...}
+    by_room_type JSONB,
+    -- Revenue breakdown by room type: {"Double": {"revenue_net": 1500, "adr_net": 100, "agr_total": 1800, "agr_avg": 120}, ...}
+    revenue_by_room_type JSONB,
     fetched_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -159,6 +292,17 @@ CREATE TABLE daily_covers (
     external_covers INTEGER,
     dbb_covers INTEGER,
     package_covers INTEGER,
+    -- Hotel occupancy correlation (for forecasting)
+    -- Links restaurant covers to hotel occupancy for predictive modeling
+    total_hotel_residents INTEGER,             -- Hotel guests staying that night (from daily_occupancy)
+    hotel_guest_dining_rate DECIMAL(5,2),      -- % of residents who dined: hotel_guest_covers / total_hotel_residents * 100
+    -- Booking movement stats
+    cancelled_bookings INTEGER,
+    cancelled_covers INTEGER,
+    no_show_bookings INTEGER,
+    no_show_covers INTEGER,
+    -- Source breakdown: {"website": {"bookings": 10, "covers": 25}, "phone": {...}}
+    by_source JSONB,
     fetched_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(date, service_period)
 );
@@ -352,9 +496,8 @@ CREATE TABLE forecast_schedule (
 
 -- Default schedules
 INSERT INTO forecast_schedule (schedule_name, horizon_min_days, horizon_max_days, frequency, run_time, models, forecast_types) VALUES
-('daily_short_term', 0, 14, 'daily', '06:00', '["prophet", "xgboost", "pickup"]', '["hotel_occupancy_pct", "hotel_guests", "resos_lunch_covers", "resos_dinner_covers"]'),
-('daily_medium_term', 15, 28, 'daily', '06:15', '["prophet", "xgboost", "pickup"]', '["hotel_occupancy_pct", "hotel_guests", "resos_lunch_covers", "resos_dinner_covers"]'),
-('weekly_long_term', 29, 60, 'weekly', '06:30', '["prophet", "xgboost"]', '["hotel_occupancy_pct", "hotel_guests", "resos_lunch_covers", "resos_dinner_covers"]');
+('daily_forecast', 0, 28, 'daily', '06:00', '["prophet", "xgboost", "pickup"]', '["hotel_occupancy_pct", "hotel_guests", "resos_lunch_covers", "resos_dinner_covers"]'),
+('weekly_forecast', 29, 365, 'weekly', '06:30', '["prophet", "xgboost"]', '["hotel_occupancy_pct", "hotel_guests", "resos_lunch_covers", "resos_dinner_covers"]');
 
 -- ============================================
 -- MODEL EXPLAINABILITY
@@ -564,6 +707,36 @@ CREATE TABLE forecast_cross_reference (
 );
 
 -- ============================================
+-- BACKTESTING
+-- ============================================
+
+-- Store backtest results for model accuracy evaluation
+-- Backtesting simulates historical forecasts using only data available at the time
+CREATE TABLE backtest_results (
+    id SERIAL PRIMARY KEY,
+    target_date DATE NOT NULL,
+    metric_code VARCHAR(50) NOT NULL,
+    lead_time INTEGER NOT NULL,              -- Days out from simulated today
+    simulated_today DATE,                    -- The date we pretended "today" was
+    current_otb DECIMAL(12,2),               -- OTB value at simulated_today
+    prior_otb DECIMAL(12,2),                 -- Prior year OTB at same lead time
+    prior_final DECIMAL(12,2),               -- Prior year actual final value
+    projected_value DECIMAL(12,2),           -- What the model would have predicted
+    actual_value DECIMAL(12,2),              -- What actually happened
+    error DECIMAL(12,2),                     -- projected - actual
+    abs_error DECIMAL(12,2),                 -- |error|
+    pct_error DECIMAL(8,2),                  -- (error / actual) * 100
+    abs_pct_error DECIMAL(8,2),              -- |pct_error|
+    projection_method VARCHAR(30),           -- additive, additive_floor, implied_additive, etc.
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(target_date, metric_code, lead_time)
+);
+
+CREATE INDEX idx_backtest_metric ON backtest_results(metric_code);
+CREATE INDEX idx_backtest_date ON backtest_results(target_date);
+CREATE INDEX idx_backtest_lead ON backtest_results(lead_time);
+
+-- ============================================
 -- ACCURACY TRACKING
 -- ============================================
 
@@ -634,11 +807,51 @@ INSERT INTO system_config (config_key, description) VALUES
 ('resos_api_key', 'Resos API Key'),
 ('total_rooms', 'Total number of hotel rooms (for occupancy calculation)'),
 ('hotel_name', 'Hotel/Property Name'),
-('timezone', 'Local timezone (e.g., Europe/London)');
+('timezone', 'Local timezone (e.g., Europe/London)'),
+-- GL account mapping for inventory items (breakfast/dinner identification)
+('newbook_breakfast_gl_codes', 'Comma-separated list of GL codes for breakfast items'),
+('newbook_dinner_gl_codes', 'Comma-separated list of GL codes for dinner items'),
+('newbook_breakfast_vat_rate', 'VAT rate for breakfast items (e.g., 0.20 for 20%)'),
+('newbook_dinner_vat_rate', 'VAT rate for dinner items (e.g., 0.20 for 20%)'),
+-- Accommodation VAT rate for room revenue calculations
+('accommodation_vat_rate', 'VAT rate for accommodation/room revenue (e.g., 0.20 for 20%)'),
+-- Accommodation GL codes for earned revenue sync (identifies which GL accounts are room revenue)
+('accommodation_gl_codes', 'Comma-separated list of GL codes for accommodation/room revenue'),
+-- Sync schedule enable/disable
+('sync_newbook_enabled', 'Enable automatic Newbook sync (true/false)'),
+('sync_resos_enabled', 'Enable automatic Resos sync (true/false)'),
+('sync_schedule_time', 'Time for daily sync (HH:MM format, e.g., 05:00)');
 
 -- Set default values
 UPDATE system_config SET config_value = '80' WHERE config_key = 'total_rooms';
 UPDATE system_config SET config_value = 'Europe/London' WHERE config_key = 'timezone';
+UPDATE system_config SET config_value = '0.20' WHERE config_key = 'newbook_breakfast_vat_rate';
+UPDATE system_config SET config_value = '0.20' WHERE config_key = 'newbook_dinner_vat_rate';
+UPDATE system_config SET config_value = '0.20' WHERE config_key = 'accommodation_vat_rate';
+-- Sync schedules disabled by default for initial testing
+UPDATE system_config SET config_value = 'false' WHERE config_key = 'sync_newbook_enabled';
+UPDATE system_config SET config_value = 'false' WHERE config_key = 'sync_resos_enabled';
+UPDATE system_config SET config_value = '05:00' WHERE config_key = 'sync_schedule_time';
+
+-- ============================================
+-- AGGREGATION QUEUE
+-- ============================================
+
+-- Track dates that need re-aggregation after booking changes
+-- Sync jobs populate this; aggregation job processes and clears it
+CREATE TABLE aggregation_queue (
+    id SERIAL PRIMARY KEY,
+    date DATE NOT NULL,
+    source VARCHAR(20) NOT NULL,               -- 'newbook' or 'resos'
+    reason VARCHAR(50),                        -- 'booking_created', 'booking_modified', 'booking_cancelled'
+    booking_id VARCHAR(100),                   -- Reference to the booking that triggered this
+    queued_at TIMESTAMP DEFAULT NOW(),
+    aggregated_at TIMESTAMP,                   -- NULL = pending, set when processed
+    UNIQUE(date, source, booking_id)           -- Prevent duplicate entries for same booking/date
+);
+
+CREATE INDEX idx_aggregation_pending ON aggregation_queue (source, aggregated_at) WHERE aggregated_at IS NULL;
+CREATE INDEX idx_aggregation_date ON aggregation_queue (date);
 
 -- ============================================
 -- BACKFILL TRACKING

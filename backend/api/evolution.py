@@ -107,7 +107,8 @@ async def get_evolution_chart_data(
     chart_data = []
 
     for row in rows:
-        if row.actual_value:
+        # Use 'is not None' - 0 is valid actual data (e.g., 0 covers on closed day)
+        if row.actual_value is not None:
             actual_value = float(row.actual_value)
         chart_data.append({
             "update_date": row.update_date,
@@ -177,7 +178,7 @@ async def get_forecast_changes(
             "bookings_cancelled": row.bookings_cancelled,
             "covers_change": row.covers_change,
             "days_out": row.days_out,
-            "otb_at_change": float(row.otb_at_change) if row.otb_at_change else None
+            "otb_at_change": float(row.otb_at_change) if row.otb_at_change is not None else None
         }
         for row in rows
     ]

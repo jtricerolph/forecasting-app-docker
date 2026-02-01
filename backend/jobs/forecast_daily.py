@@ -2,11 +2,13 @@
 Daily forecast generation job
 Runs Prophet, XGBoost, and Pickup models
 """
+import json
 import logging
 import uuid
 from datetime import date, timedelta
 from typing import List, Optional
 
+from sqlalchemy import text
 from database import SyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,7 @@ async def run_daily_forecast(
         triggered_by: Who triggered this run
     """
     if models is None:
-        models = ['prophet', 'xgboost', 'pickup']
+        models = ['prophet', 'xgboost', 'pickup', 'tft']
 
     run_id = str(uuid.uuid4())
     forecast_from = date.today() + timedelta(days=start_days)
@@ -41,7 +43,7 @@ async def run_daily_forecast(
     try:
         # Log run start
         db.execute(
-            """
+            text("""
             INSERT INTO forecast_runs (
                 run_id, run_type, started_at, status,
                 forecast_from, forecast_to, models_run, triggered_by
@@ -49,12 +51,12 @@ async def run_daily_forecast(
                 :run_id, 'scheduled', NOW(), 'running',
                 :forecast_from, :forecast_to, :models, :triggered_by
             )
-            """,
+            """),
             {
                 "run_id": run_id,
                 "forecast_from": forecast_from,
                 "forecast_to": forecast_to,
-                "models": str(models),
+                "models": json.dumps(models),
                 "triggered_by": triggered_by
             }
         )
@@ -62,11 +64,12 @@ async def run_daily_forecast(
 
         # Get metrics to forecast
         result = db.execute(
-            """
-            SELECT metric_code, use_prophet, use_xgboost, use_pickup
+            text("""
+            SELECT metric_code, use_prophet, use_xgboost, use_pickup,
+                   COALESCE(use_tft, FALSE) as use_tft
             FROM forecast_metrics
             WHERE is_active = TRUE AND show_in_dashboard = TRUE
-            """
+            """)
         )
         metrics = result.fetchall()
 
@@ -108,13 +111,27 @@ async def run_daily_forecast(
                 except Exception as e:
                     logger.error(f"Pickup forecast failed for {metric_code}: {e}")
 
+            # Run TFT if applicable
+            if 'tft' in models and getattr(metric, 'use_tft', False):
+                try:
+                    from services.forecasting.tft_model import run_tft_forecast
+                    import os
+                    use_gpu = os.getenv('TFT_USE_GPU', 'false').lower() == 'true'
+                    tft_forecasts = await run_tft_forecast(
+                        db, metric_code, forecast_from, forecast_to,
+                        use_gpu=use_gpu
+                    )
+                    forecasts_generated += len(tft_forecasts)
+                except Exception as e:
+                    logger.error(f"TFT forecast failed for {metric_code}: {e}")
+
         # Update run status
         db.execute(
-            """
+            text("""
             UPDATE forecast_runs
             SET completed_at = NOW(), status = 'success'
             WHERE run_id = :run_id
-            """,
+            """),
             {"run_id": run_id}
         )
         db.commit()
@@ -124,11 +141,11 @@ async def run_daily_forecast(
     except Exception as e:
         logger.error(f"Forecast run {run_id} failed: {e}")
         db.execute(
-            """
+            text("""
             UPDATE forecast_runs
             SET completed_at = NOW(), status = 'failed', error_message = :error
             WHERE run_id = :run_id
-            """,
+            """),
             {"run_id": run_id, "error": str(e)}
         )
         db.commit()

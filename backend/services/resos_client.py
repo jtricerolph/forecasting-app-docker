@@ -72,14 +72,10 @@ class ResosClient:
     async def get_bookings(
         self,
         from_date: date,
-        to_date: date,
-        batch_days: int = 7
+        to_date: date
     ) -> List[dict]:
         """
-        Fetch bookings for date range with pagination and rate limiting
-
-        Uses batching by date spans to avoid hitting API limits.
-        Implements rate limiting (1 request per second).
+        Fetch bookings for date range with pagination and rate limiting.
 
         Returns list of booking objects with structure:
         {
@@ -95,62 +91,47 @@ class ResosClient:
         }
         """
         all_bookings = []
-        current_date = from_date
+        offset = 0
 
-        # Batch requests by date spans (default 7 days per request)
-        while current_date <= to_date:
-            batch_end = min(current_date + timedelta(days=batch_days - 1), to_date)
+        from_datetime = f"{from_date}T00:00:00"
+        to_datetime = f"{to_date}T23:59:59"
 
-            from_datetime = f"{current_date}T00:00:00"
-            to_datetime = f"{batch_end}T23:59:59"
+        while True:
+            logger.info(f"Fetching Resos bookings: {from_date} to {to_date} (offset: {offset})")
 
-            # Paginate through bookings for this date range
-            offset = 0
-            batch_total = 0
+            response = await self.client.get(
+                f"{self.BASE_URL}/bookings",
+                headers={"Authorization": self.auth_header},
+                params={
+                    "fromDateTime": from_datetime,
+                    "toDateTime": to_datetime,
+                    "limit": 100,
+                    "skip": offset
+                }
+            )
 
-            while True:
-                logger.info(f"Fetching Resos bookings: {current_date} to {batch_end} (offset: {offset})")
+            if response.status_code != 200:
+                error_body = response.text
+                logger.error(f"Resos API error {response.status_code}: {error_body}")
+                raise ResosAPIError(f"Failed to fetch bookings: {response.status_code} - {error_body}")
 
-                response = await self.client.get(
-                    f"{self.BASE_URL}/bookings",
-                    headers={"Authorization": self.auth_header},
-                    params={
-                        "fromDateTime": from_datetime,
-                        "toDateTime": to_datetime,
-                        "limit": 100,  # Max per request (Resos API limit)
-                        "skip": offset  # Pagination offset
-                    }
-                )
+            data = response.json()
+            page_bookings = data if isinstance(data, list) else []
 
-                if response.status_code != 200:
-                    error_body = response.text
-                    logger.error(f"Resos API error {response.status_code}: {error_body}")
-                    raise ResosAPIError(f"Failed to fetch bookings: {response.status_code} - {error_body}")
+            if not page_bookings:
+                break
 
-                data = response.json()
-                page_bookings = data if isinstance(data, list) else []
+            all_bookings.extend(page_bookings)
+            logger.info(f"Fetched {len(page_bookings)} bookings (offset {offset})")
 
-                if not page_bookings:
-                    break
+            # If we got fewer than the limit, we've reached the end
+            if len(page_bookings) < 100:
+                break
 
-                all_bookings.extend(page_bookings)
-                batch_total += len(page_bookings)
+            offset += 100
 
-                logger.info(f"Fetched {len(page_bookings)} bookings (offset {offset})")
-
-                # If we got fewer than the limit, we've reached the end
-                if len(page_bookings) < 100:
-                    break
-
-                offset += 100
-
-                # Rate limiting: 1 request per second
-                await asyncio.sleep(1)
-
-            logger.info(f"Total for {current_date} to {batch_end}: {batch_total} bookings")
-
-            # Move to next date batch
-            current_date = batch_end + timedelta(days=1)
+            # Rate limiting: 1 request per second
+            await asyncio.sleep(1)
 
         logger.info(f"Total bookings fetched: {len(all_bookings)}")
         return all_bookings

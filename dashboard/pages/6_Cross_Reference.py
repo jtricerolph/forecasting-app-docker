@@ -1,202 +1,322 @@
 """
-Cross-Reference Validation Page
-Validate that related forecasts align with each other
+Cross Reference Page
+Analyze correlations between different metrics
 """
+import os
+import sys
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 from datetime import date, timedelta
-import numpy as np
+import httpx
 
-st.set_page_config(page_title="Cross-Reference", page_icon="✅", layout="wide")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from components.auth import require_auth, get_auth_header
 
-st.title("✅ Cross-Reference Validation")
-st.markdown("Ensure forecast consistency - verify related metrics align")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
 
-# Date selector
-check_date = st.date_input("Check Date", date.today() + timedelta(days=7))
+st.set_page_config(page_title="Cross Reference", page_icon="🔗", layout="wide")
+require_auth()
+
+st.title("🔗 Cross Reference Analysis")
+
+# Help expander
+with st.expander("ℹ️ Understanding Cross-Reference Analysis", expanded=False):
+    st.markdown("""
+    ### What This Page Shows
+
+    Explore relationships between different metrics to understand:
+    - **Correlations**: How metrics move together
+    - **Dependencies**: What drives what
+    - **Planning Insights**: Use one metric to predict another
+
+    ### Key Relationships to Explore
+
+    | Relationship | What it tells you |
+    |--------------|-------------------|
+    | **Occupancy ↔ Restaurant Covers** | Hotel guests dining in the restaurant |
+    | **Room Revenue ↔ ADR** | Price vs volume trade-offs |
+    | **Arrivals ↔ Dinner Covers** | Check-in day dining patterns |
+    | **Guests ↔ Breakfast Allocation** | Breakfast planning needs |
+
+    ### Correlation Interpretation
+
+    | Value | Meaning |
+    |-------|---------|
+    | **0.8 to 1.0** | Strong positive correlation - metrics move together |
+    | **0.5 to 0.8** | Moderate correlation - some relationship |
+    | **0 to 0.5** | Weak correlation - limited relationship |
+    | **Negative** | Inverse relationship - one goes up, other goes down |
+
+    ### Using This for Planning
+
+    **Example**: If occupancy correlates strongly with dinner covers (0.85):
+    - When occupancy forecast is high → expect more dinner covers
+    - Use occupancy forecast to estimate F&B demand
+    - Adjust staffing based on expected hotel guests
+    """)
 
 st.markdown("---")
 
-# Generate cross-reference check data
-np.random.seed(int(check_date.toordinal()))
+@st.cache_data(ttl=60)
+def fetch_historical_data(from_date, to_date):
+    """Fetch historical data for correlation analysis"""
+    try:
+        response = httpx.get(
+            f"{BACKEND_URL}/historical/summary",
+            params={"from_date": str(from_date), "to_date": str(to_date)},
+            headers=get_auth_header(),
+            timeout=30.0
+        )
+        if response.status_code == 200:
+            return response.json()
+        return []
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        return []
 
-# Hotel checks
-room_nights = 65 + np.random.randint(-5, 10)
-adr = 175 + np.random.randint(-20, 30)
-revenue_calculated = room_nights * adr
-revenue_forecast = revenue_calculated * (1 + np.random.randn() * 0.03)
+# Controls
+col1, col2 = st.columns([1, 1])
 
-occupancy_calculated = (room_nights / 80) * 100  # Assuming 80 rooms
-occupancy_forecast = occupancy_calculated * (1 + np.random.randn() * 0.02)
-
-guests_per_room = 1.8
-guests_calculated = room_nights * guests_per_room
-guests_forecast = guests_calculated * (1 + np.random.randn() * 0.05)
-
-# Restaurant checks
-dinner_bookings = 45 + np.random.randint(-5, 10)
-party_size = 3.2 + np.random.randn() * 0.3
-covers_calculated = dinner_bookings * party_size
-covers_forecast = covers_calculated * (1 + np.random.randn() * 0.05)
-
-checks = [
-    {
-        'Category': 'Hotel',
-        'Check': 'Revenue (nights × ADR)',
-        'Calculated': revenue_calculated,
-        'Forecasted': revenue_forecast,
-        'Tolerance': 5.0,
-        'Formula': f'{room_nights} × £{adr}'
-    },
-    {
-        'Category': 'Hotel',
-        'Check': 'Occupancy (nights / rooms)',
-        'Calculated': occupancy_calculated,
-        'Forecasted': occupancy_forecast,
-        'Tolerance': 2.0,
-        'Formula': f'{room_nights} / 80 × 100'
-    },
-    {
-        'Category': 'Hotel',
-        'Check': 'Guests (nights × avg)',
-        'Calculated': guests_calculated,
-        'Forecasted': guests_forecast,
-        'Tolerance': 10.0,
-        'Formula': f'{room_nights} × {guests_per_room}'
-    },
-    {
-        'Category': 'Restaurant',
-        'Check': 'Dinner Covers (bookings × party)',
-        'Calculated': covers_calculated,
-        'Forecasted': covers_forecast,
-        'Tolerance': 10.0,
-        'Formula': f'{dinner_bookings} × {party_size:.1f}'
-    }
-]
-
-# Calculate differences and status
-for check in checks:
-    diff = check['Forecasted'] - check['Calculated']
-    diff_pct = abs(diff / check['Calculated']) * 100 if check['Calculated'] != 0 else 0
-    check['Difference'] = diff
-    check['Diff %'] = diff_pct
-    check['Status'] = '✅ OK' if diff_pct <= check['Tolerance'] else '⚠️ Warning' if diff_pct <= check['Tolerance'] * 2 else '❌ Discrepancy'
-
-checks_df = pd.DataFrame(checks)
-
-# Alignment score
-passed = sum(1 for c in checks if '✅' in c['Status'])
-warnings = sum(1 for c in checks if '⚠️' in c['Status'])
-total = len(checks)
-alignment_score = ((passed + warnings * 0.5) / total) * 100
-
-# Summary metrics
-col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.metric("Alignment Score", f"{alignment_score:.0f}%")
+    lookback = st.slider(
+        "Analysis Period (Days)",
+        30, 365, 90,
+        help="Number of days of historical data to analyze"
+    )
+
 with col2:
-    st.metric("Checks Passed", f"{passed}/{total}")
-with col3:
-    st.metric("Warnings", f"{warnings}")
-with col4:
-    st.metric("Discrepancies", f"{total - passed - warnings}")
+    analysis_type = st.selectbox(
+        "Analysis Type",
+        ["Occupancy vs Restaurant", "Revenue Breakdown", "Custom Comparison"],
+        help="Choose predefined analysis or custom metric selection"
+    )
 
 st.markdown("---")
 
-# Results table
-st.subheader("📋 Cross-Reference Results")
+# Fetch data
+end_date = date.today()
+start_date = end_date - timedelta(days=lookback)
+data = fetch_historical_data(start_date, end_date)
 
-# Style the dataframe
-def style_status(val):
-    if '✅' in str(val):
-        return 'background-color: #d4edda'
-    elif '⚠️' in str(val):
-        return 'background-color: #fff3cd'
-    elif '❌' in str(val):
-        return 'background-color: #f8d7da'
-    return ''
+if not data:
+    st.warning("No historical data available for the selected period.")
+    st.stop()
 
-display_df = checks_df[['Category', 'Check', 'Calculated', 'Forecasted', 'Diff %', 'Tolerance', 'Status', 'Formula']]
+df = pd.DataFrame(data)
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values('date')
 
-st.dataframe(
-    display_df.style.applymap(style_status, subset=['Status']).format({
-        'Calculated': '{:.1f}',
-        'Forecasted': '{:.1f}',
-        'Diff %': '{:.1f}%',
-        'Tolerance': '{:.1f}%'
-    }),
-    use_container_width=True,
-    hide_index=True,
-    height=250
-)
+# Define metric groups
+metric_columns = {
+    'occupancy_pct': 'Occupancy %',
+    'occupied_rooms': 'Rooms Sold',
+    'total_guests': 'Guests',
+    'arrival_count': 'Arrivals',
+    'room_revenue': 'Room Revenue',
+    'adr': 'ADR',
+    'revpar': 'RevPAR',
+    'dinner_covers': 'Dinner Covers',
+    'lunch_covers': 'Lunch Covers'
+}
 
-# Visualization
-st.subheader("📊 Calculated vs Forecasted Values")
+if analysis_type == "Occupancy vs Restaurant":
+    metric_x = 'occupancy_pct'
+    metric_y = 'dinner_covers'
+    x_label = 'Occupancy %'
+    y_label = 'Dinner Covers'
 
-fig = go.Figure()
+elif analysis_type == "Revenue Breakdown":
+    metric_x = 'occupied_rooms'
+    metric_y = 'room_revenue'
+    x_label = 'Rooms Sold'
+    y_label = 'Room Revenue (£)'
 
-for i, check in enumerate(checks):
-    fig.add_trace(go.Bar(
-        name=check['Check'][:20] + '...' if len(check['Check']) > 20 else check['Check'],
-        x=['Calculated', 'Forecasted'],
-        y=[check['Calculated'], check['Forecasted']],
-        text=[f"{check['Calculated']:.0f}", f"{check['Forecasted']:.0f}"],
-        textposition='outside',
-        offsetgroup=i
-    ))
+else:  # Custom
+    col1, col2 = st.columns(2)
+    with col1:
+        metric_x = st.selectbox(
+            "X-Axis Metric",
+            options=list(metric_columns.keys()),
+            format_func=lambda x: metric_columns.get(x, x)
+        )
+    with col2:
+        metric_y = st.selectbox(
+            "Y-Axis Metric",
+            options=list(metric_columns.keys()),
+            index=7,  # Default to dinner_covers
+            format_func=lambda x: metric_columns.get(x, x)
+        )
+    x_label = metric_columns.get(metric_x, metric_x)
+    y_label = metric_columns.get(metric_y, metric_y)
 
-fig.update_layout(
-    barmode='group',
-    title='Calculated vs Forecasted Comparison',
-    height=400,
-    legend=dict(orientation='h', yanchor='bottom', y=1.02)
-)
+# Scatter plot
+st.subheader(f"📊 {x_label} vs {y_label}")
 
-st.plotly_chart(fig, use_container_width=True)
+# Calculate correlation
+if metric_x in df.columns and metric_y in df.columns:
+    valid_df = df[[metric_x, metric_y, 'date', 'day_of_week']].dropna()
 
-# Discrepancy details
-discrepancies = [c for c in checks if '❌' in c['Status']]
-if discrepancies:
-    st.markdown("---")
-    st.subheader("⚠️ Discrepancy Details")
+    if len(valid_df) > 5:
+        correlation = valid_df[metric_x].corr(valid_df[metric_y])
 
-    for disc in discrepancies:
-        st.error(f"""
-        **{disc['Check']}**
+        col1, col2 = st.columns([3, 1])
 
-        - Calculated: {disc['Calculated']:.1f} (Formula: {disc['Formula']})
-        - Forecasted: {disc['Forecasted']:.1f}
-        - Difference: {disc['Diff %']:.1f}% (Tolerance: {disc['Tolerance']}%)
+        with col1:
+            # Scatter plot with trendline
+            fig = px.scatter(
+                valid_df,
+                x=metric_x,
+                y=metric_y,
+                color='day_of_week',
+                trendline='ols',
+                labels={metric_x: x_label, metric_y: y_label, 'day_of_week': 'Day'},
+                title=f'Correlation: {correlation:.3f}'
+            )
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True)
 
-        **Possible causes:**
-        - Input metric forecasts may be inconsistent
-        - Check individual model predictions for this date
-        - Review if any manual overrides were applied
+        with col2:
+            # Correlation interpretation
+            st.metric("Correlation", f"{correlation:.3f}")
+
+            if abs(correlation) >= 0.8:
+                st.success("Strong relationship")
+            elif abs(correlation) >= 0.5:
+                st.info("Moderate relationship")
+            else:
+                st.warning("Weak relationship")
+
+            # Simple stats
+            st.markdown("---")
+            st.markdown("**Quick Stats**")
+            st.markdown(f"**{x_label}**")
+            st.markdown(f"Mean: {valid_df[metric_x].mean():.1f}")
+            st.markdown(f"**{y_label}**")
+            st.markdown(f"Mean: {valid_df[metric_y].mean():.1f}")
+
+        # Day of week breakdown
+        st.subheader("📅 Relationship by Day of Week")
+
+        dow_stats = valid_df.groupby('day_of_week').agg({
+            metric_x: 'mean',
+            metric_y: 'mean'
+        }).round(2)
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.dataframe(dow_stats.rename(columns={
+                metric_x: f'Avg {x_label}',
+                metric_y: f'Avg {y_label}'
+            }), use_container_width=True)
+
+        with col2:
+            # Bar chart comparison by day
+            fig_dow = go.Figure()
+            fig_dow.add_trace(go.Bar(
+                x=dow_stats.index,
+                y=dow_stats[metric_x],
+                name=x_label,
+                yaxis='y'
+            ))
+            fig_dow.add_trace(go.Scatter(
+                x=dow_stats.index,
+                y=dow_stats[metric_y],
+                name=y_label,
+                yaxis='y2',
+                mode='lines+markers',
+                line=dict(color='red', width=2)
+            ))
+            fig_dow.update_layout(
+                title='By Day of Week',
+                yaxis=dict(title=x_label),
+                yaxis2=dict(title=y_label, overlaying='y', side='right'),
+                height=300
+            )
+            st.plotly_chart(fig_dow, use_container_width=True)
+
+    else:
+        st.warning("Not enough data points for correlation analysis.")
+
+# Correlation matrix
+st.markdown("---")
+st.subheader("📈 Full Correlation Matrix")
+st.caption("_Explore relationships between all metrics_")
+
+# Select numeric columns
+numeric_cols = ['occupancy_pct', 'occupied_rooms', 'total_guests', 'arrival_count',
+                'room_revenue', 'adr', 'revpar', 'dinner_covers', 'lunch_covers']
+available_cols = [c for c in numeric_cols if c in df.columns]
+
+if len(available_cols) >= 2:
+    corr_matrix = df[available_cols].corr()
+
+    # Rename for display
+    display_names = [metric_columns.get(c, c) for c in available_cols]
+    corr_matrix.index = display_names
+    corr_matrix.columns = display_names
+
+    fig_heatmap = px.imshow(
+        corr_matrix,
+        labels=dict(color="Correlation"),
+        color_continuous_scale='RdBu_r',
+        zmin=-1, zmax=1,
+        aspect='auto'
+    )
+    fig_heatmap.update_layout(height=500)
+    st.plotly_chart(fig_heatmap, use_container_width=True)
+
+    with st.expander("ℹ️ Reading the Correlation Matrix"):
+        st.markdown("""
+        - **Red/Orange**: Positive correlation (metrics increase together)
+        - **Blue**: Negative correlation (one increases, other decreases)
+        - **White/Light**: No significant correlation
+
+        **Strong positive correlations to look for:**
+        - Occupancy ↔ Room Revenue (more rooms = more revenue)
+        - Guests ↔ Breakfast (more guests = more breakfasts)
+
+        **Interesting negative correlations:**
+        - ADR ↔ Occupancy might show pricing strategy effects
         """)
 
-# Historical alignment
+# Time series comparison
 st.markdown("---")
-st.subheader("📈 Alignment Score Trend")
+st.subheader("📈 Time Series Comparison")
 
-# Generate historical alignment scores
-dates = pd.date_range(end=check_date, periods=14, freq='D')
-scores = 85 + np.random.randn(14) * 5 + np.sin(np.arange(14) * 0.3) * 3
+if metric_x in df.columns and metric_y in df.columns:
+    fig_ts = go.Figure()
 
-fig_trend = go.Figure()
-fig_trend.add_trace(go.Scatter(
-    x=dates, y=scores,
-    mode='lines+markers',
-    fill='tozeroy',
-    line=dict(color='#1f77b4', width=2)
-))
-fig_trend.add_hline(y=90, line_dash="dash", line_color="green", annotation_text="Target: 90%")
-fig_trend.update_layout(
-    title='Alignment Score Over Time',
-    xaxis_title='Date',
-    yaxis_title='Alignment Score (%)',
-    height=300,
-    yaxis=dict(range=[70, 100])
+    fig_ts.add_trace(go.Scatter(
+        x=df['date'], y=df[metric_x],
+        name=x_label, yaxis='y'
+    ))
+
+    fig_ts.add_trace(go.Scatter(
+        x=df['date'], y=df[metric_y],
+        name=y_label, yaxis='y2',
+        line=dict(color='red')
+    ))
+
+    fig_ts.update_layout(
+        title=f'{x_label} and {y_label} Over Time',
+        yaxis=dict(title=x_label, side='left'),
+        yaxis2=dict(title=y_label, side='right', overlaying='y'),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02),
+        height=350,
+        hovermode='x unified'
+    )
+
+    st.plotly_chart(fig_ts, use_container_width=True)
+
+# Export
+st.markdown("---")
+csv = df.to_csv(index=False)
+st.download_button(
+    label="📥 Export Cross-Reference Data",
+    data=csv,
+    file_name=f"cross_reference_{lookback}days.csv",
+    mime="text/csv"
 )
-
-st.plotly_chart(fig_trend, use_container_width=True)
