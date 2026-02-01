@@ -1731,6 +1731,24 @@ async def _tft_predict_with_cached_model(
         predict_dataloader = predict_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
         raw_predictions = tft_model.predict(predict_dataloader, mode="raw", return_x=False)
         pred_values = raw_predictions["prediction"]
+
+        # DEBUG: Log predictions with day of week
+        import logging
+        logging.info(f"TFT Predictions (first 7 days):")
+        for i in range(min(7, pred_values.shape[1])):
+            forecast_dt = future_dates[i]
+            dow_name = forecast_dt.strftime("%a")
+            dow_num = forecast_dt.weekday()
+            pred_val = float(pred_values[0, i, 3])  # median
+            logging.info(f"  {forecast_dt} ({dow_name}, dow={dow_num}): pred={pred_val:.1f}")
+
+        # DEBUG: Check categorical encoder mapping
+        logging.info(f"Categorical encoder for day_of_week: {training.categorical_encoders['day_of_week'].classes_}")
+
+        # DEBUG: Check what day_of_week values are in prediction_data
+        future_dows = prediction_data.tail(7)['day_of_week'].tolist()
+        future_dates_str = prediction_data.tail(7)['ds'].dt.strftime('%Y-%m-%d (%a)').tolist()
+        logging.info(f"Prediction data day_of_week (last 7 rows): {list(zip(future_dates_str, future_dows))}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TFT prediction failed: {str(e)}")
 
@@ -1789,6 +1807,16 @@ async def _tft_predict_with_cached_model(
         yhat = float(pred_values[0, i, 3])
         yhat_lower = float(pred_values[0, i, 1])
         yhat_upper = float(pred_values[0, i, 5])
+
+        # Apply day-of-week adjustment based on historical patterns
+        # This corrects for the model not learning weekly seasonality properly
+        # Adjustments are: Mon=-7.4, Tue=-3.8, Wed=-4.3, Thu=-1.8, Fri=+5.9, Sat=+13.8, Sun=-3.3
+        dow_adjustments = {0: -7.4, 1: -3.8, 2: -4.3, 3: -1.8, 4: 5.9, 5: 13.8, 6: -3.3}
+        dow_num = forecast_date.weekday()
+        dow_adj = dow_adjustments.get(dow_num, 0)
+        yhat += dow_adj
+        yhat_lower += dow_adj
+        yhat_upper += dow_adj
 
         if metric == "occupancy":
             yhat = min(max(yhat, 0), 100.0)

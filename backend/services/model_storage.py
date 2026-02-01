@@ -154,6 +154,7 @@ def save_model(
                 "max_encoder_length": dataset.max_encoder_length,
                 "max_prediction_length": dataset.max_prediction_length,
                 "time_varying_known_reals": dataset.time_varying_known_reals,
+                "time_varying_known_categoricals": dataset.time_varying_known_categoricals,  # day_of_week!
                 "time_varying_unknown_reals": dataset.time_varying_unknown_reals,
                 "static_categoricals": dataset.static_categoricals,
             }
