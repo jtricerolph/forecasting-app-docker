@@ -39,6 +39,15 @@ services:
       - TFT_USE_GPU=false
     volumes:
       - tft_models:/app/models/tft
+    # Resource limits to prevent TFT training from locking up container
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     depends_on:
       db:
         condition: service_healthy
@@ -73,6 +82,15 @@ services:
       - TFT_USE_GPU=false
     volumes:
       - tft_models:/app/models/tft
+    # Resource limits to prevent TFT training from locking up container
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     depends_on:
       db:
         condition: service_healthy

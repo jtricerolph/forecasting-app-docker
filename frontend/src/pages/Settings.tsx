@@ -2413,6 +2413,7 @@ interface TFTSettings {
   use_otb_data: boolean
   early_stop_patience: number
   early_stop_min_delta: number
+  cpu_threads: number
 }
 
 interface TFTModel {
@@ -2806,6 +2807,21 @@ const TFTTrainingPage: React.FC = () => {
                   Use GPU
                 </label>
                 <span style={styles.settingHint}>CUDA acceleration if available</span>
+              </div>
+
+              <div style={styles.settingItem}>
+                <label style={styles.settingLabel} title="Maximum CPU threads for training. Lower values prevent container lockup during training but train slower. Higher values train faster but may impact other services. 2-4 is recommended for shared containers.">CPU Threads</label>
+                <select
+                  value={settings.cpu_threads ?? 2}
+                  onChange={(e) => setSettings({ ...settings, cpu_threads: parseInt(e.target.value) })}
+                  style={styles.settingSelect}
+                >
+                  <option value={1}>1 (Minimal)</option>
+                  <option value={2}>2 (Recommended)</option>
+                  <option value={4}>4 (Faster)</option>
+                  <option value={8}>8 (Fast, high resource use)</option>
+                </select>
+                <span style={styles.settingHint}>Prevents container lockup during training</span>
               </div>
 
               <div style={styles.settingItem}>

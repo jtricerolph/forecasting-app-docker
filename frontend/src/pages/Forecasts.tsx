@@ -517,11 +517,11 @@ const ForecastPreview: React.FC = () => {
 
       {/* Summary Stats */}
       {previewData?.summary && (() => {
-        const days = previewData.summary.days_count
-        const otbAvg = metric === 'occupancy' ? previewData.summary.otb_total / days : previewData.summary.otb_total
-        const priorOtbAvg = metric === 'occupancy' ? previewData.summary.prior_otb_total / days : previewData.summary.prior_otb_total
-        const forecastAvg = metric === 'occupancy' ? previewData.summary.forecast_total / days : previewData.summary.forecast_total
-        const priorFinalAvg = metric === 'occupancy' ? previewData.summary.prior_final_total / days : previewData.summary.prior_final_total
+        // Backend already returns averages for occupancy, totals for rooms
+        const otbAvg = previewData.summary.otb_total
+        const priorOtbAvg = previewData.summary.prior_otb_total
+        const forecastAvg = previewData.summary.forecast_total
+        const priorFinalAvg = previewData.summary.prior_final_total
         const otbDiff = otbAvg - priorOtbAvg
         const forecastDiff = forecastAvg - priorFinalAvg
 
@@ -1024,11 +1024,11 @@ const ProphetPreview: React.FC = () => {
 
       {/* Summary Stats */}
       {prophetData?.summary && (() => {
-        const days = prophetData.summary.days_count
-        const otbAvg = metric === 'occupancy' ? prophetData.summary.otb_total / days : prophetData.summary.otb_total
-        const priorOtbAvg = metric === 'occupancy' ? prophetData.summary.prior_otb_total / days : prophetData.summary.prior_otb_total
-        const forecastAvg = metric === 'occupancy' ? prophetData.summary.forecast_total / days : prophetData.summary.forecast_total
-        const priorFinalAvg = metric === 'occupancy' ? prophetData.summary.prior_final_total / days : prophetData.summary.prior_final_total
+        // Backend already returns averages for occupancy, totals for rooms
+        const otbAvg = prophetData.summary.otb_total
+        const priorOtbAvg = prophetData.summary.prior_otb_total
+        const forecastAvg = prophetData.summary.forecast_total
+        const priorFinalAvg = prophetData.summary.prior_final_total
         const otbDiff = otbAvg - priorOtbAvg
         const forecastDiff = forecastAvg - priorFinalAvg
 
@@ -1399,11 +1399,11 @@ const XGBoostPreview: React.FC = () => {
 
       {/* Summary Stats */}
       {xgboostData?.summary && (() => {
-        const days = xgboostData.summary.days_count
-        const otbAvg = metric === 'occupancy' ? xgboostData.summary.otb_total / days : xgboostData.summary.otb_total
-        const priorOtbAvg = metric === 'occupancy' ? xgboostData.summary.prior_otb_total / days : xgboostData.summary.prior_otb_total
-        const forecastAvg = metric === 'occupancy' ? xgboostData.summary.forecast_total / days : xgboostData.summary.forecast_total
-        const priorFinalAvg = metric === 'occupancy' ? xgboostData.summary.prior_final_total / days : xgboostData.summary.prior_final_total
+        // Backend already returns averages for occupancy, totals for rooms
+        const otbAvg = xgboostData.summary.otb_total
+        const priorOtbAvg = xgboostData.summary.prior_otb_total
+        const forecastAvg = xgboostData.summary.forecast_total
+        const priorFinalAvg = xgboostData.summary.prior_final_total
         const otbDiff = otbAvg - priorOtbAvg
         const forecastDiff = forecastAvg - priorFinalAvg
 

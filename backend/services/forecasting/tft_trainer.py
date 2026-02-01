@@ -41,6 +41,7 @@ def train_tft_model_with_progress(
         Dict with training results
     """
     import torch
+    import os
     from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
     from pytorch_forecasting.metrics import QuantileLoss
     from lightning.pytorch import Trainer
@@ -66,6 +67,17 @@ def train_tft_model_with_progress(
     use_otb_data = config.get('use_otb_data', True)
     early_stop_patience = config.get('early_stop_patience', 10)
     early_stop_min_delta = config.get('early_stop_min_delta', 0.0001)
+    cpu_threads = config.get('cpu_threads', 2)  # Limit CPU threads to avoid lockup
+
+    # Apply resource limits to prevent container lockup
+    # Limit PyTorch CPU threads (default 2 to leave headroom for other processes)
+    torch.set_num_threads(cpu_threads)
+    torch.set_num_interop_threads(max(1, cpu_threads // 2))
+
+    # Also set environment variables for other libraries (numpy, etc.)
+    os.environ['OMP_NUM_THREADS'] = str(cpu_threads)
+    os.environ['MKL_NUM_THREADS'] = str(cpu_threads)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(cpu_threads)
 
     logger.info(f"Starting TFT training for {metric_code}")
     logger.info(f"  Config: encoder_length={encoder_length}, prediction_length={prediction_length}")
@@ -75,6 +87,7 @@ def train_tft_model_with_progress(
     logger.info(f"  Config: dropout={dropout}, use_gpu={use_gpu}")
     logger.info(f"  Config: use_special_dates={use_special_dates}, use_otb_data={use_otb_data}")
     logger.info(f"  Config: early_stop_patience={early_stop_patience}, early_stop_min_delta={early_stop_min_delta}")
+    logger.info(f"  Resource limits: cpu_threads={cpu_threads}")
 
     # Update job status to running
     update_training_job(db, job_id, status="running", progress_pct=5)
@@ -200,6 +213,9 @@ def train_tft_model_with_progress(
             # Keep only rows where lag_364 is valid (after row 364)
             df = df.iloc[364:].copy()
             df = df.reset_index(drop=True)
+            # CRITICAL: Reassign time_idx after row drop to ensure 0-based indexing
+            # This prevents day-of-week misalignment during prediction
+            df['time_idx'] = range(len(df))
             logger.info(f"Dropped first 364 rows for lag_364, now have {len(df)} rows")
         elif 'lag_364' in df.columns:
             # Not enough history for lag_364 - drop the column
@@ -207,6 +223,9 @@ def train_tft_model_with_progress(
             logger.info("Dropped lag_364 column - insufficient history")
 
         df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
+        # Reassign time_idx after dropping NaN rows to ensure continuous 0-based indexing
+        df = df.reset_index(drop=True)
+        df['time_idx'] = range(len(df))
 
         if len(df) < min_required:
             raise ValueError("Insufficient data after feature creation")

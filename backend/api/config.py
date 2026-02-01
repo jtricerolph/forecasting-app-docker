@@ -788,6 +788,11 @@ class TFTSettingsUpdate(BaseModel):
     use_gpu: Optional[bool] = None
     auto_retrain: Optional[bool] = None
     use_cached_model: Optional[bool] = None
+    use_special_dates: Optional[bool] = None
+    use_otb_data: Optional[bool] = None
+    early_stop_patience: Optional[int] = None
+    early_stop_min_delta: Optional[float] = None
+    cpu_threads: Optional[int] = None
 
 
 class TFTModelResponse(BaseModel):
@@ -1227,7 +1232,7 @@ async def _run_tft_training(job_id: str, metric_code: str, model_name: str, crea
             value = row.config_value
             if key in ('encoder_length', 'prediction_length', 'hidden_size',
                        'attention_heads', 'batch_size', 'max_epochs', 'training_days',
-                       'early_stop_patience'):
+                       'early_stop_patience', 'cpu_threads'):
                 settings[key] = int(value) if value else 0
             elif key in ('learning_rate', 'dropout', 'early_stop_min_delta'):
                 settings[key] = float(value) if value else 0.0

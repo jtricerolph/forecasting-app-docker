@@ -27,22 +27,28 @@ ON tft_models(is_active) WHERE is_active = TRUE;
 
 -- TFT training settings in system_config
 INSERT INTO system_config (config_key, config_value, description) VALUES
+-- Model Architecture
 ('tft_encoder_length', '90', 'Historical context window (days)'),
 ('tft_prediction_length', '28', 'Forecast horizon (days)'),
 ('tft_hidden_size', '64', 'Model hidden layer size'),
 ('tft_attention_heads', '4', 'Number of attention heads'),
+('tft_dropout', '0.1', 'Dropout rate'),
+-- Training Parameters
 ('tft_learning_rate', '0.001', 'Training learning rate'),
 ('tft_batch_size', '128', 'Training batch size'),
 ('tft_max_epochs', '100', 'Maximum training epochs'),
 ('tft_training_days', '2555', 'Days of historical data to use'),
-('tft_dropout', '0.1', 'Dropout rate'),
-('tft_use_gpu', 'false', 'Use GPU for training'),
-('tft_auto_retrain', 'true', 'Enable weekly auto-retrain'),
-('tft_use_cached_model', 'true', 'Use cached model for live preview'),
+-- Early Stopping
+('tft_early_stop_patience', '10', 'Epochs without improvement before stopping'),
+('tft_early_stop_min_delta', '0.0001', 'Minimum loss improvement to count as progress'),
+-- Feature Options
 ('tft_use_special_dates', 'true', 'Include special dates/holidays as features'),
 ('tft_use_otb_data', 'true', 'Include OTB (On-The-Books) pickup data as features'),
-('tft_early_stop_patience', '10', 'Epochs without improvement before stopping'),
-('tft_early_stop_min_delta', '0.0001', 'Minimum loss improvement to count as progress')
+-- Runtime Options
+('tft_use_gpu', 'false', 'Use GPU for training'),
+('tft_cpu_threads', '2', 'Max CPU threads for training (prevents container lockup)'),
+('tft_use_cached_model', 'true', 'Use cached model for live preview'),
+('tft_auto_retrain', 'true', 'Enable weekly auto-retrain')
 ON CONFLICT (config_key) DO NOTHING;
 
 -- Training job status table

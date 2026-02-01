@@ -46,7 +46,7 @@ def get_tft_config_from_db(db) -> Dict[str, Any]:
             # Convert to appropriate types
             if key in ('encoder_length', 'prediction_length', 'hidden_size',
                        'attention_heads', 'batch_size', 'max_epochs', 'training_days',
-                       'early_stop_patience'):
+                       'early_stop_patience', 'cpu_threads'):
                 config[key] = int(value) if value else 0
             elif key in ('learning_rate', 'dropout', 'early_stop_min_delta'):
                 config[key] = float(value) if value else 0.0
@@ -389,10 +389,16 @@ async def _generate_forecasts_from_pretrained_model(
         if has_lag_364 and 'lag_364' in df.columns:
             df = df.iloc[364:].copy()
             df = df.reset_index(drop=True)
+            # CRITICAL: Reassign time_idx after row drop to ensure 0-based indexing
+            # This prevents day-of-week misalignment during prediction
+            df['time_idx'] = range(len(df))
             logger.debug(f"Dropped 364 prefix rows, now have {len(df)} rows")
 
         # Drop any remaining NaN from lag features
         df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
+        # Reassign time_idx after dropping NaN rows to ensure continuous 0-based indexing
+        df = df.reset_index(drop=True)
+        df['time_idx'] = range(len(df))
 
         if len(df) < min_required:
             logger.warning(f"Insufficient data after feature creation for {metric_code}")

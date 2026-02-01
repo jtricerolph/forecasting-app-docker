@@ -1212,6 +1212,153 @@ async def get_xgboost_preview(
 # LIVE TFT ENDPOINT
 # ============================================
 
+
+async def _load_special_dates_async(db, from_date: date, to_date: date) -> set:
+    """Load special dates from Settings database (async version)."""
+    import logging
+    try:
+        from api.special_dates import resolve_special_date
+
+        result = await db.execute(text("""
+            SELECT
+                id, name, pattern_type,
+                fixed_month, fixed_day,
+                nth_week, weekday, month,
+                relative_to_month, relative_to_day,
+                relative_weekday, relative_direction,
+                duration_days, is_recurring, one_off_year
+            FROM special_dates
+            WHERE is_active = TRUE
+        """))
+        rows = result.fetchall()
+
+        if not rows:
+            return set()
+
+        all_dates = set()
+        years = set(range(from_date.year - 1, to_date.year + 2))
+
+        for row in rows:
+            sd = {
+                'pattern_type': row.pattern_type,
+                'fixed_month': row.fixed_month,
+                'fixed_day': row.fixed_day,
+                'nth_week': row.nth_week,
+                'weekday': row.weekday,
+                'month': row.month,
+                'relative_to_month': row.relative_to_month,
+                'relative_to_day': row.relative_to_day,
+                'relative_weekday': row.relative_weekday,
+                'relative_direction': row.relative_direction,
+                'duration_days': row.duration_days or 1,
+                'is_recurring': row.is_recurring,
+                'one_off_year': row.one_off_year
+            }
+
+            for year in years:
+                resolved = resolve_special_date(sd, year)
+                for d in resolved:
+                    if from_date - timedelta(days=30) <= d <= to_date + timedelta(days=365):
+                        all_dates.add(d)
+
+        logging.info(f"Loaded {len(all_dates)} special date occurrences")
+        return all_dates
+
+    except Exception as e:
+        logging.warning(f"Failed to load special dates: {e}")
+        return set()
+
+
+async def _load_otb_data_async(db, from_date: date, to_date: date):
+    """Load OTB data from booking_pace table (async version)."""
+    import pandas as pd
+    import logging
+    try:
+        result = await db.execute(text("""
+            SELECT
+                arrival_date,
+                d30 as otb_at_30d,
+                d14 as otb_at_14d,
+                d7 as otb_at_7d,
+                d0 as final_bookings
+            FROM newbook_booking_pace
+            WHERE arrival_date BETWEEN :from_date AND :to_date
+            ORDER BY arrival_date
+        """), {"from_date": from_date, "to_date": to_date})
+        rows = result.fetchall()
+
+        if not rows:
+            return None
+
+        df = pd.DataFrame([{
+            "arrival_date": row.arrival_date,
+            "otb_at_30d": float(row.otb_at_30d) if row.otb_at_30d else 0,
+            "otb_at_14d": float(row.otb_at_14d) if row.otb_at_14d else 0,
+            "otb_at_7d": float(row.otb_at_7d) if row.otb_at_7d else 0,
+            "final_bookings": float(row.final_bookings) if row.final_bookings else 0
+        } for row in rows])
+
+        return df
+
+    except Exception as e:
+        logging.warning(f"Failed to load OTB data: {e}")
+        return None
+
+
+def _add_otb_features_sync(df, otb_df):
+    """Add OTB features to the dataframe (sync version)."""
+    import pandas as pd
+    import numpy as np
+
+    df = df.copy()
+
+    if otb_df is None or len(otb_df) == 0:
+        df['otb_at_30d'] = 0
+        df['otb_at_14d'] = 0
+        df['otb_at_7d'] = 0
+        df['pickup_30d_to_14d'] = 0
+        df['pickup_14d_to_7d'] = 0
+        df['otb_pct_at_30d'] = 0
+        df['otb_pct_at_14d'] = 0
+        df['otb_pct_at_7d'] = 0
+        return df
+
+    df['date_only'] = df['ds'].dt.date
+    otb_df = otb_df.copy()
+    otb_df['date_only'] = pd.to_datetime(otb_df['arrival_date']).dt.date
+
+    df = df.merge(
+        otb_df[['date_only', 'otb_at_30d', 'otb_at_14d', 'otb_at_7d', 'final_bookings']],
+        on='date_only',
+        how='left'
+    )
+
+    for col in ['otb_at_30d', 'otb_at_14d', 'otb_at_7d', 'final_bookings']:
+        df[col] = df[col].fillna(0)
+
+    df['pickup_30d_to_14d'] = df['otb_at_14d'] - df['otb_at_30d']
+    df['pickup_14d_to_7d'] = df['otb_at_7d'] - df['otb_at_14d']
+
+    df['otb_pct_at_30d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_30d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+    df['otb_pct_at_14d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_14d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+    df['otb_pct_at_7d'] = np.where(
+        df['final_bookings'] > 0,
+        np.minimum(df['otb_at_7d'] / df['final_bookings'] * 100, 100),
+        0
+    )
+
+    df = df.drop(columns=['date_only', 'final_bookings'], errors='ignore')
+    return df
+
+
 async def _tft_predict_with_cached_model(
     db,
     model,
@@ -1226,17 +1373,50 @@ async def _tft_predict_with_cached_model(
 ) -> "TFTResponse":
     """
     Generate TFT predictions using a cached model.
-    This is much faster than training a new model each time.
+    This function recreates the exact features used during training.
     """
     import pandas as pd
     import numpy as np
+    import logging
 
     from pytorch_forecasting import TimeSeriesDataSet
 
-    # Get historical data for encoder context
-    # Only need ~150 days: encoder_length + lag features (28) + buffer
-    ENCODER_LENGTH = checkpoint.get('dataset_parameters', {}).get('max_encoder_length', 60)
-    HISTORY_DAYS = ENCODER_LENGTH + 90  # Enough for encoder + feature calculation
+    # 'model' parameter contains the actual checkpoint dict with dataset_parameters
+    # 'checkpoint' parameter is the model_info dict (id, name, path, etc.)
+    dataset_params = model.get('dataset_parameters', {})
+    training_config = model.get('training_config', {})
+
+    ENCODER_LENGTH = dataset_params.get('max_encoder_length', 90)
+    PREDICTION_LENGTH = min(
+        dataset_params.get('max_prediction_length', 28),
+        (end - start).days + 1
+    )
+
+    # Read feature lists from checkpoint to know what the model expects
+    time_varying_known = dataset_params.get('time_varying_known_reals', [
+        'day_of_week', 'month', 'week_of_year', 'is_weekend',
+        'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
+    ])
+    time_varying_unknown = dataset_params.get('time_varying_unknown_reals', [
+        'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
+        'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
+        'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
+    ])
+
+    # Detect which features the model was trained with
+    use_special_dates = training_config.get('use_special_dates', False) or 'is_holiday' in time_varying_known
+    use_otb_data = training_config.get('use_otb_data', False) or 'otb_at_30d' in time_varying_unknown
+    use_lag_364 = 'lag_364' in time_varying_unknown
+
+    logging.info(f"Loading cached model for {metric_code}")
+    logging.info(f"  Features: special_dates={use_special_dates}, otb={use_otb_data}, lag_364={use_lag_364}")
+    logging.info(f"  Known features: {time_varying_known}")
+    logging.info(f"  Unknown features: {time_varying_unknown}")
+
+    # Calculate how much history we need
+    HISTORY_DAYS = ENCODER_LENGTH + 90
+    if use_lag_364:
+        HISTORY_DAYS = max(HISTORY_DAYS, 400)  # Need 364+ days for lag_364
 
     history_start = today - timedelta(days=HISTORY_DAYS)
     history_result = await db.execute(text("""
@@ -1252,13 +1432,10 @@ async def _tft_predict_with_cached_model(
     if len(history_rows) < 60:
         raise HTTPException(status_code=400, detail="Insufficient historical data for TFT model (need 60+ days)")
 
-    PREDICTION_LENGTH = min(28, (end - start).days + 1)
-
-    # Check dataset cache
-    cache_key = (metric, str(today), PREDICTION_LENGTH)
+    # Check dataset cache with feature-aware key
+    cache_key = (metric, str(today), PREDICTION_LENGTH, use_special_dates, use_otb_data, use_lag_364)
     if cache_key in _tft_dataset_cache:
         training, df = _tft_dataset_cache[cache_key]
-        import logging
         logging.info(f"Using cached TFT dataset for {metric}")
     else:
         # Build training dataframe
@@ -1268,7 +1445,7 @@ async def _tft_predict_with_cached_model(
         if metric == "occupancy" and total_rooms > 0:
             df["y"] = (df["y"] / total_rooms) * 100
 
-        # Create features
+        # Create base calendar features
         df['day_of_week'] = df['ds'].dt.dayofweek
         df['month'] = df['ds'].dt.month
         df['week_of_year'] = df['ds'].dt.isocalendar().week.astype(int)
@@ -1278,30 +1455,65 @@ async def _tft_predict_with_cached_model(
         df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
         df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
 
+        # Special dates / holidays (if model uses them)
+        if use_special_dates:
+            special_dates = await _load_special_dates_async(db, history_start, end + timedelta(days=365))
+            if special_dates:
+                df['is_holiday'] = df['ds'].dt.date.apply(lambda x: 1 if x in special_dates else 0)
+                def days_to_holiday(d):
+                    future_dates = [h for h in special_dates if h >= d]
+                    return min((h - d).days for h in future_dates) if future_dates else 30
+                df['days_to_holiday'] = df['ds'].dt.date.apply(days_to_holiday)
+            else:
+                df['is_holiday'] = 0
+                df['days_to_holiday'] = 30
+        else:
+            # Model doesn't use these, but add zeros if columns expected
+            if 'is_holiday' in time_varying_known:
+                df['is_holiday'] = 0
+                df['days_to_holiday'] = 30
+
+        # Lag features
         for lag in [7, 14, 21, 28]:
             df[f'lag_{lag}'] = df['y'].shift(lag)
 
+        # Year-over-year lag (if model uses it)
+        if use_lag_364 and len(df) > 364:
+            df['lag_364'] = df['y'].shift(364)
+        elif 'lag_364' in time_varying_unknown:
+            # Model expects lag_364 but we don't have enough data - use mean as fallback
+            df['lag_364'] = df['y'].rolling(window=28, min_periods=1).mean()
+
+        # Rolling statistics
         for window in [7, 14, 28]:
             df[f'rolling_mean_{window}'] = df['y'].rolling(window=window, min_periods=1).mean()
             df[f'rolling_std_{window}'] = df['y'].rolling(window=window, min_periods=1).std().fillna(0)
 
+        # OTB features (if model uses them)
+        if use_otb_data or 'otb_at_30d' in time_varying_unknown:
+            otb_df = await _load_otb_data_async(db, history_start, today)
+            if otb_df is not None and len(otb_df) > 0:
+                df = _add_otb_features_sync(df, otb_df)
+            else:
+                # Model expects OTB features but we don't have data - set zeros
+                for col in ['otb_at_30d', 'otb_at_14d', 'otb_at_7d',
+                            'pickup_30d_to_14d', 'pickup_14d_to_7d',
+                            'otb_pct_at_30d', 'otb_pct_at_14d', 'otb_pct_at_7d']:
+                    if col in time_varying_unknown:
+                        df[col] = 0.0
+
         df['time_idx'] = range(len(df))
         df['group'] = 'hotel'
-        df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
 
-        # Define features
-        time_varying_known = [
-            'day_of_week', 'month', 'week_of_year', 'is_weekend',
-            'dow_sin', 'dow_cos', 'month_sin', 'month_cos'
-        ]
+        # Drop rows with NaN in required columns
+        required_lags = ['lag_7', 'lag_14', 'lag_21', 'lag_28']
+        if use_lag_364 and 'lag_364' in df.columns:
+            df = df.iloc[364:].copy()  # Skip first 364 rows for lag_364
+        df = df.dropna(subset=required_lags)
+        df = df.reset_index(drop=True)
+        df['time_idx'] = range(len(df))
 
-        time_varying_unknown = [
-            'y', 'lag_7', 'lag_14', 'lag_21', 'lag_28',
-            'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
-            'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
-        ]
-
-        # Create TimeSeriesDataSet for prediction context
+        # Create TimeSeriesDataSet with exact features from checkpoint
         training = TimeSeriesDataSet(
             df.copy(),
             time_idx="time_idx",
@@ -1319,11 +1531,10 @@ async def _tft_predict_with_cached_model(
             add_encoder_length=True,
         )
 
-        # Cache for subsequent requests (clear old entries to prevent memory bloat)
+        # Cache for subsequent requests
         if len(_tft_dataset_cache) > 10:
             _tft_dataset_cache.clear()
         _tft_dataset_cache[cache_key] = (training, df)
-        import logging
         logging.info(f"Created and cached TFT dataset for {metric}")
 
     # Generate forecasts for future dates
@@ -1344,11 +1555,12 @@ async def _tft_predict_with_cached_model(
             )
         )
 
-    # Build prediction dataframe
+    # Build prediction dataframe with all features the model expects
     future_df = pd.DataFrame({'ds': [pd.Timestamp(d) for d in future_dates]})
     last_known_y = df['y'].iloc[-1]
     future_df['y'] = last_known_y
 
+    # Base calendar features
     future_df['day_of_week'] = future_df['ds'].dt.dayofweek
     future_df['month'] = future_df['ds'].dt.month
     future_df['week_of_year'] = future_df['ds'].dt.isocalendar().week.astype(int)
@@ -1358,17 +1570,155 @@ async def _tft_predict_with_cached_model(
     future_df['month_sin'] = np.sin(2 * np.pi * future_df['month'] / 12)
     future_df['month_cos'] = np.cos(2 * np.pi * future_df['month'] / 12)
 
+    # Special date features for future (if model uses them)
+    if 'is_holiday' in time_varying_known:
+        if use_special_dates:
+            special_dates = await _load_special_dates_async(db, start, end + timedelta(days=30))
+            if special_dates:
+                future_df['is_holiday'] = future_df['ds'].dt.date.apply(lambda x: 1 if x in special_dates else 0)
+                def days_to_holiday_future(d):
+                    future_h = [h for h in special_dates if h >= d]
+                    return min((h - d).days for h in future_h) if future_h else 30
+                future_df['days_to_holiday'] = future_df['ds'].dt.date.apply(days_to_holiday_future)
+            else:
+                future_df['is_holiday'] = 0
+                future_df['days_to_holiday'] = 30
+        else:
+            future_df['is_holiday'] = 0
+            future_df['days_to_holiday'] = 30
+
+    # Lag features - use last known values
     for lag in [7, 14, 21, 28]:
         future_df[f'lag_{lag}'] = df['y'].iloc[-1]
+
+    # lag_364 - use value from 364 days ago if available
+    if 'lag_364' in time_varying_unknown:
+        if 'lag_364' in df.columns:
+            future_df['lag_364'] = df['lag_364'].iloc[-1]
+        else:
+            future_df['lag_364'] = df['y'].mean()
+
+    # Rolling stats - use last known values
     for window in [7, 14, 28]:
         future_df[f'rolling_mean_{window}'] = df[f'rolling_mean_{window}'].iloc[-1]
         future_df[f'rolling_std_{window}'] = df[f'rolling_std_{window}'].iloc[-1]
+
+    # OTB features for future dates - load CURRENT bookings, not historical snapshots
+    otb_features = ['otb_at_30d', 'otb_at_14d', 'otb_at_7d',
+                    'pickup_30d_to_14d', 'pickup_14d_to_7d',
+                    'otb_pct_at_30d', 'otb_pct_at_14d', 'otb_pct_at_7d']
+    has_otb_features = any(col in time_varying_unknown for col in otb_features)
+
+    if has_otb_features:
+        # Load CURRENT bookings for future dates (what we have booked right now)
+        current_otb_result = await db.execute(text("""
+            SELECT date, booking_count
+            FROM newbook_bookings_stats
+            WHERE date >= :start_date AND date <= :end_date
+        """), {"start_date": start, "end_date": end})
+        current_otb_rows = current_otb_result.fetchall()
+        current_otb_map = {row.date: float(row.booking_count or 0) for row in current_otb_rows}
+
+        # Load prior year final for calculating OTB percentages
+        prior_start = start - timedelta(days=364)
+        prior_end = end - timedelta(days=364)
+        prior_result = await db.execute(text("""
+            SELECT date, booking_count
+            FROM newbook_bookings_stats
+            WHERE date >= :start_date AND date <= :end_date
+        """), {"start_date": prior_start, "end_date": prior_end})
+        prior_rows = prior_result.fetchall()
+        prior_final_map = {row.date: float(row.booking_count or 0) for row in prior_rows}
+
+        # For future dates, treat current OTB as the "OTB at current lead time"
+        # Map it to whichever lead window is closest
+        future_otb = []
+        for fd in future_dates:
+            lead_days = (fd - today).days
+            current_otb = current_otb_map.get(fd, 0)
+            prior_date = fd - timedelta(days=364)
+            prior_final = prior_final_map.get(prior_date, 0)
+
+            # Convert to occupancy if needed
+            if metric == "occupancy" and total_rooms > 0:
+                current_otb = (current_otb / total_rooms) * 100
+                prior_final = (prior_final / total_rooms) * 100
+
+            # Assign current OTB to appropriate lead-time bucket
+            if lead_days <= 7:
+                otb_30d, otb_14d, otb_7d = current_otb, current_otb, current_otb
+            elif lead_days <= 14:
+                otb_30d, otb_14d, otb_7d = current_otb, current_otb, 0
+            elif lead_days <= 30:
+                otb_30d, otb_14d, otb_7d = current_otb, 0, 0
+            else:
+                # Far out - no OTB snapshot yet, use current as proxy
+                otb_30d, otb_14d, otb_7d = current_otb, 0, 0
+
+            # Calculate OTB percentages based on prior year final
+            otb_pct_30d = min(otb_30d / prior_final * 100, 100) if prior_final > 0 else 0
+            otb_pct_14d = min(otb_14d / prior_final * 100, 100) if prior_final > 0 else 0
+            otb_pct_7d = min(otb_7d / prior_final * 100, 100) if prior_final > 0 else 0
+
+            future_otb.append({
+                'otb_at_30d': otb_30d,
+                'otb_at_14d': otb_14d,
+                'otb_at_7d': otb_7d,
+                'pickup_30d_to_14d': otb_14d - otb_30d,
+                'pickup_14d_to_7d': otb_7d - otb_14d,
+                'otb_pct_at_30d': otb_pct_30d,
+                'otb_pct_at_14d': otb_pct_14d,
+                'otb_pct_at_7d': otb_pct_7d,
+            })
+
+        # Assign OTB features to future_df
+        for col in otb_features:
+            if col in time_varying_unknown:
+                future_df[col] = [otb[col] for otb in future_otb]
+    else:
+        # No OTB features needed
+        for col in otb_features:
+            if col in time_varying_unknown:
+                future_df[col] = 0.0
 
     combined = pd.concat([df, future_df], ignore_index=True)
     combined['time_idx'] = range(len(combined))
     combined['group'] = 'hotel'
 
     prediction_data = combined.iloc[-(len(future_dates) + ENCODER_LENGTH):].copy()
+
+    # Reconstruct TFT model from checkpoint
+    # 'model' parameter is actually the checkpoint dict containing model_state_dict and model_hparams
+    from pytorch_forecasting import TemporalFusionTransformer
+    from pytorch_forecasting.metrics import QuantileLoss
+
+    try:
+        # Get hyperparameters from checkpoint
+        hparams = model.get('model_hparams', {})
+
+        # Create TFT model with saved hyperparameters
+        tft_model = TemporalFusionTransformer.from_dataset(
+            training,
+            learning_rate=hparams.get('learning_rate', 0.001),
+            hidden_size=hparams.get('hidden_size', 64),
+            attention_head_size=hparams.get('attention_head_size', 4),
+            dropout=hparams.get('dropout', 0.1),
+            hidden_continuous_size=hparams.get('hidden_continuous_size', 32),
+            output_size=7,  # 7 quantiles
+            loss=QuantileLoss(),
+            reduce_on_plateau_patience=4,
+        )
+
+        # Load trained weights
+        tft_model.load_state_dict(model['model_state_dict'])
+        tft_model.eval()
+
+        import logging
+        logging.info(f"Reconstructed TFT model from checkpoint for {metric_code}")
+    except Exception as e:
+        import logging
+        logging.error(f"Failed to reconstruct TFT model: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to load cached model: {str(e)}")
 
     try:
         predict_dataset = TimeSeriesDataSet.from_dataset(
@@ -1378,7 +1728,7 @@ async def _tft_predict_with_cached_model(
             stop_randomization=True
         )
         predict_dataloader = predict_dataset.to_dataloader(train=False, batch_size=1, num_workers=0)
-        raw_predictions = model.predict(predict_dataloader, mode="raw", return_x=False)
+        raw_predictions = tft_model.predict(predict_dataloader, mode="raw", return_x=False)
         pred_values = raw_predictions["prediction"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TFT prediction failed: {str(e)}")
@@ -1707,6 +2057,10 @@ async def get_tft_preview(
 
     # Drop NaN from lag features
     df = df.dropna(subset=['lag_7', 'lag_14', 'lag_21', 'lag_28'])
+    # CRITICAL: Reset index AND time_idx after dropping rows to ensure 0-based indexing
+    # This prevents day-of-week misalignment during prediction
+    df = df.reset_index(drop=True)
+    df['time_idx'] = range(len(df))
 
     if len(df) < 90:
         raise HTTPException(status_code=400, detail="Insufficient data after feature creation")
