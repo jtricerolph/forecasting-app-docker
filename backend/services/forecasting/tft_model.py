@@ -151,8 +151,11 @@ def create_tft_features(df: pd.DataFrame, holidays_df: Optional[pd.DataFrame] = 
         df[f'lag_{lag}'] = df['y'].shift(lag)
 
     # Year-over-year (364 days for DOW alignment, like pickup model)
-    if len(df) > 364:
+    # Only create if we have enough data (>450 rows)
+    if len(df) > 450:
         df['lag_364'] = df['y'].shift(364)
+        # Fill NaN with forward fill for early rows
+        df['lag_364'] = df['lag_364'].ffill().bfill()
 
     # Rolling statistics
     for window in [7, 14, 28]:

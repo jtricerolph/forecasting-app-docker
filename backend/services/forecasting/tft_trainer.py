@@ -179,8 +179,19 @@ def train_tft_model_with_progress(
             'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
         ]
 
-        if 'lag_364' in df.columns and df['lag_364'].notna().sum() > 30:
-            time_varying_unknown.append('lag_364')
+        # Only include lag_364 if <20% of values are NaN (after other dropna)
+        # TFT doesn't allow NaN, so we need to fill remaining NaN with forward fill
+        if 'lag_364' in df.columns:
+            nan_pct = df['lag_364'].isna().sum() / len(df)
+            if nan_pct < 0.20:
+                # Fill remaining NaN with forward fill (use most recent year-over-year value)
+                df['lag_364'] = df['lag_364'].ffill().bfill()
+                time_varying_unknown.append('lag_364')
+                logger.info(f"Including lag_364 feature ({nan_pct*100:.1f}% filled)")
+            else:
+                # Too many NaN, drop the column entirely
+                df = df.drop(columns=['lag_364'])
+                logger.info(f"Excluding lag_364 feature ({nan_pct*100:.1f}% would be NaN)")
 
         # Add OTB features if enabled - these are "unknown" because we learn from historical pickup patterns
         if use_otb_data and 'otb_at_30d' in df.columns:
@@ -386,8 +397,10 @@ def _create_tft_features(df: pd.DataFrame, special_dates: set = None) -> pd.Data
     for lag in [7, 14, 21, 28]:
         df[f'lag_{lag}'] = df['y'].shift(lag)
 
-    # Year-over-year
-    if len(df) > 364:
+    # Year-over-year - only create if we have enough data
+    # After dropna for lag_7/14/21/28 (28 rows dropped), we need lag_364 to have <15% NaN
+    # That means we need at least 364 + 364*0.15 = ~420 rows before dropna kicks in
+    if len(df) > 450:
         df['lag_364'] = df['y'].shift(364)
 
     # Rolling statistics
