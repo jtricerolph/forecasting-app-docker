@@ -215,7 +215,7 @@ def load_model(db, metric_code: str):
         metric_code: Metric to load model for
 
     Returns:
-        Tuple of (model, checkpoint) if found, (None, None) otherwise
+        Tuple of (model, checkpoint, model_info) if found, (None, None, None) otherwise
     """
     try:
         import torch
@@ -223,7 +223,7 @@ def load_model(db, metric_code: str):
 
         # Get active model path
         result = db.execute(text("""
-            SELECT file_path, training_config
+            SELECT id, file_path, training_config, model_name, trained_at
             FROM tft_models
             WHERE metric_code = :metric_code AND is_active = TRUE
             ORDER BY trained_at DESC
@@ -233,28 +233,60 @@ def load_model(db, metric_code: str):
 
         if not row or not row.file_path:
             logger.info(f"No active TFT model found for {metric_code}")
-            return None, None
+            return None, None, None
 
         file_path = Path(row.file_path)
         if not file_path.exists():
             logger.warning(f"Model file not found: {file_path}")
-            return None, None
+            return None, None, None
 
         # Load checkpoint
-        checkpoint = torch.load(file_path, map_location="cpu")
+        checkpoint = torch.load(file_path, map_location="cpu", weights_only=False)
 
-        # Reconstruct model from hparams
-        model = TemporalFusionTransformer.load_from_checkpoint(
-            file_path,
-            map_location="cpu"
+        # Reconstruct model from checkpoint
+        # We need to recreate the model architecture from saved hparams
+        if "model_state_dict" not in checkpoint:
+            logger.error(f"Invalid checkpoint format: missing model_state_dict")
+            return None, None, None
+
+        # Create model from hparams and load state dict
+        hparams = checkpoint.get("model_hparams", {})
+
+        # Build model with the same architecture
+        from pytorch_forecasting.metrics import QuantileLoss
+        model = TemporalFusionTransformer(
+            hidden_size=hparams.get("hidden_size", 64),
+            attention_head_size=hparams.get("attention_head_size", 4),
+            dropout=hparams.get("dropout", 0.1),
+            hidden_continuous_size=hparams.get("hidden_continuous_size", 16),
+            output_size=hparams.get("output_size", 7),
+            loss=QuantileLoss(),
+            learning_rate=hparams.get("learning_rate", 0.001),
+            **{k: v for k, v in hparams.items() if k not in [
+                "hidden_size", "attention_head_size", "dropout",
+                "hidden_continuous_size", "output_size", "learning_rate", "loss"
+            ]}
         )
 
-        logger.info(f"Loaded TFT model for {metric_code} from {file_path}")
-        return model, checkpoint
+        # Load the trained weights
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()  # Set to evaluation mode
+
+        model_info = {
+            "id": row.id,
+            "model_name": row.model_name,
+            "trained_at": row.trained_at.isoformat() if row.trained_at else None,
+            "file_path": str(file_path)
+        }
+
+        logger.info(f"Loaded TFT model '{row.model_name}' for {metric_code} from {file_path}")
+        return model, checkpoint, model_info
 
     except Exception as e:
         logger.error(f"Failed to load TFT model for {metric_code}: {e}")
-        return None, None
+        import traceback
+        logger.error(traceback.format_exc())
+        return None, None, None
 
 
 def load_model_by_id(db, model_id: int):

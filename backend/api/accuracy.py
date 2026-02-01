@@ -190,6 +190,110 @@ async def get_best_model_analysis(
     ]
 
 
+@router.get("/by-lead-time")
+async def get_accuracy_by_lead_time(
+    from_date: Optional[date] = Query(None),
+    to_date: Optional[date] = Query(None),
+    metric_code: Optional[str] = Query(None, description="Filter by metric code"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get accuracy aggregated by lead time brackets from backtest data.
+    Returns MAPE for each model at different lead times (7, 14, 28, 60, 90 days).
+    """
+    if from_date is None:
+        from_date = date.today() - timedelta(days=365)
+    if to_date is None:
+        to_date = date.today()
+
+    # Define lead time brackets
+    brackets = [
+        (0, 7, "1 week"),
+        (8, 14, "2 weeks"),
+        (15, 28, "1 month"),
+        (29, 60, "2 months"),
+        (61, 90, "3 months"),
+        (91, 180, "6 months"),
+        (181, 365, "1 year")
+    ]
+
+    query = """
+        SELECT
+            CASE
+                WHEN days_out <= 7 THEN '1 week'
+                WHEN days_out <= 14 THEN '2 weeks'
+                WHEN days_out <= 28 THEN '1 month'
+                WHEN days_out <= 60 THEN '2 months'
+                WHEN days_out <= 90 THEN '3 months'
+                WHEN days_out <= 180 THEN '6 months'
+                ELSE '1 year'
+            END as lead_time_label,
+            CASE
+                WHEN days_out <= 7 THEN 1
+                WHEN days_out <= 14 THEN 2
+                WHEN days_out <= 28 THEN 3
+                WHEN days_out <= 60 THEN 4
+                WHEN days_out <= 90 THEN 5
+                WHEN days_out <= 180 THEN 6
+                ELSE 7
+            END as sort_order,
+            model,
+            metric_code,
+            AVG(ABS((forecast_value - actual_value) / NULLIF(actual_value, 0) * 100)) as mape,
+            AVG(ABS(forecast_value - actual_value)) as mae,
+            COUNT(*) as sample_count
+        FROM forecast_snapshots
+        WHERE target_date BETWEEN :from_date AND :to_date
+            AND actual_value IS NOT NULL
+    """
+    params = {"from_date": from_date, "to_date": to_date}
+
+    if metric_code:
+        query += " AND metric_code = :metric_code"
+        params["metric_code"] = metric_code
+
+    query += """
+        GROUP BY
+            CASE
+                WHEN days_out <= 7 THEN '1 week'
+                WHEN days_out <= 14 THEN '2 weeks'
+                WHEN days_out <= 28 THEN '1 month'
+                WHEN days_out <= 60 THEN '2 months'
+                WHEN days_out <= 90 THEN '3 months'
+                WHEN days_out <= 180 THEN '6 months'
+                ELSE '1 year'
+            END,
+            CASE
+                WHEN days_out <= 7 THEN 1
+                WHEN days_out <= 14 THEN 2
+                WHEN days_out <= 28 THEN 3
+                WHEN days_out <= 60 THEN 4
+                WHEN days_out <= 90 THEN 5
+                WHEN days_out <= 180 THEN 6
+                ELSE 7
+            END,
+            model,
+            metric_code
+        ORDER BY sort_order, model
+    """
+
+    result = await db.execute(text(query), params)
+    rows = result.fetchall()
+
+    return [
+        {
+            "lead_time": row.lead_time_label,
+            "model": row.model,
+            "metric_code": row.metric_code,
+            "mape": round(float(row.mape), 2) if row.mape else None,
+            "mae": round(float(row.mae), 2) if row.mae else None,
+            "sample_count": row.sample_count
+        }
+        for row in rows
+    ]
+
+
 @router.get("/by-horizon")
 async def get_accuracy_by_horizon(
     horizon: int = Query(..., description="Lead time in days (7, 14, 28)"),
@@ -199,29 +303,30 @@ async def get_accuracy_by_horizon(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get accuracy at different lead times.
+    Get accuracy at different lead times from backtest data.
     Shows how forecast accuracy degrades as horizon increases.
+    Uses forecast_snapshots table populated by backtests.
     """
     if from_date is None:
         from_date = date.today() - timedelta(days=90)
     if to_date is None:
         to_date = date.today()
 
+    # Query forecast_snapshots table (populated by backtests)
     query = """
         SELECT
-            fh.forecast_type,
-            fh.horizon_days,
-            fh.model_type,
-            AVG(ABS(fh.predicted_value - dm.actual_value)) as mae,
-            AVG(ABS((fh.predicted_value - dm.actual_value) / NULLIF(dm.actual_value, 0) * 100)) as mape,
+            metric_code as forecast_type,
+            days_out as horizon_days,
+            model as model_type,
+            AVG(ABS(forecast_value - actual_value)) as mae,
+            AVG(ABS((forecast_value - actual_value) / NULLIF(actual_value, 0) * 100)) as mape,
             COUNT(*) as sample_count
-        FROM forecast_history fh
-        JOIN daily_metrics dm ON fh.forecast_date = dm.date AND fh.forecast_type = dm.metric_code
-        WHERE fh.forecast_date BETWEEN :from_date AND :to_date
-            AND fh.horizon_days = :horizon
-            AND dm.actual_value IS NOT NULL
-        GROUP BY fh.forecast_type, fh.horizon_days, fh.model_type
-        ORDER BY fh.forecast_type, fh.model_type
+        FROM forecast_snapshots
+        WHERE target_date BETWEEN :from_date AND :to_date
+            AND days_out = :horizon
+            AND actual_value IS NOT NULL
+        GROUP BY metric_code, days_out, model
+        ORDER BY metric_code, model
     """
 
     result = await db.execute(text(query), {

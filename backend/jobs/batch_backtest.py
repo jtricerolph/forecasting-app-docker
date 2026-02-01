@@ -154,9 +154,15 @@ async def run_batch_backtest(
 
             db.commit()
 
+        # Backfill actuals after all backtests complete
+        logger.info("Backfilling actual values...")
+        backfill_count = await backfill_actuals()
+        logger.info(f"Backfilled {backfill_count} actual values")
+
         return {
             "perception_dates_processed": len(perception_dates),
             "total_snapshots": total_snapshots,
+            "actuals_backfilled": backfill_count,
             "errors": errors
         }
 

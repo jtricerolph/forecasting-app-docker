@@ -549,38 +549,6 @@ async def get_gl_accounts(
     ]
 
 
-@router.get("/{key}")
-async def get_config(
-    key: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    Get a configuration value by key.
-    Encrypted values are masked in the response.
-    """
-    result = await db.execute(
-        text("SELECT config_value, is_encrypted, description FROM system_config WHERE config_key = :key"),
-        {"key": key}
-    )
-    row = result.fetchone()
-
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Config key not found: {key}")
-
-    # Mask encrypted values
-    value = row.config_value
-    if row.is_encrypted and value:
-        value = "********"  # Don't expose encrypted values
-
-    return {
-        "key": key,
-        "value": value,
-        "description": row.description,
-        "is_encrypted": row.is_encrypted
-    }
-
-
 @router.get("/")
 async def list_config(
     db: AsyncSession = Depends(get_db),
@@ -1188,6 +1156,48 @@ async def delete_model(
 
     return {"status": "deleted", "model_id": model_id}
 
+
+# ============================================
+# CATCH-ALL CONFIG KEY LOOKUP (MUST BE LAST)
+# ============================================
+
+@router.get("/{key}")
+async def get_config(
+    key: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get a configuration value by key.
+    Encrypted values are masked in the response.
+
+    NOTE: This route must be defined LAST as it catches all unmatched paths.
+    """
+    result = await db.execute(
+        text("SELECT config_value, is_encrypted, description FROM system_config WHERE config_key = :key"),
+        {"key": key}
+    )
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Config key not found: {key}")
+
+    # Mask encrypted values
+    value = row.config_value
+    if row.is_encrypted and value:
+        value = "********"  # Don't expose encrypted values
+
+    return {
+        "key": key,
+        "value": value,
+        "description": row.description,
+        "is_encrypted": row.is_encrypted
+    }
+
+
+# ============================================
+# HELPER FUNCTIONS (NOT ROUTES)
+# ============================================
 
 async def _run_tft_training(job_id: str, metric_code: str, model_name: str, created_by: str):
     """Background task to run TFT training"""
