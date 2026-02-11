@@ -25,10 +25,16 @@ from services.reconciliation_service import (
     parse_till_transactions,
     build_reconciliation_rows,
     build_multi_day_report,
+    build_transaction_breakdown,
 )
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _parse_date(d: str) -> date:
+    """Convert YYYY-MM-DD string to datetime.date for asyncpg compatibility."""
+    return date.fromisoformat(d)
 
 UPLOAD_DIR = "/app/uploads/reconciliation"
 
@@ -134,10 +140,10 @@ async def list_cash_ups(
         params["status"] = status
     if date_from:
         conditions.append("c.session_date >= :date_from")
-        params["date_from"] = date_from
+        params["date_from"] = _parse_date(date_from)
     if date_to:
         conditions.append("c.session_date <= :date_to")
-        params["date_to"] = date_to
+        params["date_to"] = _parse_date(date_to)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     offset = (page - 1) * per_page
@@ -150,15 +156,21 @@ async def list_cash_ups(
     )
     total = count_result.scalar()
 
-    # Get rows
+    # Get rows with variance data from reconciliation table
     result = await db.execute(
         text(f"""
             SELECT c.*, u.display_name as created_by_name,
-                   su.display_name as submitted_by_name
+                   su.display_name as submitted_by_name,
+                   COALESCE(SUM(r.variance), 0) as total_variance,
+                   COALESCE(SUM(CASE WHEN r.category = 'Cash' THEN r.variance ELSE 0 END), 0) as cash_variance,
+                   COALESCE(SUM(CASE WHEN r.category IN ('PDQ Visa/MC', 'PDQ Amex', 'Gateway Visa/MC', 'Gateway Amex') THEN r.variance ELSE 0 END), 0) as card_variance,
+                   COALESCE(SUM(CASE WHEN r.category = 'BACS' THEN r.variance ELSE 0 END), 0) as bacs_variance
             FROM recon_cash_ups c
             LEFT JOIN users u ON c.created_by = u.id
             LEFT JOIN users su ON c.submitted_by = su.id
+            LEFT JOIN recon_reconciliation r ON c.id = r.cash_up_id
             {where}
+            GROUP BY c.id, u.display_name, su.display_name
             ORDER BY c.session_date DESC
             LIMIT :limit OFFSET :offset
         """), params
@@ -180,6 +192,10 @@ async def list_cash_ups(
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
             "submitted_at": row.submitted_at.isoformat() if row.submitted_at else None,
             "submitted_by_name": row.submitted_by_name,
+            "total_variance": float(row.total_variance or 0),
+            "cash_variance": float(row.cash_variance or 0),
+            "card_variance": float(row.card_variance or 0),
+            "bacs_variance": float(row.bacs_variance or 0),
         })
 
     return {
@@ -200,7 +216,7 @@ async def get_cash_up_by_date(
     """Check if cash-up exists for a given date and return full data."""
     result = await db.execute(
         text("SELECT * FROM recon_cash_ups WHERE session_date = :d"),
-        {"d": session_date}
+        {"d": _parse_date(session_date)}
     )
     cash_up = result.fetchone()
     if not cash_up:
@@ -333,9 +349,10 @@ async def create_cash_up(
 ):
     """Create a new cash-up session."""
     # Check if date already exists
+    parsed_date = _parse_date(data.session_date)
     existing = await db.execute(
         text("SELECT id FROM recon_cash_ups WHERE session_date = :d"),
-        {"d": data.session_date}
+        {"d": parsed_date}
     )
     if existing.fetchone():
         raise HTTPException(status_code=409, detail="Cash-up already exists for this date")
@@ -346,7 +363,7 @@ async def create_cash_up(
             VALUES (:session_date, :created_by, 'draft', NOW(), NOW())
             RETURNING id, session_date, status, created_at
         """),
-        {"session_date": data.session_date, "created_by": current_user["id"]}
+        {"session_date": parsed_date, "created_by": current_user["id"]}
     )
     await db.commit()
     row = result.fetchone()
@@ -591,13 +608,20 @@ async def fetch_newbook_payments(
     payments = categorize_payments(raw_transactions)
     totals = calculate_payment_totals(payments)
     till_breakdown = parse_till_transactions(raw_transactions)
+    transaction_breakdown = build_transaction_breakdown(payments)
 
     # Store payment records (replace existing for this date)
     await db.execute(
         text("DELETE FROM recon_payment_records WHERE payment_date::date = :d"),
-        {"d": payment_date}
+        {"d": target_date}
     )
     for p in payments:
+        # Parse payment_date string to datetime for asyncpg
+        pd_str = p['payment_date']
+        try:
+            pd_val = datetime.fromisoformat(pd_str) if pd_str else datetime.now()
+        except (ValueError, TypeError):
+            pd_val = datetime.now()
         await db.execute(
             text("""
                 INSERT INTO recon_payment_records
@@ -610,7 +634,7 @@ async def fetch_newbook_payments(
                 "pid": p['payment_id'],
                 "bid": p['booking_id'],
                 "gn": p['guest_name'],
-                "pd": p['payment_date'],
+                "pd": pd_val,
                 "pt": p['payment_type'],
                 "pm": p['payment_method'],
                 "tm": p['transaction_method'],
@@ -628,6 +652,7 @@ async def fetch_newbook_payments(
         "payment_count": len(payments),
         "totals": totals,
         "till_breakdown": till_breakdown,
+        "transaction_breakdown": transaction_breakdown,
         "payments": payments,
     }
 
@@ -652,7 +677,7 @@ async def fetch_newbook_daily_stats(
             FROM newbook_bookings_stats
             WHERE date = :d
         """),
-        {"d": stats_date}
+        {"d": target_date}
     )
     stats_row = stats_result.fetchone()
 
@@ -673,7 +698,7 @@ async def fetch_newbook_daily_stats(
             DO UPDATE SET gross_sales = :gs, rooms_sold = :rs, total_people = :tp,
                           source = 'newbook_auto', updated_at = NOW()
         """),
-        {"d": stats_date, "gs": stats["gross_sales"], "rs": stats["rooms_sold"], "tp": stats["total_people"]}
+        {"d": target_date, "gs": stats["gross_sales"], "rs": stats["rooms_sold"], "tp": stats["total_people"]}
     )
     await db.commit()
 
@@ -708,7 +733,7 @@ async def generate_multi_day_report(
             WHERE c.session_date BETWEEN :start AND :end
             ORDER BY c.session_date ASC
         """),
-        {"start": start.isoformat(), "end": end.isoformat()}
+        {"start": start, "end": end}
     )
     cash_up_rows = cu_result.fetchall()
 
@@ -742,7 +767,7 @@ async def generate_multi_day_report(
             WHERE payment_date::date BETWEEN :start AND :end
             GROUP BY payment_date::date, card_type, transaction_method
         """),
-        {"start": start.isoformat(), "end": end.isoformat()}
+        {"start": start, "end": end}
     )
     for row in pr_result.fetchall():
         d = row.pdate.isoformat()
@@ -777,7 +802,7 @@ async def generate_multi_day_report(
             WHERE business_date BETWEEN :start AND :end
             ORDER BY business_date ASC
         """),
-        {"start": start.isoformat(), "end": end.isoformat()}
+        {"start": start, "end": end}
     )
     daily_stats = [
         {
@@ -797,7 +822,7 @@ async def generate_multi_day_report(
             WHERE business_date BETWEEN :start AND :end
             ORDER BY business_date ASC, category ASC
         """),
-        {"start": start.isoformat(), "end": end.isoformat()}
+        {"start": start, "end": end}
     )
     sales_breakdown = [
         {
@@ -835,10 +860,10 @@ async def list_float_counts(
         params["count_type"] = count_type
     if date_from:
         conditions.append("f.count_date >= :date_from")
-        params["date_from"] = date_from
+        params["date_from"] = datetime.fromisoformat(date_from)
     if date_to:
         conditions.append("f.count_date <= :date_to")
-        params["date_to"] = date_to + " 23:59:59"
+        params["date_to"] = datetime.fromisoformat(date_to + "T23:59:59")
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     offset = (page - 1) * per_page
@@ -937,7 +962,7 @@ async def create_float_count(
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new float count."""
-    count_date = data.count_date or datetime.now().isoformat()
+    count_date = datetime.fromisoformat(data.count_date) if data.count_date else datetime.now()
 
     result = await db.execute(
         text("""

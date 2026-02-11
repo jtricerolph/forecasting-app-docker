@@ -1,7 +1,6 @@
-import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import React, { useState, useMemo, useEffect, useRef } from 'react'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useAuth } from '../App'
 import api from '../utils/api'
 import { colors, spacing, radius, typography, shadows, buttonStyle, badgeStyle, mergeStyles } from '../utils/theme'
 
@@ -126,18 +125,22 @@ const Reconciliation: React.FC = () => {
 // ============================================
 
 export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = true }) => {
-  const { user } = useAuth()
   const queryClient = useQueryClient()
-  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0])
+  const [searchParams] = useSearchParams()
+  const initialDate = searchParams.get('date') || new Date().toISOString().split('T')[0]
+  const [selectedDate, setSelectedDate] = useState(initialDate)
   const [cashUpId, setCashUpId] = useState<number | null>(null)
   const [cashUpStatus, setCashUpStatus] = useState<string>('')
   const [dateChecked, setDateChecked] = useState(false)
   const [isDirty, setIsDirty] = useState(false)
   const [notes, setNotes] = useState('')
 
-  // Denomination state
+  // Denomination state - qty mode
   const [floatQuantities, setFloatQuantities] = useState<Record<number, number>>({})
   const [takingsQuantities, setTakingsQuantities] = useState<Record<number, number>>({})
+  // Denomination state - direct value mode
+  const [floatValues, setFloatValues] = useState<Record<number, number>>({})
+  const [takingsValues, setTakingsValues] = useState<Record<number, number>>({})
 
   // Card machine state
   const [cardMachines, setCardMachines] = useState<CardMachine[]>([
@@ -148,15 +151,42 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
   // Newbook data
   const [newbookTotals, setNewbookTotals] = useState<Record<string, number> | null>(null)
   const [newbookLoading, setNewbookLoading] = useState(false)
+  const [transactionBreakdown, setTransactionBreakdown] = useState<any>(null)
+  const [breakdownExpanded, setBreakdownExpanded] = useState(false)
+  const [selectedTransactions, setSelectedTransactions] = useState<Set<string>>(new Set())
+
+  // Settings
+  const [expectedFloat, setExpectedFloat] = useState<number>(300)
 
   // Reconciliation rows
   const [reconRows, setReconRows] = useState<ReconRow[]>([])
 
-  // Calculate denomination totals
+  // Attachments
+  const [attachments, setAttachments] = useState<any[]>([])
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [previewName, setPreviewName] = useState('')
+
+  // Load settings on mount
+  useEffect(() => {
+    api.get('/reconciliation/settings').then(res => {
+      const ef = parseFloat(res.data.expected_till_float)
+      if (!isNaN(ef)) setExpectedFloat(ef)
+    }).catch(() => {})
+  }, [])
+
+  // Calculate denomination totals (use direct value if set, otherwise qty * denom)
   const floatTotal = useMemo(() =>
-    ALL_DENOMS.reduce((sum, d) => sum + (floatQuantities[d] || 0) * d, 0), [floatQuantities])
+    ALL_DENOMS.reduce((sum, d) => {
+      if (floatValues[d] != null && floatValues[d] > 0) return sum + floatValues[d]
+      return sum + (floatQuantities[d] || 0) * d
+    }, 0), [floatQuantities, floatValues])
   const takingsTotal = useMemo(() =>
-    ALL_DENOMS.reduce((sum, d) => sum + (takingsQuantities[d] || 0) * d, 0), [takingsQuantities])
+    ALL_DENOMS.reduce((sum, d) => {
+      if (takingsValues[d] != null && takingsValues[d] > 0) return sum + takingsValues[d]
+      return sum + (takingsQuantities[d] || 0) * d
+    }, 0), [takingsQuantities, takingsValues])
 
   // Card totals
   const totalCardVisamc = useMemo(() =>
@@ -164,11 +194,30 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
   const totalCardAmex = useMemo(() =>
     cardMachines.reduce((sum, c) => sum + c.amex_amount, 0), [cardMachines])
 
+  const fetchNewbookData = async (silent = false) => {
+    setNewbookLoading(true)
+    try {
+      const res = await api.get(`/reconciliation/newbook/payments/${selectedDate}`)
+      setNewbookTotals(res.data.totals)
+      setTransactionBreakdown(res.data.transaction_breakdown || null)
+      return res.data.totals
+    } catch (e: any) {
+      if (!silent) alert(e.response?.data?.detail || 'Failed to fetch Newbook data')
+      return null
+    } finally {
+      setNewbookLoading(false)
+    }
+  }
+
   const checkDate = async () => {
     if (isDirty && !confirm('You have unsaved changes. Continue?')) return
     setDateChecked(false)
     setCashUpId(null)
     setCashUpStatus('')
+    setNewbookTotals(null)
+    setTransactionBreakdown(null)
+    setSelectedTransactions(new Set())
+    setReconRows([])
     try {
       const res = await api.get(`/reconciliation/cash-ups/by-date/${selectedDate}`)
       const data = res.data
@@ -176,25 +225,45 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
       setCashUpStatus(data.cash_up.status)
       loadCashUpData(data)
       setDateChecked(true)
+      // Auto-fetch Newbook data to refresh
+      fetchNewbookData(true)
     } catch (e: any) {
       if (e.response?.status === 404) {
         setDateChecked(true)
         resetForm()
+        // Auto-fetch Newbook data for the selected date even if no cash-up exists
+        fetchNewbookData(true)
       }
     }
   }
 
+  // Auto-check date when navigating from history with ?date= param
+  useEffect(() => {
+    if (searchParams.get('date')) checkDate()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   const loadCashUpData = (data: any) => {
     setNotes(data.cash_up.notes || '')
-    // Load denominations
+    // Load denominations (qty or direct value)
     const fq: Record<number, number> = {}
     const tq: Record<number, number> = {}
+    const fv: Record<number, number> = {}
+    const tv: Record<number, number> = {}
     for (const d of data.denominations || []) {
-      if (d.count_type === 'float') fq[d.denomination_value] = d.quantity || 0
-      else tq[d.denomination_value] = d.quantity || 0
+      if (d.value_entered != null && d.value_entered > 0) {
+        // Direct value entry mode
+        if (d.count_type === 'float') fv[d.denomination_value] = d.value_entered
+        else tv[d.denomination_value] = d.value_entered
+      } else {
+        // Quantity mode
+        if (d.count_type === 'float') fq[d.denomination_value] = d.quantity || 0
+        else tq[d.denomination_value] = d.quantity || 0
+      }
     }
     setFloatQuantities(fq)
     setTakingsQuantities(tq)
+    setFloatValues(fv)
+    setTakingsValues(tv)
     // Load card machines
     if (data.card_machines?.length) {
       setCardMachines(data.card_machines.map((c: any) => ({
@@ -219,20 +288,98 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
       }
       setNewbookTotals(totals)
     }
+    // Load attachments
+    setAttachments(data.attachments || [])
     setIsDirty(false)
   }
 
   const resetForm = () => {
     setFloatQuantities({})
     setTakingsQuantities({})
+    setFloatValues({})
+    setTakingsValues({})
     setCardMachines([
       { machine_name: 'Front Desk', total_amount: 0, amex_amount: 0, visa_mc_amount: 0 },
       { machine_name: 'Restaurant/Bar', total_amount: 0, amex_amount: 0, visa_mc_amount: 0 },
     ])
     setNewbookTotals(null)
+    setTransactionBreakdown(null)
+    setSelectedTransactions(new Set())
     setReconRows([])
+    setAttachments([])
     setNotes('')
     setIsDirty(false)
+  }
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file || !cashUpId) return
+
+    // Validate type
+    const allowed = ['image/jpeg', 'image/png', 'application/pdf']
+    if (!allowed.includes(file.type)) {
+      alert('Only JPEG, PNG, or PDF files are allowed.')
+      return
+    }
+    // Validate size (5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      alert('File too large. Maximum 5MB.')
+      return
+    }
+
+    setUploading(true)
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await api.post(`/reconciliation/cash-ups/${cashUpId}/attachments`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      setAttachments(prev => [{ ...res.data, file_type: file.type, file_size: file.size }, ...prev])
+    } catch (err: any) {
+      alert(err.response?.data?.detail || 'Upload failed')
+    } finally {
+      setUploading(false)
+      // Reset file input so the same file can be re-selected
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
+  const deleteAttachment = async (attachmentId: number) => {
+    if (!confirm('Delete this attachment?')) return
+    try {
+      await api.delete(`/reconciliation/attachments/${attachmentId}`)
+      setAttachments(prev => prev.filter(a => a.id !== attachmentId))
+    } catch (err: any) {
+      alert(err.response?.data?.detail || 'Delete failed')
+    }
+  }
+
+  const viewAttachment = async (attachmentId: number, fileName: string, fileType?: string) => {
+    try {
+      const res = await api.get(`/reconciliation/attachments/${attachmentId}/download`, {
+        responseType: 'blob',
+      })
+      const url = window.URL.createObjectURL(new Blob([res.data]))
+      const contentType = fileType || res.headers['content-type'] || ''
+      if (contentType.startsWith('image/')) {
+        // Show image in modal popup
+        setPreviewUrl(url)
+        setPreviewName(fileName)
+      } else {
+        // PDFs and other files open in new tab
+        window.open(url, '_blank')
+      }
+    } catch {
+      alert('Failed to load file')
+    }
+  }
+
+  const toggleTransaction = (id: string) => {
+    setSelectedTransactions(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
   }
 
   const createCashUp = async () => {
@@ -245,27 +392,15 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
     }
   }
 
-  const fetchNewbookData = async () => {
-    setNewbookLoading(true)
-    try {
-      const res = await api.get(`/reconciliation/newbook/payments/${selectedDate}`)
-      setNewbookTotals(res.data.totals)
-      updateReconRows(res.data.totals)
-      setIsDirty(true)
-    } catch (e: any) {
-      alert(e.response?.data?.detail || 'Failed to fetch Newbook data')
-    }
-    setNewbookLoading(false)
-  }
-
   const updateReconRows = (reported: Record<string, number>) => {
+    // Gateway & BACS: banked = reported (same value, no manual count)
     const banked = {
       cash: takingsTotal,
       manual_visa_mc: totalCardVisamc,
       manual_amex: totalCardAmex,
-      gateway_visa_mc: 0,
-      gateway_amex: 0,
-      bacs: 0,
+      gateway_visa_mc: reported.gateway_visa_mc || 0,
+      gateway_amex: reported.gateway_amex || 0,
+      bacs: reported.bacs || 0,
     }
     const categories = [
       { label: 'Cash', key: 'cash' },
@@ -283,24 +418,38 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
     })))
   }
 
-  // Recalculate recon when banked amounts change
+  // Recalculate recon when banked amounts or Newbook totals change
   useEffect(() => {
     if (newbookTotals) {
       updateReconRows(newbookTotals)
     }
-  }, [takingsTotal, totalCardVisamc, totalCardAmex])
+  }, [takingsTotal, totalCardVisamc, totalCardAmex, newbookTotals])
 
   const buildDenominations = (): DenomEntry[] => {
     const denoms: DenomEntry[] = []
     for (const d of ALL_DENOMS) {
-      if (floatQuantities[d]) {
+      // Float: check direct value first, then quantity
+      if (floatValues[d] != null && floatValues[d] > 0) {
+        denoms.push({
+          count_type: 'float', denomination_type: d >= 5 ? 'note' : 'coin',
+          denomination_value: d, quantity: null, value_entered: floatValues[d],
+          total_amount: floatValues[d],
+        })
+      } else if (floatQuantities[d]) {
         denoms.push({
           count_type: 'float', denomination_type: d >= 5 ? 'note' : 'coin',
           denomination_value: d, quantity: floatQuantities[d], value_entered: null,
           total_amount: parseFloat((floatQuantities[d] * d).toFixed(2)),
         })
       }
-      if (takingsQuantities[d]) {
+      // Takings: check direct value first, then quantity
+      if (takingsValues[d] != null && takingsValues[d] > 0) {
+        denoms.push({
+          count_type: 'takings', denomination_type: d >= 5 ? 'note' : 'coin',
+          denomination_value: d, quantity: null, value_entered: takingsValues[d],
+          total_amount: takingsValues[d],
+        })
+      } else if (takingsQuantities[d]) {
         denoms.push({
           count_type: 'takings', denomination_type: d >= 5 ? 'note' : 'coin',
           denomination_value: d, quantity: takingsQuantities[d], value_entered: null,
@@ -350,6 +499,7 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
   }
 
   const isFinal = cashUpStatus === 'final'
+  const cashTarget = newbookTotals?.cash ?? null
 
   return (
     <div>
@@ -364,7 +514,7 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
             Check Date
           </button>
           {dateChecked && !cashUpId && (
-            <button onClick={createCashUp} style={mergeStyles(buttonStyle('accent'), { padding: `${spacing.sm} ${spacing.lg}` })}>
+            <button onClick={createCashUp} style={mergeStyles(buttonStyle('secondary'), { padding: `${spacing.sm} ${spacing.lg}` })}>
               Create New
             </button>
           )}
@@ -381,11 +531,17 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
             {/* Denomination Tables */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: spacing.lg, marginBottom: spacing.lg }}>
               <DenomTable title="Till Float" quantities={floatQuantities}
-                onChange={(d, v) => { setFloatQuantities(p => ({ ...p, [d]: v })); setIsDirty(true) }}
-                total={floatTotal} disabled={isFinal} />
+                onChange={(d, v) => { setFloatQuantities(p => ({ ...p, [d]: v })); setFloatValues(p => { const n = { ...p }; delete n[d]; return n }); setIsDirty(true) }}
+                onValueChange={(d, v) => { setFloatValues(p => ({ ...p, [d]: v })); setFloatQuantities(p => { const n = { ...p }; delete n[d]; return n }); setIsDirty(true) }}
+                values={floatValues}
+                total={floatTotal} disabled={isFinal}
+                target={expectedFloat} targetLabel="EXPECTED FLOAT" />
               <DenomTable title="Cash Takings" quantities={takingsQuantities}
-                onChange={(d, v) => { setTakingsQuantities(p => ({ ...p, [d]: v })); setIsDirty(true) }}
-                total={takingsTotal} disabled={isFinal} />
+                onChange={(d, v) => { setTakingsQuantities(p => ({ ...p, [d]: v })); setTakingsValues(p => { const n = { ...p }; delete n[d]; return n }); setIsDirty(true) }}
+                onValueChange={(d, v) => { setTakingsValues(p => ({ ...p, [d]: v })); setTakingsQuantities(p => { const n = { ...p }; delete n[d]; return n }); setIsDirty(true) }}
+                values={takingsValues}
+                total={takingsTotal} disabled={isFinal}
+                target={cashTarget} targetLabel="NEWBOOK CASH EXPECTED" />
             </div>
 
             {/* Card Machines */}
@@ -412,11 +568,12 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
               ))}
             </div>
 
-            {/* Newbook Fetch */}
+            {/* Newbook Fetch / Refresh */}
             <div style={{ display: 'flex', gap: spacing.md, alignItems: 'center', marginBottom: spacing.lg }}>
-              <button onClick={fetchNewbookData} disabled={newbookLoading || isFinal}
+              <button onClick={() => { fetchNewbookData(false).then(t => { if (t) setIsDirty(true) }) }}
+                disabled={newbookLoading}
                 style={mergeStyles(buttonStyle('primary'), { padding: `${spacing.sm} ${spacing.lg}` })}>
-                {newbookLoading ? 'Fetching...' : 'Fetch Newbook Data'}
+                {newbookLoading ? 'Fetching...' : newbookTotals ? 'Refresh Newbook Data' : 'Fetch Newbook Data'}
               </button>
               {newbookTotals && <span style={{ color: colors.success, fontSize: typography.sm }}>Newbook data loaded</span>}
             </div>
@@ -466,6 +623,156 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
               </>
             )}
 
+            {/* Transaction Breakdown (expandable) */}
+            {transactionBreakdown && (
+              <div style={{ marginTop: spacing.lg }}>
+                <button
+                  onClick={() => setBreakdownExpanded(p => !p)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: spacing.sm,
+                    background: 'none', border: `1px solid ${colors.border}`, borderRadius: radius.md,
+                    padding: `${spacing.sm} ${spacing.md}`, cursor: 'pointer', width: '100%',
+                    color: colors.text, fontSize: typography.sm, fontWeight: typography.semibold as any,
+                  }}
+                >
+                  <span style={{ transform: breakdownExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s', display: 'inline-block' }}>
+                    &#9654;
+                  </span>
+                  Show Transaction Breakdown
+                  <span style={{ marginLeft: 'auto', color: colors.textMuted, fontWeight: typography.normal as any }}>
+                    {(transactionBreakdown.reception_manual?.count || 0) + (transactionBreakdown.reception_gateway?.count || 0) + (transactionBreakdown.restaurant_bar?.count || 0)} transactions
+                  </span>
+                </button>
+
+                {breakdownExpanded && (
+                  <div style={{ marginTop: spacing.md }}>
+                    <p style={{ fontSize: typography.xs, color: colors.textMuted, margin: `0 0 ${spacing.md}` }}>
+                      Click rows to highlight for cross-referencing receipts.
+                    </p>
+                    <div style={{ display: 'grid', gridTemplateColumns: transactionBreakdown.restaurant_bar?.count > 0 ? '1fr 1fr' : '1fr', gap: spacing.lg }}>
+                      {/* Reception Payments (Manual + Gateway) */}
+                      <div>
+                        <h4 style={{ margin: `0 0 ${spacing.sm}`, color: colors.text, fontSize: typography.base }}>Reception Payments</h4>
+                        <TransactionGroupTable
+                          groups={transactionBreakdown.reception_manual?.groups || {}}
+                          total={transactionBreakdown.reception_manual?.total || 0}
+                          sectionLabel="Manual (PDQ)"
+                          selectedIds={selectedTransactions}
+                          onToggle={toggleTransaction}
+                          idPrefix="rm"
+                        />
+                        {transactionBreakdown.reception_gateway?.count > 0 && (
+                          <div style={{ marginTop: spacing.md }}>
+                            <TransactionGroupTable
+                              groups={transactionBreakdown.reception_gateway?.groups || {}}
+                              total={transactionBreakdown.reception_gateway?.total || 0}
+                              sectionLabel="Gateway (Automated)"
+                              selectedIds={selectedTransactions}
+                              onToggle={toggleTransaction}
+                              idPrefix="rg"
+                            />
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Restaurant/Bar Payments */}
+                      {transactionBreakdown.restaurant_bar?.count > 0 && (
+                        <div>
+                          <h4 style={{ margin: `0 0 ${spacing.sm}`, color: colors.text, fontSize: typography.base }}>Restaurant / Bar</h4>
+                          <TransactionGroupTable
+                            groups={transactionBreakdown.restaurant_bar?.groups || {}}
+                            total={transactionBreakdown.restaurant_bar?.total || 0}
+                            sectionLabel="Till System"
+                            selectedIds={selectedTransactions}
+                            onToggle={toggleTransaction}
+                            idPrefix="rb"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Attachments */}
+            {cashUpId && (
+              <div style={{ marginTop: spacing.lg }}>
+                <h3 style={styles.sectionSubtitle}>Attachments</h3>
+                <p style={{ fontSize: typography.xs, color: colors.textMuted, margin: `0 0 ${spacing.sm}` }}>
+                  Attach PDQ Z-reports, receipt photos, or other supporting documents (JPEG, PNG, PDF - max 5MB).
+                </p>
+
+                {/* Upload Button */}
+                {!isFinal && (
+                  <div style={{ marginBottom: spacing.md }}>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/jpeg,image/png,application/pdf"
+                      onChange={handleFileUpload}
+                      style={{ display: 'none' }}
+                    />
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={uploading}
+                      style={mergeStyles(buttonStyle('outline'), { padding: `${spacing.sm} ${spacing.md}` })}
+                    >
+                      {uploading ? 'Uploading...' : '+ Add Photo / File'}
+                    </button>
+                  </div>
+                )}
+
+                {/* Attachment List */}
+                {attachments.length > 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm }}>
+                    {attachments.map((att: any) => (
+                      <div key={att.id} style={{
+                        display: 'flex', alignItems: 'center', gap: spacing.md,
+                        padding: `${spacing.sm} ${spacing.md}`,
+                        background: colors.background, borderRadius: radius.md,
+                        border: `1px solid ${colors.borderLight}`,
+                      }}>
+                        {/* File type icon */}
+                        <span style={{ fontSize: typography.lg }}>
+                          {att.file_type?.startsWith('image/') ? '\u{1F4F7}' : '\u{1F4C4}'}
+                        </span>
+                        {/* File info */}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: typography.sm, color: colors.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {att.file_name}
+                          </div>
+                          <div style={{ fontSize: typography.xs, color: colors.textMuted }}>
+                            {att.file_size ? `${(att.file_size / 1024).toFixed(0)} KB` : ''}
+                            {att.uploaded_at ? ` - ${new Date(att.uploaded_at).toLocaleString()}` : ''}
+                          </div>
+                        </div>
+                        {/* Actions */}
+                        <button
+                          onClick={() => viewAttachment(att.id, att.file_name, att.file_type)}
+                          style={{ ...styles.linkBtn, color: colors.accent }}
+                        >
+                          View
+                        </button>
+                        {!isFinal && (
+                          <button
+                            onClick={() => deleteAttachment(att.id)}
+                            style={{ ...styles.linkBtn, color: colors.error }}
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p style={{ fontSize: typography.sm, color: colors.textMuted, fontStyle: 'italic' }}>
+                    No attachments yet.
+                  </p>
+                )}
+              </div>
+            )}
+
             {/* Notes */}
             <div style={{ marginTop: spacing.lg }}>
               <label style={styles.label}>Notes</label>
@@ -482,7 +789,7 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
                 </button>
                 {canFinalize && cashUpId && (
                   <button onClick={() => { if (confirm('Finalize this cash-up? It cannot be edited after.')) saveCashUp(true) }}
-                    style={mergeStyles(buttonStyle('accent'), { padding: `${spacing.sm} ${spacing.xl}` })}>
+                    style={mergeStyles(buttonStyle('secondary'), { padding: `${spacing.sm} ${spacing.xl}` })}>
                     Finalize
                   </button>
                 )}
@@ -491,6 +798,58 @@ export const CashUpPage: React.FC<{ canFinalize?: boolean }> = ({ canFinalize = 
           </>
         )}
       </div>
+
+      {/* Image Preview Modal */}
+      {previewUrl && (
+        <div
+          onClick={() => { setPreviewUrl(null); setPreviewName('') }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999,
+            background: 'rgba(0,0,0,0.8)', display: 'flex',
+            alignItems: 'center', justifyContent: 'center',
+            cursor: 'pointer',
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              position: 'relative', maxWidth: '90vw', maxHeight: '90vh',
+              background: colors.surface, borderRadius: radius.lg,
+              boxShadow: shadows.xl, overflow: 'hidden',
+              display: 'flex', flexDirection: 'column',
+            }}
+          >
+            {/* Header */}
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: `${spacing.sm} ${spacing.md}`, borderBottom: `1px solid ${colors.borderLight}`,
+            }}>
+              <span style={{ fontSize: typography.sm, color: colors.text, fontWeight: typography.medium as any,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '400px' }}>
+                {previewName}
+              </span>
+              <button
+                onClick={() => { setPreviewUrl(null); setPreviewName('') }}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  fontSize: typography.xl, color: colors.textMuted, padding: `0 ${spacing.xs}`,
+                  lineHeight: 1,
+                }}
+              >
+                &times;
+              </button>
+            </div>
+            {/* Image */}
+            <div style={{ overflow: 'auto', padding: spacing.sm }}>
+              <img
+                src={previewUrl}
+                alt={previewName}
+                style={{ maxWidth: '100%', maxHeight: '80vh', display: 'block', margin: '0 auto' }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -503,50 +862,204 @@ const DenomTable: React.FC<{
   title: string
   quantities: Record<number, number>
   onChange: (denom: number, qty: number) => void
+  onValueChange?: (denom: number, value: number) => void
+  values?: Record<number, number>
   total: number
   disabled: boolean
-}> = ({ title, quantities, onChange, total, disabled }) => (
-  <div style={styles.card}>
-    <h4 style={{ margin: `0 0 ${spacing.sm} 0`, color: colors.text }}>{title}</h4>
-    <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-      <thead>
-        <tr>
-          <th style={styles.thSmall}>Denom</th>
-          <th style={styles.thSmall}>Qty</th>
-          <th style={{ ...styles.thSmall, textAlign: 'right' }}>Total</th>
-        </tr>
-      </thead>
-      <tbody>
-        {ALL_DENOMS.map(d => {
-          const qty = quantities[d] || 0
-          const rowTotal = qty * d
-          return (
-            <tr key={d} style={{ borderBottom: `1px solid ${colors.borderLight}` }}>
-              <td style={{ padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.sm }}>{denomLabel(d)}</td>
-              <td style={{ padding: spacing.xs }}>
-                <input type="number" min="0" value={qty || ''} disabled={disabled}
-                  onChange={e => onChange(d, parseInt(e.target.value) || 0)}
-                  onFocus={e => e.target.select()}
-                  style={{ ...styles.numberInputSmall, width: '70px' }} />
-              </td>
-              <td style={{ padding: `${spacing.xs} ${spacing.sm}`, textAlign: 'right', fontSize: typography.sm, color: colors.textSecondary }}>
-                {rowTotal > 0 ? formatCurrency(rowTotal) : ''}
-              </td>
-            </tr>
-          )
-        })}
-      </tbody>
-      <tfoot>
-        <tr style={{ borderTop: `2px solid ${colors.border}` }}>
-          <td colSpan={2} style={{ padding: spacing.sm, fontWeight: typography.bold as any }}>Total</td>
-          <td style={{ padding: spacing.sm, textAlign: 'right', fontWeight: typography.bold as any, fontSize: typography.md }}>
-            {formatCurrency(total)}
-          </td>
-        </tr>
-      </tfoot>
-    </table>
-  </div>
-)
+  target?: number | null
+  targetLabel?: string
+}> = ({ title, quantities, onChange, onValueChange, values, total, disabled, target, targetLabel }) => {
+  const variance = target != null ? total - target : null
+  return (
+    <div style={styles.card}>
+      <h4 style={{ margin: `0 0 ${spacing.sm} 0`, color: colors.text }}>{title}</h4>
+      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead>
+          <tr>
+            <th style={styles.thSmall}>Denom</th>
+            <th style={styles.thSmall}>Qty</th>
+            <th style={{ ...styles.thSmall, textAlign: 'right' }}>Value</th>
+            <th style={{ ...styles.thSmall, textAlign: 'right' }}>Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {ALL_DENOMS.map(d => {
+            const qty = quantities[d] || 0
+            const directVal = values?.[d] ?? null
+            const rowTotal = directVal != null ? directVal : qty * d
+            return (
+              <tr key={d} style={{ borderBottom: `1px solid ${colors.borderLight}` }}>
+                <td style={{ padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.sm }}>{denomLabel(d)}</td>
+                <td style={{ padding: spacing.xs }}>
+                  <input type="number" min="0" value={qty || ''} disabled={disabled || directVal != null}
+                    onChange={e => onChange(d, parseInt(e.target.value) || 0)}
+                    onFocus={e => e.target.select()}
+                    style={{ ...styles.numberInputSmall, width: '60px', opacity: directVal != null ? 0.4 : 1 }} />
+                </td>
+                <td style={{ padding: spacing.xs }}>
+                  <input type="number" step="0.01" min="0"
+                    value={directVal != null ? directVal || '' : ''}
+                    disabled={disabled || qty > 0}
+                    placeholder=""
+                    onChange={e => {
+                      const v = parseFloat(e.target.value)
+                      if (onValueChange) onValueChange(d, isNaN(v) ? 0 : v)
+                    }}
+                    onFocus={e => e.target.select()}
+                    style={{ ...styles.numberInputSmall, width: '75px', opacity: qty > 0 ? 0.4 : 1 }} />
+                </td>
+                <td style={{ padding: `${spacing.xs} ${spacing.sm}`, textAlign: 'right', fontSize: typography.sm, color: colors.textSecondary }}>
+                  {rowTotal > 0 ? formatCurrency(rowTotal) : ''}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+        <tfoot>
+          <tr style={{ borderTop: `2px solid ${colors.border}` }}>
+            <td colSpan={3} style={{ padding: spacing.sm, fontWeight: typography.bold as any }}>Total</td>
+            <td style={{ padding: spacing.sm, textAlign: 'right', fontWeight: typography.bold as any, fontSize: typography.base }}>
+              {formatCurrency(total)}
+            </td>
+          </tr>
+          {target != null && (
+            <>
+              <tr style={{ background: colors.background }}>
+                <td colSpan={3} style={{ padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs, color: colors.textMuted, textTransform: 'uppercase', fontWeight: typography.semibold as any }}>
+                  {targetLabel || 'Expected'}
+                </td>
+                <td style={{ padding: `${spacing.xs} ${spacing.sm}`, textAlign: 'right', fontSize: typography.sm, color: colors.textMuted }}>
+                  {formatCurrency(target)}
+                </td>
+              </tr>
+              <tr style={{ background: variance === 0 ? undefined : (variance! > 0 ? '#f1f8e9' : '#fce4ec') }}>
+                <td colSpan={3} style={{ padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs, textTransform: 'uppercase', fontWeight: typography.semibold as any,
+                  color: variance === 0 ? colors.textMuted : variance! > 0 ? colors.success : colors.error }}>
+                  Variance
+                </td>
+                <td style={{ padding: `${spacing.xs} ${spacing.sm}`, textAlign: 'right', fontSize: typography.sm, fontWeight: typography.bold as any,
+                  color: variance === 0 ? colors.textMuted : variance! > 0 ? colors.success : colors.error }}>
+                  {variance! > 0 ? '+' : ''}{formatCurrency(variance!)}
+                </td>
+              </tr>
+            </>
+          )}
+        </tfoot>
+      </table>
+    </div>
+  )
+}
+
+// ============================================
+// TRANSACTION GROUP TABLE COMPONENT
+// ============================================
+
+const TransactionGroupTable: React.FC<{
+  groups: Record<string, { transactions: any[]; subtotal: number; count: number }>
+  total: number
+  sectionLabel: string
+  selectedIds: Set<string>
+  onToggle: (id: string) => void
+  idPrefix: string
+}> = ({ groups, total, sectionLabel, selectedIds, onToggle, idPrefix }) => {
+  const groupKeys = Object.keys(groups)
+  if (groupKeys.length === 0) return null
+
+  return (
+    <div style={{ border: `1px solid ${colors.borderLight}`, borderRadius: radius.md, overflow: 'hidden' }}>
+      <div style={{
+        background: colors.background, padding: `${spacing.xs} ${spacing.sm}`,
+        fontSize: typography.xs, fontWeight: typography.semibold as any, color: colors.textMuted,
+        textTransform: 'uppercase', letterSpacing: '0.5px', borderBottom: `1px solid ${colors.borderLight}`,
+      }}>
+        {sectionLabel}
+      </div>
+      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead>
+          <tr>
+            <th style={{ ...styles.thSmall, width: '55px' }}>Time</th>
+            <th style={styles.thSmall}>Type</th>
+            <th style={styles.thSmall}>Details</th>
+            <th style={{ ...styles.thSmall, textAlign: 'right' }}>Amount</th>
+          </tr>
+        </thead>
+        <tbody>
+          {groupKeys.map(groupName => {
+            const group = groups[groupName]
+            return (
+              <React.Fragment key={groupName}>
+                {/* Sub-group header */}
+                <tr>
+                  <td colSpan={3} style={{
+                    padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs,
+                    fontWeight: typography.semibold as any, color: colors.primary,
+                    background: '#f0f4ff', borderBottom: `1px solid ${colors.borderLight}`,
+                  }}>
+                    {groupName} ({group.count})
+                  </td>
+                  <td style={{
+                    padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs,
+                    fontWeight: typography.semibold as any, color: colors.primary,
+                    background: '#f0f4ff', borderBottom: `1px solid ${colors.borderLight}`,
+                    textAlign: 'right',
+                  }}>
+                    {formatCurrency(group.subtotal)}
+                  </td>
+                </tr>
+                {/* Individual transactions */}
+                {group.transactions.map((t: any, i: number) => {
+                  const txId = `${idPrefix}-${groupName}-${i}`
+                  const isSelected = selectedIds.has(txId)
+                  return (
+                    <tr key={i} onClick={() => onToggle(txId)} style={{
+                      cursor: 'pointer',
+                      background: isSelected ? '#e8f5e9' : 'transparent',
+                      opacity: t.is_voided ? 0.45 : 1,
+                      borderBottom: `1px solid ${colors.borderLight}`,
+                    }}>
+                      <td style={{ padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs, color: colors.textMuted }}>
+                        {t.time}
+                      </td>
+                      <td style={{ padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs }}>
+                        {t.type}
+                        {t.is_voided && <span style={{ color: colors.error, marginLeft: '4px' }}>(VOID)</span>}
+                        {t.is_refund && !t.is_voided && <span style={{ color: colors.warning, marginLeft: '4px' }}>(REFUND)</span>}
+                      </td>
+                      <td style={{
+                        padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs, color: colors.textSecondary,
+                        maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {t.details}
+                      </td>
+                      <td style={{
+                        padding: `${spacing.xs} ${spacing.sm}`, fontSize: typography.xs, textAlign: 'right',
+                        fontVariantNumeric: 'tabular-nums',
+                        color: t.amount < 0 ? colors.error : colors.text,
+                        textDecoration: t.is_voided ? 'line-through' : 'none',
+                      }}>
+                        {formatCurrency(t.amount)}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </React.Fragment>
+            )
+          })}
+        </tbody>
+        <tfoot>
+          <tr style={{ borderTop: `2px solid ${colors.border}` }}>
+            <td colSpan={3} style={{ padding: `${spacing.xs} ${spacing.sm}`, fontWeight: typography.bold as any, fontSize: typography.sm }}>
+              Total
+            </td>
+            <td style={{ padding: `${spacing.xs} ${spacing.sm}`, textAlign: 'right', fontWeight: typography.bold as any, fontSize: typography.sm }}>
+              {formatCurrency(total)}
+            </td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  )
+}
 
 // ============================================
 // HISTORY PAGE
@@ -589,10 +1102,42 @@ const HistoryPage: React.FC = () => {
     })
   }
 
+  const toggleSelectAll = () => {
+    const draftIds = (data?.cash_ups || []).filter((cu: any) => cu.status === 'draft').map((cu: any) => cu.id)
+    if (draftIds.length > 0 && draftIds.every((id: number) => selectedIds.has(id))) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(draftIds))
+    }
+  }
+
+  const formatDate = (dateStr: string) => {
+    if (!dateStr) return ''
+    const d = new Date(dateStr + 'T00:00:00')
+    return d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' })
+  }
+
+  const formatDateTime = (dtStr: string | null) => {
+    if (!dtStr) return '-'
+    const d = new Date(dtStr)
+    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) +
+      ' ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+  }
+
+  const varianceColor = (v: number) => {
+    if (Math.abs(v) < 0.01) return colors.success
+    return v < 0 ? colors.error : '#e67e22'
+  }
+
+  const draftIds = (data?.cash_ups || []).filter((cu: any) => cu.status === 'draft').map((cu: any) => cu.id)
+  const allDraftsSelected = draftIds.length > 0 && draftIds.every((id: number) => selectedIds.has(id))
+
   return (
     <div style={styles.section}>
       <h2 style={styles.sectionTitle}>Cash Up History</h2>
-      <div style={{ display: 'flex', gap: spacing.md, marginBottom: spacing.lg, flexWrap: 'wrap', alignItems: 'center' }}>
+
+      {/* Filters */}
+      <div style={{ display: 'flex', gap: spacing.md, marginBottom: spacing.md, flexWrap: 'wrap', alignItems: 'center' }}>
         <select value={statusFilter} onChange={e => { setStatusFilter(e.target.value); setPage(1) }} style={styles.input}>
           <option value="">All Status</option>
           <option value="draft">Draft</option>
@@ -601,13 +1146,32 @@ const HistoryPage: React.FC = () => {
         <input type="date" value={dateFrom} onChange={e => { setDateFrom(e.target.value); setPage(1) }} style={styles.input} />
         <span style={{ color: colors.textMuted }}>to</span>
         <input type="date" value={dateTo} onChange={e => { setDateTo(e.target.value); setPage(1) }} style={styles.input} />
-        {selectedIds.size > 0 && (
-          <button onClick={() => bulkFinalize.mutate(Array.from(selectedIds))}
-            style={mergeStyles(buttonStyle('accent'), { padding: `${spacing.sm} ${spacing.lg}` })}>
-            Finalize Selected ({selectedIds.size})
-          </button>
-        )}
       </div>
+
+      {/* Bulk finalize bar - appears above table when drafts selected */}
+      {selectedIds.size > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: spacing.md,
+          padding: `${spacing.sm} ${spacing.md}`,
+          background: '#e3f2fd', borderRadius: radius.md,
+          marginBottom: spacing.md, border: '1px solid #90caf9',
+        }}>
+          <span style={{ fontSize: typography.sm, color: colors.text, fontWeight: typography.medium as any }}>
+            {selectedIds.size} draft{selectedIds.size !== 1 ? 's' : ''} selected
+          </span>
+          <button onClick={() => {
+            if (confirm(`Finalize ${selectedIds.size} selected draft${selectedIds.size !== 1 ? 's' : ''}?`))
+              bulkFinalize.mutate(Array.from(selectedIds))
+          }}
+            style={mergeStyles(buttonStyle('primary'), { padding: `${spacing.xs} ${spacing.lg}`, fontSize: typography.sm })}>
+            Save Selected as Final
+          </button>
+          <button onClick={() => setSelectedIds(new Set())}
+            style={{ ...styles.linkBtn, color: colors.textMuted, fontSize: typography.sm }}>
+            Clear selection
+          </button>
+        </div>
+      )}
 
       {isLoading ? (
         <p style={{ color: colors.textMuted }}>Loading...</p>
@@ -616,35 +1180,73 @@ const HistoryPage: React.FC = () => {
           <table style={styles.table}>
             <thead>
               <tr>
-                <th style={styles.th}></th>
+                <th style={{ ...styles.th, width: '36px' }}>
+                  {draftIds.length > 0 && (
+                    <input type="checkbox" checked={allDraftsSelected} onChange={toggleSelectAll} />
+                  )}
+                </th>
                 <th style={styles.th}>Date</th>
                 <th style={styles.th}>Status</th>
-                <th style={styles.th}>Cash Total</th>
-                <th style={styles.th}>Float Total</th>
+                <th style={{ ...styles.th, textAlign: 'right' }}>Cash Total</th>
+                <th style={{ ...styles.th, textAlign: 'right' }}>Total Variance</th>
                 <th style={styles.th}>Created By</th>
+                <th style={styles.th}>Created At</th>
+                <th style={styles.th}>Submitted At</th>
                 <th style={styles.th}>Actions</th>
               </tr>
             </thead>
             <tbody>
+              {data?.cash_ups?.length === 0 && (
+                <tr><td colSpan={9} style={{ ...styles.td, textAlign: 'center', color: colors.textMuted, padding: spacing.xl }}>
+                  No cash-ups found.
+                </td></tr>
+              )}
               {data?.cash_ups?.map((cu: any) => (
-                <tr key={cu.id}>
+                <tr key={cu.id} style={{ borderBottom: `1px solid ${colors.borderLight}` }}>
                   <td style={styles.td}>
                     {cu.status === 'draft' && (
                       <input type="checkbox" checked={selectedIds.has(cu.id)} onChange={() => toggleSelect(cu.id)} />
                     )}
                   </td>
-                  <td style={styles.td}>{cu.session_date}</td>
+                  <td style={{ ...styles.td, whiteSpace: 'nowrap' }}>{formatDate(cu.session_date)}</td>
                   <td style={styles.td}>
                     <span style={cu.status === 'final' ? badgeStyle('success') : badgeStyle('warning')}>
-                      {cu.status}
+                      {cu.status === 'final' ? 'Final' : 'Draft'}
                     </span>
                   </td>
                   <td style={styles.tdRight}>{formatCurrency(cu.total_cash_counted)}</td>
-                  <td style={styles.tdRight}>{formatCurrency(cu.total_float_counted)}</td>
-                  <td style={styles.td}>{cu.created_by_name}</td>
+                  <td style={styles.tdRight}>
+                    <div>
+                      <span style={{ fontWeight: typography.semibold as any, color: varianceColor(cu.total_variance) }}>
+                        {cu.total_variance >= 0 ? '+' : ''}{formatCurrency(cu.total_variance)}
+                      </span>
+                      {(cu.cash_variance !== 0 || cu.card_variance !== 0 || cu.bacs_variance !== 0) && (
+                        <div style={{ fontSize: typography.xs, color: colors.textMuted, marginTop: '2px', lineHeight: 1.4 }}>
+                          {cu.cash_variance !== 0 && (
+                            <span style={{ color: varianceColor(cu.cash_variance) }}>
+                              Cash: {cu.cash_variance >= 0 ? '+' : ''}{formatCurrency(cu.cash_variance)}
+                            </span>
+                          )}
+                          {cu.card_variance !== 0 && (
+                            <span style={{ color: varianceColor(cu.card_variance), marginLeft: cu.cash_variance !== 0 ? spacing.xs : '0' }}>
+                              Card: {cu.card_variance >= 0 ? '+' : ''}{formatCurrency(cu.card_variance)}
+                            </span>
+                          )}
+                          {cu.bacs_variance !== 0 && (
+                            <span style={{ color: varianceColor(cu.bacs_variance), marginLeft: (cu.cash_variance !== 0 || cu.card_variance !== 0) ? spacing.xs : '0' }}>
+                              BACS: {cu.bacs_variance >= 0 ? '+' : ''}{formatCurrency(cu.bacs_variance)}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </td>
+                  <td style={styles.td}>{cu.created_by_name || '-'}</td>
+                  <td style={{ ...styles.td, fontSize: typography.xs, whiteSpace: 'nowrap' }}>{formatDateTime(cu.created_at)}</td>
+                  <td style={{ ...styles.td, fontSize: typography.xs, whiteSpace: 'nowrap' }}>{formatDateTime(cu.submitted_at)}</td>
                   <td style={styles.td}>
                     <div style={{ display: 'flex', gap: spacing.xs }}>
-                      <button onClick={() => navigate('/reconciliation')}
+                      <button onClick={() => navigate(`/reconciliation?date=${cu.session_date}`)}
                         style={{ ...styles.linkBtn, color: colors.accent }}>
                         {cu.status === 'draft' ? 'Edit' : 'View'}
                       </button>
@@ -689,7 +1291,6 @@ const MultiDayReportPage: React.FC = () => {
   const [selectedCells, setSelectedCells] = useState<Set<string>>(new Set())
   const [isSelecting, setIsSelecting] = useState(false)
   const [selectionStart, setSelectionStart] = useState<{ row: number; col: number } | null>(null)
-  const tooltipRef = useRef<HTMLDivElement>(null)
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['multi-day-report', startDate, numDays],

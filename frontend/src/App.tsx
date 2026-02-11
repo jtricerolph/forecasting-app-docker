@@ -72,7 +72,6 @@ const App: React.FC = () => {
     )
   }
 
-  const isAdmin = user?.role === 'admin' || !user?.role
   const isStaff = user?.role === 'staff'
   const defaultRoute = isStaff ? '/staff' : '/'
 

@@ -101,7 +101,8 @@ def process_transaction(transaction: dict) -> Optional[dict]:
         'amount': amount,
         'tendered': 0,
         'processed_by': '',
-        'item_type': item_type
+        'item_type': item_type,
+        'description': transaction.get('item_description', ''),
     }
 
 
@@ -227,6 +228,114 @@ def parse_till_transactions(raw_transactions: List[dict]) -> dict:
         till_payments[key]['total'] = round(till_payments[key]['total'], 2)
 
     return till_payments
+
+
+# ============================================
+# TRANSACTION BREAKDOWN
+# ============================================
+
+def build_transaction_breakdown(payments: List[dict]) -> dict:
+    """
+    Group processed payments into a transaction breakdown for display.
+
+    Groups:
+    - reception_manual: Manual payments at reception (PDQ entered by staff)
+    - reception_gateway: Automated/gateway payments at reception
+    - restaurant_bar: Payments from till system (description contains "Ticket:")
+
+    Each group is further sub-grouped by payment type label.
+    Returns dict of groups, each containing sub-groups with transaction lists.
+    """
+    ticket_pattern = re.compile(r'Ticket:\s*(\d+)\s*-\s*(.+)', re.IGNORECASE)
+
+    reception_manual: Dict[str, list] = {}
+    reception_gateway: Dict[str, list] = {}
+    restaurant_bar: Dict[str, list] = {}
+
+    for p in payments:
+        transaction_method = (p.get('transaction_method') or '').lower()
+        card_type = p.get('card_type', 'other')
+        payment_type = p.get('payment_type', '')
+        item_type = p.get('item_type', '')
+        amount = float(p.get('amount', 0))
+        guest_name = p.get('guest_name', '')
+        payment_date = p.get('payment_date', '')
+        description = p.get('description', '')
+        is_voided = item_type in ('payments_voided', 'refunds_voided')
+
+        # Extract time from date string
+        time_str = ''
+        if payment_date and ' ' in str(payment_date):
+            time_str = str(payment_date).split(' ')[1][:5]  # HH:MM
+
+        # Determine display type label
+        type_label = payment_type.title() if payment_type else 'Other'
+        if card_type == 'cash':
+            type_label = 'Cash'
+        elif card_type == 'bacs':
+            type_label = 'BACS'
+        elif card_type == 'amex':
+            type_label = 'Amex'
+        elif card_type == 'visa_mc':
+            type_label = 'Card'
+
+        # Check for restaurant/bar till ticket pattern in description
+        ticket_match = ticket_pattern.search(description) if description else None
+        details = guest_name
+        if ticket_match:
+            ticket_num = ticket_match.group(1)
+            ticket_type = ticket_match.group(2).strip()
+            details = f"Ticket #{ticket_num} - {ticket_type}"
+            type_label = ticket_type.title() if ticket_type else type_label
+
+        entry = {
+            'time': time_str,
+            'type': type_label,
+            'details': details,
+            'amount': round(amount, 2),
+            'is_voided': is_voided,
+            'is_refund': item_type in ('refunds_raised', 'refunds_voided'),
+            'item_type': item_type,
+            'payment_id': p.get('payment_id', ''),
+            'booking_id': p.get('booking_id', ''),
+        }
+
+        # Route to appropriate group
+        if ticket_match:
+            if type_label not in restaurant_bar:
+                restaurant_bar[type_label] = []
+            restaurant_bar[type_label].append(entry)
+        elif transaction_method in ('automated', 'gateway', 'cc_gateway'):
+            if type_label not in reception_gateway:
+                reception_gateway[type_label] = []
+            reception_gateway[type_label].append(entry)
+        else:
+            # Manual and default go to reception_manual
+            if type_label not in reception_manual:
+                reception_manual[type_label] = []
+            reception_manual[type_label].append(entry)
+
+    # Calculate subtotals for each group
+    def with_subtotals(group: Dict[str, list]) -> dict:
+        result = {}
+        group_total = 0.0
+        group_count = 0
+        for key, transactions in group.items():
+            subtotal = round(sum(t['amount'] for t in transactions), 2)
+            result[key] = {
+                'transactions': transactions,
+                'subtotal': subtotal,
+                'count': len(transactions),
+            }
+            group_total += subtotal
+            group_count += len(transactions)
+        return {'groups': result, 'total': round(group_total, 2), 'count': group_count}
+
+    return {
+        'reception_manual': with_subtotals(reception_manual),
+        'reception_gateway': with_subtotals(reception_gateway),
+        'restaurant_bar': with_subtotals(restaurant_bar),
+    }
 
 
 # ============================================
