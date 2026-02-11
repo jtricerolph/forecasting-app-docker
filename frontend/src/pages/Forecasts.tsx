@@ -5083,7 +5083,7 @@ const PickupV2Forecast: React.FC<PickupV2ForecastProps> = ({ consolidation }) =>
                 const rowStyle = hasOpportunity ? { backgroundColor: '#fef9e7' } : {}
                 const pickupRooms = row.pickup_rooms_total || 0
                 const otbRooms = row.current_otb || 0
-                const forecastRooms = otbRooms + pickupRooms
+                const forecastRooms = row.forecast || (otbRooms + pickupRooms)
                 const priorOtbRev = row.prior_year_otb_rev || 0
                 const priorFinalRev = row.prior_year_final_rev || 0
                 const otbPacePct = priorOtbRev > 0 ? ((row.current_otb_rev || 0) - priorOtbRev) / priorOtbRev * 100 : 0
@@ -5381,7 +5381,7 @@ const PickupV2BookingsForecast: React.FC<PickupV2BookingsForecastProps> = ({ con
 
       const isPast = d.date < todayStr
       const otb = d.current_otb || 0
-      const forecast = (d.current_otb || 0) + (d.pickup_rooms_total || 0)  // OTB + pickup = total forecast rooms
+      const forecast = d.forecast || ((d.current_otb || 0) + (d.pickup_rooms_total || 0))  // Use capped forecast from API
       const priorFinal = d.prior_year_final || 0
       const priorOtb = d.prior_year_otb || 0
 
@@ -5487,8 +5487,7 @@ const PickupV2BookingsForecast: React.FC<PickupV2BookingsForecastProps> = ({ con
 
     forecastData.data.forEach(d => {
       const otb = d.current_otb || 0
-      const pickup = d.pickup_rooms_total || 0
-      const forecast = otb + pickup
+      const forecast = d.forecast || (otb + (d.pickup_rooms_total || 0))
 
       if (d.date < todayStr) {
         actualDates.push(d.date)
@@ -5574,7 +5573,7 @@ const PickupV2BookingsForecast: React.FC<PickupV2BookingsForecastProps> = ({ con
     const priorOtbTotal = futureDays.reduce((sum, d) => sum + (d.prior_year_otb || 0), 0)
 
     // Forecast remaining = OTB + pickup for future days
-    const forecastRemainingTotal = futureDays.reduce((sum, d) => sum + (d.current_otb || 0) + (d.pickup_rooms_total || 0), 0)
+    const forecastRemainingTotal = futureDays.reduce((sum, d) => sum + (d.forecast || ((d.current_otb || 0) + (d.pickup_rooms_total || 0))), 0)
     // Prior year final for future days
     const priorForecastTotal = futureDays.reduce((sum, d) => sum + (d.prior_year_final || 0), 0)
 
@@ -5878,7 +5877,7 @@ const PickupV2BookingsForecast: React.FC<PickupV2BookingsForecastProps> = ({ con
               {forecastData.data.map((row) => {
                 const otb = row.current_otb || 0
                 const pickup = row.pickup_rooms_total || 0
-                const forecast = otb + pickup
+                const forecast = row.forecast || (otb + pickup)
                 const priorFinal = row.prior_year_final || 0
                 const diff = forecast - priorFinal
                 const shortDay = row.day_of_week?.substring(0, 3) || ''
