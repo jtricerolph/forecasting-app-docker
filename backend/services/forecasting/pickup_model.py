@@ -20,6 +20,7 @@ from typing import List, Optional
 from sqlalchemy import text
 
 from utils.time_alignment import get_prior_year_daily, get_comparison_info
+from utils.capacity import get_bookable_cap_sync
 
 logger = logging.getLogger(__name__)
 
@@ -63,20 +64,8 @@ async def run_pickup_forecast(
         # Calculate prior year comparison date (same day of week alignment)
         prior_year_date = get_prior_year_daily(forecast_date)
 
-        # Get total available rooms for this date (for capping room_nights)
-        total_rooms = 25  # Default fallback
-        if metric_code in ('hotel_room_nights', 'hotel_occupancy_pct'):
-            rooms_result = db.execute(
-                text("""
-                SELECT COALESCE(SUM(available), 25) as total_rooms
-                FROM newbook_occupancy_report_data
-                WHERE date = :forecast_date
-                """),
-                {"forecast_date": forecast_date}
-            )
-            rooms_row = rooms_result.fetchone()
-            if rooms_row and rooms_row.total_rooms:
-                total_rooms = int(rooms_row.total_rooms)
+        # Get bookable rooms for this date (rooms - maintenance, for capping)
+        bookable_cap = get_bookable_cap_sync(db, forecast_date, fallback_value=25)
 
         # Get current OTB from snapshots
         otb_result = db.execute(
@@ -159,9 +148,9 @@ async def run_pickup_forecast(
             if metric_code == 'hotel_occupancy_pct' and projected_value > 100:
                 projected_value = 100
                 confidence_note += " (capped at 100%)"
-            if metric_code == 'hotel_room_nights' and projected_value > total_rooms:
-                projected_value = total_rooms
-                confidence_note += f" (capped at {total_rooms} rooms)"
+            if metric_code == 'hotel_room_nights' and projected_value > bookable_cap:
+                projected_value = bookable_cap
+                confidence_note += f" (capped at {bookable_cap} bookable rooms)"
 
         elif prior_final is not None and prior_final > 0:
             # No prior OTB, but have prior final - use as guidance
@@ -190,9 +179,9 @@ async def run_pickup_forecast(
             if metric_code == 'hotel_occupancy_pct' and projected_value > 100:
                 projected_value = 100
                 confidence_note += " (capped at 100%)"
-            if metric_code == 'hotel_room_nights' and projected_value > total_rooms:
-                projected_value = total_rooms
-                confidence_note += f" (capped at {total_rooms} rooms)"
+            if metric_code == 'hotel_room_nights' and projected_value > bookable_cap:
+                projected_value = bookable_cap
+                confidence_note += f" (capped at {bookable_cap} bookable rooms)"
 
         elif curve_row and curve_row.avg_pct_of_final > 0:
             # Curve method: project based on historical pickup curve
@@ -204,9 +193,9 @@ async def run_pickup_forecast(
             if metric_code == 'hotel_occupancy_pct' and projected_value > 100:
                 projected_value = 100
                 confidence_note += " (capped at 100%)"
-            if metric_code == 'hotel_room_nights' and projected_value > total_rooms:
-                projected_value = total_rooms
-                confidence_note += f" (capped at {total_rooms} rooms)"
+            if metric_code == 'hotel_room_nights' and projected_value > bookable_cap:
+                projected_value = bookable_cap
+                confidence_note += f" (capped at {bookable_cap} bookable rooms)"
 
         forecast_record = {
             "forecast_date": forecast_date,

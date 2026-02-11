@@ -12,10 +12,16 @@ from jobs.data_sync import (
     sync_newbook_occupancy_report,
     sync_newbook_earned_revenue
 )
+from jobs.resos_bookings_sync import sync_resos_bookings_data
+from api.sync_bookings import run_bookings_data_sync
 from jobs.aggregation import run_aggregation
 from jobs.forecast_daily import run_daily_forecast
 from jobs.pickup_snapshot import run_pickup_snapshot
+from jobs.pace_snapshot_v2 import run_pace_snapshot_v2
 from jobs.accuracy_calc import run_accuracy_calculation
+from jobs.weekly_forecast_snapshot import run_weekly_forecast_snapshot
+from jobs.fetch_current_rates import run_fetch_current_rates
+from jobs.scrape_booking_rates import run_scheduled_booking_scrape_async
 from database import SyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -65,10 +71,35 @@ def get_sync_time(source: str, default_hour: int = 5, default_minute: int = 0) -
 async def run_scheduled_newbook_sync():
     """Wrapper to check if Newbook bookings sync is enabled before running"""
     if is_sync_enabled("newbook_bookings"):
-        logger.info("Running scheduled Newbook bookings sync")
-        await sync_newbook_data(triggered_by="scheduler")
+        # Get sync type from config (incremental or full)
+        sync_type = get_config_value("sync_newbook_bookings_type", "incremental")
+        logger.info(f"Running scheduled Newbook bookings sync (mode={sync_type})")
+        # Run synchronous function in thread pool to avoid blocking
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            run_bookings_data_sync,
+            sync_type,  # sync_mode
+            None,       # from_date
+            None,       # to_date
+            "scheduler" # triggered_by
+        )
     else:
         logger.debug("Scheduled Newbook bookings sync skipped (disabled in settings)")
+
+
+async def run_scheduled_resos_bookings_sync():
+    """Wrapper to check if Resos bookings sync is enabled before running"""
+    from datetime import date, timedelta
+    if is_sync_enabled("resos_bookings"):
+        logger.info("Running scheduled Resos bookings sync")
+        # Daily: -7 days to +365 days (recent history + forecast window)
+        from_date = date.today() - timedelta(days=7)
+        to_date = date.today() + timedelta(days=365)
+        await sync_resos_bookings_data(from_date, to_date, triggered_by="scheduler")
+    else:
+        logger.info("Scheduled Resos bookings sync skipped (disabled in settings)")
 
 
 async def run_scheduled_resos_sync():
@@ -106,6 +137,15 @@ async def run_scheduled_earned_revenue_sync():
         logger.info("Scheduled Newbook earned revenue sync skipped (disabled in settings)")
 
 
+async def run_scheduled_current_rates_sync():
+    """Wrapper to run current rates sync (for pickup-v2 upper bounds)"""
+    if is_sync_enabled("newbook_current_rates"):
+        logger.info("Running scheduled Newbook current rates sync")
+        await run_fetch_current_rates()
+    else:
+        logger.debug("Scheduled Newbook current rates sync skipped (disabled in settings)")
+
+
 def reschedule_sync_jobs():
     """
     Read sync times from config and reschedule sync jobs.
@@ -123,6 +163,17 @@ def reschedule_sync_jobs():
         replace_existing=True
     )
     logger.info(f"  Newbook bookings sync scheduled for {nb_hour:02d}:{nb_min:02d}")
+
+    # Resos bookings sync
+    rsb_hour, rsb_min = get_sync_time("resos_bookings", 5, 5)
+    scheduler.add_job(
+        run_scheduled_resos_bookings_sync,
+        CronTrigger(hour=rsb_hour, minute=rsb_min),
+        id="resos_bookings_sync",
+        name=f"Daily Resos Bookings Sync ({rsb_hour:02d}:{rsb_min:02d})",
+        replace_existing=True
+    )
+    logger.info(f"  Resos bookings sync scheduled for {rsb_hour:02d}:{rsb_min:02d}")
 
     # Resos sync - uses general sync_schedule_time for now
     rs_time = get_config_value("sync_schedule_time", "05:05")
@@ -203,11 +254,46 @@ def start_scheduler():
         replace_existing=True
     )
 
-    # Daily forecast (0-28 days) - Daily at 6:00 AM
-    # Prophet, XGBoost, and Pickup for operational planning window
-    # (TFT excluded - runs weekly due to training time)
+    # Pace snapshot v2 - Daily at 5:32 AM
+    # Captures revenue pace for pickup-v2 model
     scheduler.add_job(
-        lambda: run_daily_forecast(horizon_days=28, models=['prophet', 'xgboost', 'pickup']),
+        run_pace_snapshot_v2,
+        CronTrigger(hour=5, minute=32),
+        id="pace_snapshot_v2",
+        name="Daily Pace Snapshot V2",
+        replace_existing=True
+    )
+
+    # Fetch current rates from Newbook - Daily at 5:20 AM
+    # Populates newbook_current_rates for pickup-v2 upper bound calculations
+    scheduler.add_job(
+        run_scheduled_current_rates_sync,
+        CronTrigger(hour=5, minute=20),
+        id="fetch_current_rates",
+        name="Daily Fetch Current Rates",
+        replace_existing=True
+    )
+
+    # Booking.com rate scraper - Daily at configured time (default 05:30)
+    # Tiered: daily 30d, weekly 31-180d (Mon-Fri), biweekly 181-365d (Wed)
+    booking_time = get_config_value("booking_scraper_daily_time", "05:30")
+    try:
+        bk_hour, bk_min = int(booking_time.split(':')[0]), int(booking_time.split(':')[1])
+    except (ValueError, IndexError):
+        bk_hour, bk_min = 5, 30
+    scheduler.add_job(
+        run_scheduled_booking_scrape_async,
+        CronTrigger(hour=bk_hour, minute=bk_min),
+        id="booking_scrape",
+        name=f"Daily Booking.com Scrape ({bk_hour:02d}:{bk_min:02d})",
+        replace_existing=True
+    )
+    logger.info(f"  Booking.com scrape scheduled for {bk_hour:02d}:{bk_min:02d}")
+
+    # Daily forecast (0-28 days) - Daily at 6:00 AM
+    # Prophet, XGBoost, Pickup, and CatBoost for operational planning window
+    scheduler.add_job(
+        lambda: run_daily_forecast(horizon_days=28, models=['prophet', 'xgboost', 'pickup', 'catboost']),
         CronTrigger(hour=6, minute=0),
         id="forecast_daily",
         name="Daily Forecast (0-28 days)",
@@ -224,22 +310,28 @@ def start_scheduler():
         replace_existing=True
     )
 
-    # TFT forecast (0-28 days) - Weekly on Sunday at 3:00 AM
-    # TFT is computationally expensive, runs weekly instead of daily
-    scheduler.add_job(
-        lambda: run_daily_forecast(horizon_days=28, models=['tft']),
-        CronTrigger(day_of_week="sun", hour=3, minute=0),
-        id="forecast_tft_weekly",
-        name="Weekly TFT Forecast (0-28 days)",
-        replace_existing=True
-    )
-
     # Accuracy calculation - Daily at 7:00 AM
     scheduler.add_job(
         run_accuracy_calculation,
         CronTrigger(hour=7, minute=0),
         id="accuracy_calc",
         name="Daily Accuracy Calculation",
+        replace_existing=True
+    )
+
+    # Weekly forecast snapshot - Monday at 6:00 AM (default)
+    # Get time from config (default: Monday 6:00 AM)
+    snapshot_time = get_config_value("forecast_snapshot_time", "06:00")
+    try:
+        snapshot_hour, snapshot_min = int(snapshot_time.split(':')[0]), int(snapshot_time.split(':')[1])
+    except:
+        snapshot_hour, snapshot_min = 6, 0
+
+    scheduler.add_job(
+        run_weekly_forecast_snapshot,
+        CronTrigger(day_of_week="mon", hour=snapshot_hour, minute=snapshot_min),
+        id="weekly_forecast_snapshot",
+        name=f"Weekly Forecast Snapshot (Mon {snapshot_hour:02d}:{snapshot_min:02d})",
         replace_existing=True
     )
 

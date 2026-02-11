@@ -67,6 +67,21 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code session data
+.claude/
+
+# Database dumps and sensitive data
+backup.sql
+users.sql
+db/forecast_data_dump.sql
+
+# One-off debug/test scripts
+backend/test_*.py
+backend/check_*.py
+backend/simple_count.py
+backend/calc_snapshot_mape.py

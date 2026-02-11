@@ -361,3 +361,83 @@ class NewbookClient:
             await asyncio.sleep(0.75)
 
         return all_revenue
+
+    async def get_transaction_flow(
+        self,
+        from_date: date,
+        to_date: date,
+        batch_size: int = 5000
+    ) -> List[dict]:
+        """
+        Fetch transaction flow report for date range.
+        Used by reconciliation module for payment categorization.
+
+        Returns raw transaction records (payments, refunds, voided items).
+        Excludes balance_transfer items.
+        Handles pagination via data_offset/data_limit.
+        """
+        logger.info(f"Fetching transaction flow: {from_date} to {to_date}")
+
+        all_transactions = []
+        offset = 0
+
+        while True:
+            payload = self._get_auth_payload()
+            payload.update({
+                "period_from": f"{from_date.isoformat()} 00:00:00",
+                "period_to": f"{to_date.isoformat()} 23:59:59",
+                "data_offset": offset,
+                "data_limit": batch_size
+            })
+
+            response = await self.client.post(
+                self._get_url("reports_transaction_flow"),
+                json=payload,
+                auth=(self.username, self.password)
+            )
+
+            if response.status_code != 200:
+                raise NewbookAPIError(f"Failed to fetch transaction flow: {response.status_code}")
+
+            data = response.json()
+            if not data.get("success"):
+                raise NewbookAPIError(f"Newbook API returned failure: {data.get('message')}")
+
+            records = data.get("data", [])
+            all_transactions.extend(records)
+
+            # If we got fewer records than the limit, we're done
+            if len(records) < batch_size:
+                break
+
+            offset += batch_size
+            await asyncio.sleep(0.75)
+
+        logger.info(f"Fetched transaction flow: {len(all_transactions)} transactions")
+        return all_transactions
+
+    async def get_gl_account_list(self) -> List[dict]:
+        """
+        Fetch GL account list from Newbook.
+        Used for reconciliation sales breakdown column configuration.
+        """
+        logger.info("Fetching GL account list from Newbook")
+
+        payload = self._get_auth_payload()
+
+        response = await self.client.post(
+            self._get_url("gl_account_list"),
+            json=payload,
+            auth=(self.username, self.password)
+        )
+
+        if response.status_code != 200:
+            raise NewbookAPIError(f"Failed to fetch GL accounts: {response.status_code}")
+
+        data = response.json()
+        if not data.get("success"):
+            raise NewbookAPIError(f"Newbook API returned failure: {data.get('message')}")
+
+        records = data.get("data", [])
+        logger.info(f"Fetched {len(records)} GL accounts")
+        return records

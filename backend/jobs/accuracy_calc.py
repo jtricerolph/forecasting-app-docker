@@ -61,7 +61,7 @@ async def run_accuracy_calculation():
             prophet_forecast = forecasts.get('prophet')
             xgboost_forecast = forecasts.get('xgboost')
             pickup_forecast = forecasts.get('pickup')
-            tft_forecast = forecasts.get('tft')
+            catboost_forecast = forecasts.get('catboost')
 
             # Calculate errors
             def calc_error(forecast_val):
@@ -80,8 +80,8 @@ async def run_accuracy_calculation():
             pickup_error, pickup_pct = calc_error(
                 pickup_forecast.predicted_value if pickup_forecast else None
             )
-            tft_error, tft_pct = calc_error(
-                tft_forecast.predicted_value if tft_forecast else None
+            catboost_error, catboost_pct = calc_error(
+                catboost_forecast.predicted_value if catboost_forecast else None
             )
 
             # Determine best model
@@ -92,8 +92,8 @@ async def run_accuracy_calculation():
                 errors.append(('xgboost', abs(xgboost_error)))
             if pickup_error is not None:
                 errors.append(('pickup', abs(pickup_error)))
-            if tft_error is not None:
-                errors.append(('tft', abs(tft_error)))
+            if catboost_error is not None:
+                errors.append(('catboost', abs(catboost_error)))
 
             best_model = min(errors, key=lambda x: x[1])[0] if errors else None
 
@@ -115,23 +115,23 @@ async def run_accuracy_calculation():
                     date, metric_type, actual_value,
                     prophet_forecast, prophet_lower, prophet_upper,
                     xgboost_forecast, pickup_forecast,
-                    tft_forecast, tft_lower, tft_upper,
+                    catboost_forecast,
                     budget_value,
                     prophet_error, prophet_pct_error,
                     xgboost_error, xgboost_pct_error,
                     pickup_error, pickup_pct_error,
-                    tft_error, tft_pct_error,
+                    catboost_error, catboost_pct_error,
                     best_model, calculated_at
                 ) VALUES (
                     :date, :metric_type, :actual,
                     :prophet_val, :prophet_lower, :prophet_upper,
                     :xgboost_val, :pickup_val,
-                    :tft_val, :tft_lower, :tft_upper,
+                    :catboost_val,
                     :budget,
                     :prophet_error, :prophet_pct,
                     :xgboost_error, :xgboost_pct,
                     :pickup_error, :pickup_pct,
-                    :tft_error, :tft_pct,
+                    :catboost_error, :catboost_pct,
                     :best_model, NOW()
                 )
                 ON CONFLICT (date, metric_type) DO UPDATE SET
@@ -142,11 +142,9 @@ async def run_accuracy_calculation():
                     xgboost_pct_error = :xgboost_pct,
                     pickup_error = :pickup_error,
                     pickup_pct_error = :pickup_pct,
-                    tft_forecast = :tft_val,
-                    tft_lower = :tft_lower,
-                    tft_upper = :tft_upper,
-                    tft_error = :tft_error,
-                    tft_pct_error = :tft_pct,
+                    catboost_forecast = :catboost_val,
+                    catboost_error = :catboost_error,
+                    catboost_pct_error = :catboost_pct,
                     best_model = :best_model,
                     calculated_at = NOW()
                 """),
@@ -159,9 +157,7 @@ async def run_accuracy_calculation():
                     "prophet_upper": prophet_forecast.upper_bound if prophet_forecast else None,
                     "xgboost_val": xgboost_forecast.predicted_value if xgboost_forecast else None,
                     "pickup_val": pickup_forecast.predicted_value if pickup_forecast else None,
-                    "tft_val": tft_forecast.predicted_value if tft_forecast else None,
-                    "tft_lower": tft_forecast.lower_bound if tft_forecast else None,
-                    "tft_upper": tft_forecast.upper_bound if tft_forecast else None,
+                    "catboost_val": catboost_forecast.predicted_value if catboost_forecast else None,
                     "budget": budget_value,
                     "prophet_error": prophet_error,
                     "prophet_pct": prophet_pct,
@@ -169,8 +165,8 @@ async def run_accuracy_calculation():
                     "xgboost_pct": xgboost_pct,
                     "pickup_error": pickup_error,
                     "pickup_pct": pickup_pct,
-                    "tft_error": tft_error,
-                    "tft_pct": tft_pct,
+                    "catboost_error": catboost_error,
+                    "catboost_pct": catboost_pct,
                     "best_model": best_model
                 }
             )

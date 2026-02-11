@@ -654,8 +654,9 @@ async def run_batch_backtest_endpoint(
     start_perception: date = Query(..., description="First Monday to use as perception date"),
     end_perception: date = Query(..., description="Last Monday to use as perception date"),
     forecast_days: int = Query(365, description="Days ahead to forecast from each perception date"),
-    metric: str = Query("occupancy", description="Metric: occupancy or rooms"),
-    model: str = Query("xgboost", description="Model to backtest: xgboost, prophet, or pickup"),
+    metric: str = Query("occupancy", description="Metric to backtest"),
+    model: str = Query("xgboost", description="Model to backtest: xgboost, prophet, pickup, or catboost"),
+    exclude_covid: bool = Query(False, description="Exclude pre-COVID data (train from May 2021+ only)"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -668,6 +669,14 @@ async def run_batch_backtest_endpoint(
     Specify model to run one at a time - allows adding new model backtests
     without re-running existing ones.
 
+    Metrics:
+    - occupancy, rooms: All models supported (uses booking pace data)
+    - guests, ave_guest_rate, arr, net_accom, net_dry, net_wet: Prophet only (no pace data)
+
+    Set exclude_covid=true to train models only on post-COVID data (May 2021+).
+    Results will be stored with '_postcovid' suffix (e.g., 'xgboost_postcovid')
+    so you can compare accuracy with vs without COVID-era training data.
+
     Example: Run XGBoost for all Mondays of 2024:
     - start_perception: 2024-01-01
     - end_perception: 2024-12-31
@@ -678,9 +687,35 @@ async def run_batch_backtest_endpoint(
     """
     from jobs.batch_backtest import run_batch_backtest
 
-    valid_models = ['xgboost', 'prophet', 'pickup']
+    valid_models = ['xgboost', 'prophet', 'pickup', 'pickup_avg', 'catboost', 'blended']
+    valid_metrics = ['occupancy', 'rooms', 'guests', 'ave_guest_rate', 'arr', 'net_accom', 'net_dry', 'net_wet']
+    # Pickup models require pace data - only work with occupancy and rooms
+    pace_only_metrics = ['occupancy', 'rooms']
+    pickup_models = ['pickup', 'pickup_avg']
+    # Blended model requires existing prophet, xgboost, catboost forecasts
+    derived_models = ['blended']
+
     if model not in valid_models:
         raise HTTPException(status_code=400, detail=f"Invalid model. Must be one of: {valid_models}")
+
+    if metric not in valid_metrics:
+        raise HTTPException(status_code=400, detail=f"Invalid metric. Must be one of: {valid_metrics}")
+
+    # Pickup models require pace data
+    if model in pickup_models and metric not in pace_only_metrics:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model}' only supports occupancy and rooms metrics (requires booking pace data). "
+                   f"Use XGBoost, CatBoost, or Prophet for {metric}."
+        )
+
+    # Blended model requires existing prophet, xgboost, catboost forecasts
+    if model in derived_models:
+        # Note: blended model averages existing forecasts, doesn't train from scratch
+        pass
+
+    # Training cutoff for post-COVID: May 1, 2021
+    training_start = date(2021, 5, 1) if exclude_covid else None
 
     # Run in background
     background_tasks.add_task(
@@ -689,18 +724,21 @@ async def run_batch_backtest_endpoint(
         end_perception,
         forecast_days,
         metric,
-        [model]  # Single model at a time
+        [model],  # Single model at a time
+        training_start  # Training cutoff date
     )
 
     return {
         "status": "started",
-        "message": f"Batch backtest for {model} running in background",
+        "message": f"Batch backtest for {model}{' (post-COVID)' if exclude_covid else ''} running in background",
         "params": {
             "start_perception": str(start_perception),
             "end_perception": str(end_perception),
             "forecast_days": forecast_days,
             "metric": metric,
-            "model": model
+            "model": model,
+            "exclude_covid": exclude_covid,
+            "training_start": str(training_start) if training_start else None
         }
     }
 
@@ -711,25 +749,27 @@ async def get_batch_backtest_status(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get status of batch backtests - snapshot counts per model and perception date range.
+    Get status of batch backtests - snapshot counts per model/metric and perception date range.
     """
     result = await db.execute(text("""
         SELECT
             model,
+            metric_code,
             COUNT(*) as total_snapshots,
             COUNT(actual_value) as with_actuals,
             MIN(perception_date) as first_perception,
             MAX(perception_date) as last_perception,
             COUNT(DISTINCT perception_date) as perception_dates
         FROM forecast_snapshots
-        GROUP BY model
-        ORDER BY model
+        GROUP BY model, metric_code
+        ORDER BY metric_code, model
     """))
     rows = result.fetchall()
 
     return [
         {
             "model": row.model,
+            "metric_code": row.metric_code,
             "total_snapshots": row.total_snapshots,
             "with_actuals": row.with_actuals,
             "first_perception": str(row.first_perception),
@@ -827,6 +867,14 @@ async def get_accuracy_by_bracket(
             WHEN days_out BETWEEN 61 AND 90 THEN '61-90'
             ELSE '90+'
         END as lead_bracket,
+        CASE
+            WHEN days_out BETWEEN 0 AND 7 THEN 1
+            WHEN days_out BETWEEN 8 AND 14 THEN 2
+            WHEN days_out BETWEEN 15 AND 30 THEN 3
+            WHEN days_out BETWEEN 31 AND 60 THEN 4
+            WHEN days_out BETWEEN 61 AND 90 THEN 5
+            ELSE 6
+        END as sort_order,
         COUNT(*) as n,
         AVG(ABS(forecast_value - actual_value)) as mae,
         AVG(ABS((forecast_value - actual_value) / NULLIF(actual_value, 0)) * 100) as mape
@@ -834,17 +882,24 @@ async def get_accuracy_by_bracket(
     WHERE actual_value IS NOT NULL
     AND metric_code = :metric_code
     {model_filter}
-    GROUP BY model, lead_bracket
-    ORDER BY
-        model,
-        CASE lead_bracket
-            WHEN '0-7' THEN 1
-            WHEN '8-14' THEN 2
-            WHEN '15-30' THEN 3
-            WHEN '31-60' THEN 4
-            WHEN '61-90' THEN 5
+    GROUP BY model,
+        CASE
+            WHEN days_out BETWEEN 0 AND 7 THEN '0-7'
+            WHEN days_out BETWEEN 8 AND 14 THEN '8-14'
+            WHEN days_out BETWEEN 15 AND 30 THEN '15-30'
+            WHEN days_out BETWEEN 31 AND 60 THEN '31-60'
+            WHEN days_out BETWEEN 61 AND 90 THEN '61-90'
+            ELSE '90+'
+        END,
+        CASE
+            WHEN days_out BETWEEN 0 AND 7 THEN 1
+            WHEN days_out BETWEEN 8 AND 14 THEN 2
+            WHEN days_out BETWEEN 15 AND 30 THEN 3
+            WHEN days_out BETWEEN 31 AND 60 THEN 4
+            WHEN days_out BETWEEN 61 AND 90 THEN 5
             ELSE 6
         END
+    ORDER BY model, sort_order
     """
 
     result = await db.execute(text(query), params)
@@ -854,6 +909,161 @@ async def get_accuracy_by_bracket(
         {
             "model": row.model,
             "lead_bracket": row.lead_bracket,
+            "n": row.n,
+            "mae": round(float(row.mae), 2) if row.mae else None,
+            "mape": round(float(row.mape), 2) if row.mape else None
+        }
+        for row in rows
+    ]
+
+
+@router.get("/accuracy-by-day-of-week")
+async def get_accuracy_by_day_of_week(
+    metric_code: str = Query("occupancy", description="Metric code"),
+    model: Optional[str] = Query(None, description="Filter by model (default: all)"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get model accuracy (MAE, MAPE) by day of week.
+
+    Returns accuracy metrics grouped by:
+    - Sunday (0)
+    - Monday (1)
+    - Tuesday (2)
+    - Wednesday (3)
+    - Thursday (4)
+    - Friday (5)
+    - Saturday (6)
+
+    Useful for identifying if models perform better on certain days.
+    """
+    model_filter = "AND model = :model" if model else ""
+    params = {"metric_code": metric_code}
+    if model:
+        params["model"] = model
+
+    query = f"""
+    SELECT
+        model,
+        EXTRACT(DOW FROM target_date)::int as dow_num,
+        CASE EXTRACT(DOW FROM target_date)::int
+            WHEN 0 THEN 'Sunday'
+            WHEN 1 THEN 'Monday'
+            WHEN 2 THEN 'Tuesday'
+            WHEN 3 THEN 'Wednesday'
+            WHEN 4 THEN 'Thursday'
+            WHEN 5 THEN 'Friday'
+            WHEN 6 THEN 'Saturday'
+        END as day_name,
+        COUNT(*) as n,
+        AVG(ABS(forecast_value - actual_value)) as mae,
+        AVG(ABS((forecast_value - actual_value) / NULLIF(actual_value, 0)) * 100) as mape
+    FROM forecast_snapshots
+    WHERE actual_value IS NOT NULL
+    AND metric_code = :metric_code
+    {model_filter}
+    GROUP BY model,
+        EXTRACT(DOW FROM target_date)::int,
+        CASE EXTRACT(DOW FROM target_date)::int
+            WHEN 0 THEN 'Sunday'
+            WHEN 1 THEN 'Monday'
+            WHEN 2 THEN 'Tuesday'
+            WHEN 3 THEN 'Wednesday'
+            WHEN 4 THEN 'Thursday'
+            WHEN 5 THEN 'Friday'
+            WHEN 6 THEN 'Saturday'
+        END
+    ORDER BY model, dow_num
+    """
+
+    result = await db.execute(text(query), params)
+    rows = result.fetchall()
+
+    return [
+        {
+            "model": row.model,
+            "dow_num": row.dow_num,
+            "day_name": row.day_name,
+            "n": row.n,
+            "mae": round(float(row.mae), 2) if row.mae else None,
+            "mape": round(float(row.mape), 2) if row.mape else None
+        }
+        for row in rows
+    ]
+
+
+@router.get("/accuracy-by-month")
+async def get_accuracy_by_month(
+    metric_code: str = Query("occupancy", description="Metric code"),
+    model: Optional[str] = Query(None, description="Filter by model (default: all)"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get model accuracy (MAE, MAPE) by month of year.
+
+    Returns accuracy metrics grouped by month (January through December).
+
+    Useful for identifying seasonal patterns in model accuracy.
+    """
+    model_filter = "AND model = :model" if model else ""
+    params = {"metric_code": metric_code}
+    if model:
+        params["model"] = model
+
+    query = f"""
+    SELECT
+        model,
+        EXTRACT(MONTH FROM target_date)::int as month_num,
+        CASE EXTRACT(MONTH FROM target_date)::int
+            WHEN 1 THEN 'January'
+            WHEN 2 THEN 'February'
+            WHEN 3 THEN 'March'
+            WHEN 4 THEN 'April'
+            WHEN 5 THEN 'May'
+            WHEN 6 THEN 'June'
+            WHEN 7 THEN 'July'
+            WHEN 8 THEN 'August'
+            WHEN 9 THEN 'September'
+            WHEN 10 THEN 'October'
+            WHEN 11 THEN 'November'
+            WHEN 12 THEN 'December'
+        END as month_name,
+        COUNT(*) as n,
+        AVG(ABS(forecast_value - actual_value)) as mae,
+        AVG(ABS((forecast_value - actual_value) / NULLIF(actual_value, 0)) * 100) as mape
+    FROM forecast_snapshots
+    WHERE actual_value IS NOT NULL
+    AND metric_code = :metric_code
+    {model_filter}
+    GROUP BY model,
+        EXTRACT(MONTH FROM target_date)::int,
+        CASE EXTRACT(MONTH FROM target_date)::int
+            WHEN 1 THEN 'January'
+            WHEN 2 THEN 'February'
+            WHEN 3 THEN 'March'
+            WHEN 4 THEN 'April'
+            WHEN 5 THEN 'May'
+            WHEN 6 THEN 'June'
+            WHEN 7 THEN 'July'
+            WHEN 8 THEN 'August'
+            WHEN 9 THEN 'September'
+            WHEN 10 THEN 'October'
+            WHEN 11 THEN 'November'
+            WHEN 12 THEN 'December'
+        END
+    ORDER BY model, month_num
+    """
+
+    result = await db.execute(text(query), params)
+    rows = result.fetchall()
+
+    return [
+        {
+            "model": row.model,
+            "month_num": row.month_num,
+            "month_name": row.month_name,
             "n": row.n,
             "mae": round(float(row.mae), 2) if row.mae else None,
             "mape": round(float(row.mape), 2) if row.mape else None
@@ -892,7 +1102,15 @@ async def get_model_weights(
         FROM forecast_snapshots
         WHERE actual_value IS NOT NULL
         AND metric_code = :metric_code
-        GROUP BY model, lead_bracket
+        GROUP BY model,
+            CASE
+                WHEN days_out BETWEEN 0 AND 7 THEN '0-7'
+                WHEN days_out BETWEEN 8 AND 14 THEN '8-14'
+                WHEN days_out BETWEEN 15 AND 30 THEN '15-30'
+                WHEN days_out BETWEEN 31 AND 60 THEN '31-60'
+                WHEN days_out BETWEEN 61 AND 90 THEN '61-90'
+                ELSE '90+'
+            END
     ),
     inverse_mape AS (
         SELECT
@@ -939,29 +1157,424 @@ async def backfill_snapshot_actuals(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Backfill actual_value in forecast_snapshots from newbook_bookings_stats.
+    Backfill actual_value in forecast_snapshots from newbook_bookings_stats and newbook_net_revenue_data.
 
     Run this after target dates have passed to populate actual values
     for accuracy analysis.
+
+    Handles all metrics:
+    - occupancy: booking_count / bookable_count * 100
+    - rooms: booking_count
+    - guests: guests_count
+    - ave_guest_rate: guest_rate_total / booking_count
+    - arr: accommodation / booking_count (from revenue data)
+    - net_accom, net_dry, net_wet: from revenue data
     """
-    result = await db.execute(text("""
+    # First, update stats-based metrics (occupancy, rooms, guests, ave_guest_rate)
+    result1 = await db.execute(text("""
         UPDATE forecast_snapshots fs
         SET actual_value = CASE
             WHEN fs.metric_code = 'occupancy' THEN
                 (s.booking_count::decimal / NULLIF(s.bookable_count, 0)) * 100
-            ELSE
+            WHEN fs.metric_code = 'rooms' THEN
                 s.booking_count
+            WHEN fs.metric_code = 'guests' THEN
+                s.guests_count
+            WHEN fs.metric_code = 'ave_guest_rate' THEN
+                s.guest_rate_total / NULLIF(s.booking_count, 0)
+            ELSE NULL
         END
         FROM newbook_bookings_stats s
         WHERE fs.target_date = s.date
         AND fs.actual_value IS NULL
         AND fs.target_date < CURRENT_DATE
+        AND fs.metric_code IN ('occupancy', 'rooms', 'guests', 'ave_guest_rate')
         AND s.booking_count IS NOT NULL
+    """))
+
+    # Then, update revenue-based metrics (arr, net_accom, net_dry, net_wet)
+    result2 = await db.execute(text("""
+        UPDATE forecast_snapshots fs
+        SET actual_value = CASE
+            WHEN fs.metric_code = 'arr' THEN
+                r.accommodation / NULLIF(s.booking_count, 0)
+            WHEN fs.metric_code = 'net_accom' THEN
+                r.accommodation
+            WHEN fs.metric_code = 'net_dry' THEN
+                r.dry
+            WHEN fs.metric_code = 'net_wet' THEN
+                r.wet
+            ELSE NULL
+        END
+        FROM newbook_net_revenue_data r
+        JOIN newbook_bookings_stats s ON r.date = s.date
+        WHERE fs.target_date = r.date
+        AND fs.actual_value IS NULL
+        AND fs.target_date < CURRENT_DATE
+        AND fs.metric_code IN ('arr', 'net_accom', 'net_dry', 'net_wet')
     """))
 
     await db.commit()
 
     return {
         "status": "complete",
-        "rows_updated": result.rowcount
+        "rows_updated": result1.rowcount + result2.rowcount
+    }
+
+
+@router.delete("/snapshots/{model}")
+async def delete_model_snapshots(
+    model: str,
+    metric_code: Optional[str] = Query(None, description="Optional: Only delete for this metric"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Delete all backtest snapshots for a specific model.
+
+    Use this to remove backtest data for models you want to exclude from
+    accuracy analysis (e.g., models affected by COVID training data).
+
+    The model name must match exactly (e.g., 'xgboost', 'prophet', 'pickup_postcovid').
+    """
+    query = "DELETE FROM forecast_snapshots WHERE model = :model"
+    params = {"model": model}
+
+    if metric_code:
+        query += " AND metric_code = :metric_code"
+        params["metric_code"] = metric_code
+
+    result = await db.execute(text(query), params)
+    await db.commit()
+
+    return {
+        "status": "complete",
+        "model": model,
+        "metric_code": metric_code,
+        "rows_deleted": result.rowcount
+    }
+
+
+@router.post("/fill-to-today")
+async def fill_backtests_to_today(
+    background_tasks: BackgroundTasks,
+    metric: str = Query("occupancy", description="Metric to backtest"),
+    models: str = Query("prophet,xgboost,catboost,blended", description="Comma-separated models to run (blended runs last)"),
+    forecast_days: int = Query(365, description="Days ahead to forecast from each perception date"),
+    exclude_covid: bool = Query(True, description="Exclude pre-COVID data (train from May 2021+ only)"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Fill in backtests from earliest available data up to today.
+
+    Finds missing perception dates (Mondays) and runs backtests for each model.
+    Use this to backfill historical forecast data for accuracy analysis and 3D visualization.
+
+    The 'blended' model averages prophet, xgboost, and catboost - those must run first.
+    If included, blended is automatically moved to run last.
+    """
+    from jobs.batch_backtest import run_batch_backtest
+
+    model_list = [m.strip() for m in models.split(",")]
+    valid_models = ['xgboost', 'prophet', 'pickup', 'pickup_avg', 'catboost', 'blended']
+
+    for m in model_list:
+        if m not in valid_models:
+            raise HTTPException(status_code=400, detail=f"Invalid model: {m}")
+
+    # Ensure blended runs last (it depends on other model outputs)
+    if 'blended' in model_list:
+        model_list.remove('blended')
+        model_list.append('blended')
+
+    # Find earliest historical data date
+    earliest_result = await db.execute(text("""
+        SELECT MIN(date) as earliest
+        FROM newbook_bookings_stats
+        WHERE booking_count IS NOT NULL
+    """))
+    earliest_row = earliest_result.fetchone()
+    earliest_data = earliest_row.earliest if earliest_row else None
+
+    if not earliest_data:
+        raise HTTPException(status_code=400, detail="No historical data available")
+
+    # Start from 2 years after earliest data (need training history)
+    start_date = earliest_data + timedelta(days=730)
+
+    # Find most recent Monday before today
+    today = date.today()
+    days_since_monday = today.weekday()  # Monday=0
+    last_monday = today - timedelta(days=days_since_monday)
+
+    # Move start_date to first Monday
+    while start_date.weekday() != 0:
+        start_date += timedelta(days=1)
+
+    # Training cutoff for post-COVID: May 1, 2021
+    training_start = date(2021, 5, 1) if exclude_covid else None
+
+    # Check existing perception dates
+    existing_result = await db.execute(text("""
+        SELECT DISTINCT perception_date
+        FROM forecast_snapshots
+        WHERE metric_code = :metric
+        AND model = :first_model
+        ORDER BY perception_date
+    """), {"metric": metric, "first_model": f"{model_list[0]}{'_postcovid' if exclude_covid else ''}"})
+    existing_dates = {row.perception_date for row in existing_result.fetchall()}
+
+    # Count how many Mondays need processing
+    check_date = start_date
+    missing_count = 0
+    while check_date <= last_monday:
+        if check_date not in existing_dates:
+            missing_count += 1
+        check_date += timedelta(days=7)
+
+    # Run in background
+    background_tasks.add_task(
+        run_batch_backtest,
+        start_date,
+        last_monday,
+        forecast_days,
+        metric,
+        model_list,
+        training_start
+    )
+
+    return {
+        "status": "started",
+        "message": f"Filling backtests from {start_date} to {last_monday}",
+        "params": {
+            "start_perception": str(start_date),
+            "end_perception": str(last_monday),
+            "forecast_days": forecast_days,
+            "metric": metric,
+            "models": model_list,
+            "exclude_covid": exclude_covid,
+            "existing_perception_dates": len(existing_dates),
+            "missing_perception_dates": missing_count
+        }
+    }
+
+
+@router.get("/3d-data")
+async def get_3d_forecast_data(
+    metric_code: str = Query("occupancy", description="Metric code"),
+    target_date: date = Query(..., description="Target date to analyze"),
+    model: str = Query("blended", description="Model to show"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get forecast evolution data for 3D visualization.
+
+    Returns all forecasts for a specific target date from different perception dates,
+    showing how the forecast changed as the target date approached.
+
+    Data structure for 3D chart:
+    - X axis: perception_date (when forecast was made)
+    - Y axis: days_out (lead time)
+    - Z axis: forecast_value
+
+    This shows how forecast accuracy improves as lead time decreases.
+    """
+    query = """
+    SELECT
+        perception_date,
+        target_date,
+        days_out,
+        forecast_value,
+        actual_value
+    FROM forecast_snapshots
+    WHERE target_date = :target_date
+    AND metric_code = :metric_code
+    AND model = :model
+    ORDER BY perception_date
+    """
+
+    result = await db.execute(text(query), {
+        "target_date": target_date,
+        "metric_code": metric_code,
+        "model": model
+    })
+    rows = result.fetchall()
+
+    return {
+        "target_date": str(target_date),
+        "metric_code": metric_code,
+        "model": model,
+        "actual_value": float(rows[0].actual_value) if rows and rows[0].actual_value else None,
+        "snapshots": [
+            {
+                "perception_date": str(row.perception_date),
+                "days_out": row.days_out,
+                "forecast_value": float(row.forecast_value) if row.forecast_value else None
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.get("/3d-surface")
+async def get_3d_surface_data(
+    metric_code: str = Query("occupancy", description="Metric code"),
+    from_date: date = Query(..., description="Start of target date range"),
+    to_date: date = Query(..., description="End of target date range"),
+    model: str = Query("blended", description="Model to show"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get forecast surface data for 3D visualization across multiple target dates.
+
+    Returns a grid of forecasts where:
+    - Rows = target dates
+    - Columns = days_out (lead time brackets)
+    - Values = forecast values
+
+    This creates a surface showing forecast evolution across both time and lead time.
+    """
+    query = """
+    SELECT
+        target_date,
+        days_out,
+        AVG(forecast_value) as avg_forecast,
+        AVG(actual_value) as avg_actual
+    FROM forecast_snapshots
+    WHERE target_date BETWEEN :from_date AND :to_date
+    AND metric_code = :metric_code
+    AND model = :model
+    GROUP BY target_date, days_out
+    ORDER BY target_date, days_out
+    """
+
+    result = await db.execute(text(query), {
+        "from_date": from_date,
+        "to_date": to_date,
+        "metric_code": metric_code,
+        "model": model
+    })
+    rows = result.fetchall()
+
+    # Organize into grid format
+    grid_data = {}
+    for row in rows:
+        date_str = str(row.target_date)
+        if date_str not in grid_data:
+            grid_data[date_str] = {"actual": float(row.avg_actual) if row.avg_actual else None}
+        grid_data[date_str][row.days_out] = float(row.avg_forecast) if row.avg_forecast else None
+
+    return {
+        "metric_code": metric_code,
+        "model": model,
+        "from_date": str(from_date),
+        "to_date": str(to_date),
+        "data": grid_data
+    }
+
+
+@router.get("/3d-monthly-progress")
+async def get_3d_monthly_progress(
+    metric_code: str = Query("occupancy", description="Metric code"),
+    year: int = Query(..., description="Year (e.g., 2025)"),
+    month: int = Query(..., description="Month (1-12)"),
+    model: str = Query("blended", description="Model to show"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get forecast progress data for 3D visualization of a specific month.
+
+    Shows how forecasts for a given month evolved over time as perception dates
+    approached the target dates.
+
+    Returns:
+    - target_dates: Array of dates in the selected month (X axis)
+    - perception_dates: Array of unique perception dates (Y axis)
+    - surface_data: 2D array [perception_idx][target_idx] of forecast values (Z axis)
+    - actuals: Array of actual values for each target date
+
+    This visualization shows how forecast accuracy improved over time.
+    """
+    from calendar import monthrange
+
+    # Calculate date range for the selected month
+    _, last_day = monthrange(year, month)
+    from_date = date(year, month, 1)
+    to_date = date(year, month, last_day)
+
+    query = """
+    SELECT
+        perception_date,
+        target_date,
+        forecast_value,
+        actual_value
+    FROM forecast_snapshots
+    WHERE target_date BETWEEN :from_date AND :to_date
+    AND metric_code = :metric_code
+    AND model = :model
+    ORDER BY perception_date, target_date
+    """
+
+    result = await db.execute(text(query), {
+        "from_date": from_date,
+        "to_date": to_date,
+        "metric_code": metric_code,
+        "model": model
+    })
+    rows = result.fetchall()
+
+    if not rows:
+        return {
+            "metric_code": metric_code,
+            "model": model,
+            "year": year,
+            "month": month,
+            "target_dates": [],
+            "perception_dates": [],
+            "surface_data": [],
+            "actuals": []
+        }
+
+    # Extract unique dates and build lookup
+    target_dates_set = set()
+    perception_dates_set = set()
+    forecasts = {}  # (perception_date, target_date) -> forecast_value
+    actuals_map = {}  # target_date -> actual_value
+
+    for row in rows:
+        target_dates_set.add(row.target_date)
+        perception_dates_set.add(row.perception_date)
+        forecasts[(row.perception_date, row.target_date)] = row.forecast_value
+        if row.actual_value is not None:
+            actuals_map[row.target_date] = row.actual_value
+
+    # Sort dates
+    target_dates = sorted(target_dates_set)
+    perception_dates = sorted(perception_dates_set)
+
+    # Build surface data: surface_data[perception_idx][target_idx]
+    surface_data = []
+    for p_date in perception_dates:
+        row_data = []
+        for t_date in target_dates:
+            val = forecasts.get((p_date, t_date))
+            row_data.append(float(val) if val is not None else None)
+        surface_data.append(row_data)
+
+    # Actuals array aligned with target_dates
+    actuals = [float(actuals_map.get(t)) if t in actuals_map else None for t in target_dates]
+
+    return {
+        "metric_code": metric_code,
+        "model": model,
+        "year": year,
+        "month": month,
+        "target_dates": [str(d) for d in target_dates],
+        "perception_dates": [str(d) for d in perception_dates],
+        "surface_data": surface_data,
+        "actuals": actuals
     }

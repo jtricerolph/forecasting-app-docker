@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { authApi, UserWithDate } from '../utils/api'
 import { useAuth } from '../App'
@@ -13,15 +13,20 @@ import {
   shadows,
 } from '../utils/theme'
 
-type SettingsPage = 'newbook' | 'users' | 'database' | 'special-dates' | 'tft-training'
+type SettingsPage = 'newbook' | 'resos' | 'users' | 'database' | 'special-dates' | 'budget' | 'tax-rates' | 'forecast-snapshots' | 'backup' | 'api-keys'
 
 const Settings: React.FC = () => {
   const [activePage, setActivePage] = useState<SettingsPage>('newbook')
 
   const menuItems: { id: SettingsPage; label: string }[] = [
     { id: 'newbook', label: 'Newbook' },
+    { id: 'resos', label: 'Resos' },
     { id: 'special-dates', label: 'Special Dates' },
-    { id: 'tft-training', label: 'TFT Training' },
+    { id: 'budget', label: 'Budget' },
+    { id: 'tax-rates', label: 'Tax Rates' },
+    { id: 'forecast-snapshots', label: 'Forecast Snapshots' },
+    { id: 'api-keys', label: 'API Keys' },
+    { id: 'backup', label: 'Backup & Restore' },
     { id: 'users', label: 'Users' },
     { id: 'database', label: 'Database Browser' },
   ]
@@ -48,10 +53,15 @@ const Settings: React.FC = () => {
 
       <main style={styles.content}>
         {activePage === 'newbook' && <NewbookPage />}
+        {activePage === 'resos' && <ResosPage />}
         {activePage === 'special-dates' && <SpecialDatesPage />}
-        {activePage === 'tft-training' && <TFTTrainingPage />}
+        {activePage === 'budget' && <BudgetPage />}
+        {activePage === 'tax-rates' && <TaxRatesPage />}
+        {activePage === 'forecast-snapshots' && <ForecastSnapshotsPage />}
+        {activePage === 'backup' && <BackupPage />}
         {activePage === 'users' && <UsersPage />}
         {activePage === 'database' && <DatabasePage />}
+        {activePage === 'api-keys' && <ApiKeysPage />}
       </main>
     </div>
   )
@@ -128,7 +138,7 @@ const RoomCategoriesSection: React.FC = () => {
     }, 5000)
   }
 
-  // Update a single category
+  // Update a single category (toggle included)
   const handleToggle = async (category: RoomCategory) => {
     try {
       await fetch('/api/config/room-categories/bulk-update', {
@@ -144,6 +154,25 @@ const RoomCategoriesSection: React.FC = () => {
       queryClient.invalidateQueries({ queryKey: ['room-categories'] })
     } catch (err) {
       console.error('Failed to update room category', err)
+    }
+  }
+
+  // Update display order for a category
+  const handleOrderChange = async (category: RoomCategory, newOrder: number) => {
+    try {
+      await fetch('/api/config/room-categories/bulk-update', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({
+          updates: [{ id: category.id, display_order: newOrder }]
+        })
+      })
+      queryClient.invalidateQueries({ queryKey: ['room-categories'] })
+    } catch (err) {
+      console.error('Failed to update display order', err)
     }
   }
 
@@ -223,7 +252,7 @@ const RoomCategoriesSection: React.FC = () => {
           </div>
           <div style={styles.roomCategoryList}>
             {roomCategories.map((cat) => (
-              <label key={cat.id} style={styles.roomCategoryItem}>
+              <div key={cat.id} style={styles.roomCategoryItem}>
                 <input
                   type="checkbox"
                   checked={cat.is_included}
@@ -232,7 +261,15 @@ const RoomCategoriesSection: React.FC = () => {
                 />
                 <span style={styles.roomCategoryName}>{cat.site_name}</span>
                 <span style={styles.roomCategoryCount}>{cat.room_count} rooms</span>
-              </label>
+                <input
+                  type="number"
+                  value={cat.display_order}
+                  onChange={(e) => handleOrderChange(cat, parseInt(e.target.value) || 0)}
+                  style={styles.displayOrderInput}
+                  min={0}
+                  title="Display order (lower = first)"
+                />
+              </div>
             ))}
           </div>
         </>
@@ -1571,6 +1608,360 @@ const EarnedRevenueDataSyncSection: React.FC = () => {
   )
 }
 
+// ============================================
+// CURRENT RATES DATA SYNC SECTION (Pickup-V2)
+// ============================================
+
+interface CurrentRatesSyncStatus {
+  last_successful_sync: {
+    completed_at: string | null
+    records_fetched: number | null
+    records_created: number | null
+    triggered_by: string | null
+  } | null
+  last_sync: {
+    started_at: string | null
+    completed_at: string | null
+    status: string | null
+    records_fetched: number | null
+    error_message: string | null
+    triggered_by: string | null
+  } | null
+  auto_sync: {
+    enabled: boolean
+    time: string
+  }
+  total_records: number
+  data_range: {
+    from: string | null
+    to: string | null
+  }
+  category_counts: Record<string, number>
+}
+
+const CurrentRatesDataSyncSection: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'success' | 'error'>('idle')
+  const [syncMessage, setSyncMessage] = useState('')
+  const [autoEnabled, setAutoEnabled] = useState(false)
+  const [syncTime, setSyncTime] = useState('05:20')
+
+  // Fetch sync status
+  const { data: status, isLoading: statusLoading, refetch: refetchStatus } = useQuery<CurrentRatesSyncStatus>({
+    queryKey: ['current-rates-sync-status'],
+    queryFn: async () => {
+      const response = await fetch('/api/sync/current-rates/status', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch status')
+      return response.json()
+    },
+    refetchInterval: syncStatus === 'syncing' ? 3000 : false,
+  })
+
+  // Fetch sync logs
+  const { data: logs, isLoading: logsLoading } = useQuery<SyncLog[]>({
+    queryKey: ['current-rates-sync-logs'],
+    queryFn: async () => {
+      const response = await fetch('/api/sync/current-rates/logs?limit=5', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+    refetchInterval: syncStatus === 'syncing' ? 3000 : false,
+  })
+
+  // Update local state when status loads
+  React.useEffect(() => {
+    if (status?.auto_sync) {
+      setAutoEnabled(status.auto_sync.enabled)
+      setSyncTime(status.auto_sync.time || '05:20')
+    }
+    // Check if sync is currently running
+    if (status?.last_sync?.status === 'running') {
+      setSyncStatus('syncing')
+    } else if (syncStatus === 'syncing' && status?.last_sync?.status !== 'running') {
+      // Sync completed
+      setSyncStatus(status?.last_sync?.status === 'success' ? 'success' : 'error')
+      setSyncMessage(status?.last_sync?.status === 'success'
+        ? `Synced ${status?.last_sync?.records_fetched || 0} rates`
+        : status?.last_sync?.error_message || 'Sync failed')
+      setTimeout(() => {
+        setSyncStatus('idle')
+        setSyncMessage('')
+      }, 5000)
+      queryClient.invalidateQueries({ queryKey: ['current-rates-sync-status'] })
+      queryClient.invalidateQueries({ queryKey: ['current-rates-sync-logs'] })
+    }
+  }, [status, syncStatus, queryClient])
+
+  // Trigger sync
+  const handleSync = async () => {
+    setSyncStatus('syncing')
+    setSyncMessage('')
+    try {
+      const response = await fetch('/api/sync/current-rates/sync', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      const data = await response.json()
+      if (response.ok) {
+        setSyncMessage(data.message || 'Sync started...')
+      } else {
+        setSyncStatus('error')
+        setSyncMessage(data.detail || 'Failed to start sync')
+        setTimeout(() => {
+          setSyncStatus('idle')
+          setSyncMessage('')
+        }, 5000)
+      }
+    } catch {
+      setSyncStatus('error')
+      setSyncMessage('Failed to start sync')
+      setTimeout(() => {
+        setSyncStatus('idle')
+        setSyncMessage('')
+      }, 5000)
+    }
+  }
+
+  // Update auto sync config
+  const handleAutoConfigSave = async () => {
+    try {
+      const response = await fetch('/api/sync/current-rates/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({
+          enabled: autoEnabled,
+          sync_time: syncTime
+        })
+      })
+      if (response.ok) {
+        refetchStatus()
+      }
+    } catch (err) {
+      console.error('Failed to update config', err)
+    }
+  }
+
+  // Cancel running sync
+  const handleCancelSync = async () => {
+    try {
+      const response = await fetch('/api/sync/current-rates/cancel', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      const data = await response.json()
+      if (response.ok) {
+        setSyncStatus('idle')
+        setSyncMessage(data.message || 'Sync cancelled')
+        queryClient.invalidateQueries({ queryKey: ['current-rates-sync-status'] })
+        queryClient.invalidateQueries({ queryKey: ['current-rates-sync-logs'] })
+        setTimeout(() => {
+          setSyncMessage('')
+        }, 3000)
+      }
+    } catch {
+      console.error('Failed to cancel sync')
+    }
+  }
+
+  const formatDate = (dateStr: string | null) => {
+    if (!dateStr) return '-'
+    return new Date(dateStr).toLocaleString()
+  }
+
+  const formatTrigger = (trigger: string | null) => {
+    if (!trigger) return '-'
+    if (trigger.startsWith('user:')) return trigger.replace('user:', '')
+    if (trigger === 'scheduler') return 'Auto'
+    return trigger
+  }
+
+  return (
+    <div style={styles.subsection}>
+      <h3 style={styles.subsectionTitle}>Current Rates Sync (Pickup-V2)</h3>
+      <p style={styles.hint}>
+        Fetches current rack rates from Newbook for revenue forecast upper bounds.
+        Used by Pickup-V2 model for confidence shading.
+      </p>
+
+      {statusLoading ? (
+        <div style={styles.loading}>Loading sync status...</div>
+      ) : (
+        <>
+          {/* Status summary */}
+          <div style={styles.syncStatusRow}>
+            <div style={styles.syncStatusItem}>
+              <span style={styles.syncStatusLabel}>Total Rates</span>
+              <span style={styles.syncStatusValue}>{status?.total_records?.toLocaleString() || 0}</span>
+            </div>
+            <div style={styles.syncStatusItem}>
+              <span style={styles.syncStatusLabel}>Date Range</span>
+              <span style={styles.syncStatusValue}>
+                {status?.data_range?.from && status?.data_range?.to
+                  ? `${status.data_range.from} → ${status.data_range.to}`
+                  : 'No data'}
+              </span>
+            </div>
+            <div style={styles.syncStatusItem}>
+              <span style={styles.syncStatusLabel}>Last Sync</span>
+              <span style={styles.syncStatusValue}>
+                {status?.last_successful_sync?.completed_at
+                  ? formatDate(status.last_successful_sync.completed_at)
+                  : 'Never'}
+              </span>
+            </div>
+            <div style={styles.syncStatusItem}>
+              <span style={styles.syncStatusLabel}>Auto Sync</span>
+              <span style={status?.auto_sync?.enabled ? styles.statusOk : styles.statusPending}>
+                {status?.auto_sync?.enabled ? 'Enabled' : 'Disabled'}
+              </span>
+            </div>
+          </div>
+
+          {/* Category breakdown if data exists */}
+          {status?.category_counts && Object.keys(status.category_counts).length > 0 && (
+            <div style={{ ...styles.hint, marginTop: spacing.sm }}>
+              Categories: {Object.entries(status.category_counts).map(([cat, count]) =>
+                `${cat}: ${count} days`
+              ).join(', ')}
+            </div>
+          )}
+
+          {/* Sync controls */}
+          <div style={styles.syncControlsSection}>
+            {/* Manual sync */}
+            <div style={styles.syncControlBox}>
+              <h4 style={styles.syncControlTitle}>Manual Sync</h4>
+              <p style={styles.syncControlHint}>
+                Fetch rates for all categories for the next 365 days.
+                Takes ~3 minutes per category due to API rate limits.
+              </p>
+              <div style={{ display: 'flex', gap: spacing.sm }}>
+                <button
+                  onClick={handleSync}
+                  disabled={syncStatus === 'syncing'}
+                  style={mergeStyles(
+                    buttonStyle('primary'),
+                    syncStatus === 'syncing' ? { opacity: 0.7 } : {}
+                  )}
+                >
+                  {syncStatus === 'syncing' ? 'Syncing...' : 'Fetch Current Rates'}
+                </button>
+                {syncStatus === 'syncing' && (
+                  <button
+                    onClick={handleCancelSync}
+                    style={mergeStyles(buttonStyle('outline'), { borderColor: colors.error, color: colors.error })}
+                  >
+                    Cancel
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Auto sync config */}
+            <div style={styles.syncControlBox}>
+              <h4 style={styles.syncControlTitle}>Automatic Sync</h4>
+              <p style={styles.syncControlHint}>
+                Enable scheduled daily sync. Fetches rates for next 365 days.
+              </p>
+              <label style={styles.syncCheckboxLabel}>
+                <input
+                  type="checkbox"
+                  checked={autoEnabled}
+                  onChange={(e) => setAutoEnabled(e.target.checked)}
+                  style={styles.checkbox}
+                />
+                Enable auto sync
+              </label>
+              <div style={styles.syncAutoRow}>
+                <span style={styles.syncTimeLabel}>Sync at</span>
+                <input
+                  type="time"
+                  value={syncTime}
+                  onChange={(e) => setSyncTime(e.target.value)}
+                  style={styles.syncTimeInput}
+                  disabled={!autoEnabled}
+                />
+              </div>
+              <button
+                onClick={handleAutoConfigSave}
+                style={buttonStyle('outline')}
+              >
+                Save Settings
+              </button>
+            </div>
+          </div>
+
+          {/* Sync message */}
+          {syncMessage && (
+            <div style={{
+              ...styles.statusMessage,
+              background: syncStatus === 'success' ? colors.successBg :
+                         syncStatus === 'error' ? colors.errorBg : colors.background,
+              color: syncStatus === 'success' ? colors.success :
+                     syncStatus === 'error' ? colors.error : colors.text,
+              marginTop: spacing.md,
+            }}>
+              {syncMessage}
+            </div>
+          )}
+
+          {/* Recent sync logs */}
+          <div style={styles.syncLogsSection}>
+            <h4 style={styles.syncLogsTitle}>Recent Syncs</h4>
+            {logsLoading ? (
+              <div style={styles.loading}>Loading logs...</div>
+            ) : logs && logs.length > 0 ? (
+              <div style={styles.syncLogsList}>
+                {logs.map((log) => (
+                  <div key={log.id} style={styles.syncLogItem}>
+                    <div style={styles.syncLogMain}>
+                      <span style={{
+                        ...styles.syncLogStatus,
+                        color: log.status === 'success' ? colors.success :
+                               log.status === 'running' ? colors.accent :
+                               colors.error
+                      }}>
+                        {log.status === 'running' ? '●' : log.status === 'success' ? '✓' : '✗'}
+                      </span>
+                      <span style={styles.syncLogDate}>{formatDate(log.started_at)}</span>
+                      <span style={styles.syncLogRecords}>
+                        {log.records_fetched !== null ? `${log.records_fetched} rates` : ''}
+                      </span>
+                    </div>
+                    <div style={styles.syncLogMeta}>
+                      <span style={styles.syncLogTrigger}>{formatTrigger(log.triggered_by)}</span>
+                      {log.status === 'running' && (
+                        <button
+                          onClick={handleCancelSync}
+                          style={mergeStyles(buttonStyle('outline', 'small'), { marginLeft: spacing.sm, borderColor: colors.error, color: colors.error })}
+                        >
+                          Cancel
+                        </button>
+                      )}
+                    </div>
+                    {log.error_message && (
+                      <div style={styles.syncLogError}>{log.error_message}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={styles.emptyState}>No sync history yet.</div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 const NewbookPage: React.FC = () => {
   const [apiKey, setApiKey] = useState('')
   const [username, setUsername] = useState('')
@@ -1815,6 +2206,1435 @@ const NewbookPage: React.FC = () => {
       <div style={styles.divider} />
 
       <EarnedRevenueDataSyncSection />
+
+      <div style={styles.divider} />
+
+      <CurrentRatesDataSyncSection />
+    </div>
+  )
+}
+
+// ============================================
+// RESOS SETTINGS PAGE
+// ============================================
+
+interface ResosSettings {
+  resos_api_key: string | null
+  resos_api_key_set: boolean
+}
+
+interface ResosCustomField {
+  id: string
+  name: string
+  type: string
+  values?: string[]
+}
+
+interface CustomFieldMapping {
+  custom_field_id: string
+  mapping_type: string
+}
+
+interface ResosOpeningHour {
+  id: string
+  name: string
+  start_time: string
+  end_time: string
+}
+
+interface OpeningHourMapping {
+  opening_hour_id: string
+  period_type: string
+  display_name?: string
+}
+
+interface ManualBreakfastPeriod {
+  day_of_week: number
+  start_time: string
+  end_time: string
+  is_active: boolean
+}
+
+const ResosPage: React.FC = () => {
+  return (
+    <div style={styles.section}>
+      <h2 style={styles.sectionTitle}>Resos Settings</h2>
+      <p style={styles.hint}>Configure your Resos API connection and sync settings for restaurant reservation management.</p>
+
+      <ResosAPIConfigSection />
+
+      <div style={styles.divider} />
+
+      <ResosCustomFieldMappingSection />
+
+      <div style={styles.divider} />
+
+      <ResosOpeningHoursMappingSection />
+
+      <div style={styles.divider} />
+
+      <ResosManualBreakfastSection />
+
+      <div style={styles.divider} />
+
+      <ResosAverageSpendSection />
+
+      <div style={styles.divider} />
+
+      <ResosSyncConfigSection />
+    </div>
+  )
+}
+
+// ============================================
+// RESOS API CONFIGURATION SECTION
+// ============================================
+
+const ResosAPIConfigSection: React.FC = () => {
+  const [apiKey, setApiKey] = useState('')
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
+  const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle')
+  const [testMessage, setTestMessage] = useState('')
+
+  const { data: settings, isLoading } = useQuery({
+    queryKey: ['resos-settings'],
+    queryFn: async () => {
+      const response = await fetch('/api/config/settings/resos', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch settings')
+      return response.json() as Promise<ResosSettings>
+    },
+    staleTime: 30000,
+  })
+
+  const handleSave = async () => {
+    setSaveStatus('saving')
+    try {
+      const response = await fetch('/api/config/settings/resos', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({
+          resos_api_key: apiKey || undefined,
+        })
+      })
+      if (!response.ok) throw new Error('Failed to save')
+      setSaveStatus('success')
+      setApiKey('')
+      setTimeout(() => setSaveStatus('idle'), 3000)
+    } catch {
+      setSaveStatus('error')
+      setTimeout(() => setSaveStatus('idle'), 3000)
+    }
+  }
+
+  const handleTestConnection = async () => {
+    setTestStatus('testing')
+    setTestMessage('')
+    try {
+      const response = await fetch('/api/config/settings/resos/test', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      const data = await response.json()
+      if (response.ok) {
+        setTestStatus('success')
+        setTestMessage(data.message || 'Connection successful!')
+      } else {
+        setTestStatus('error')
+        setTestMessage(data.detail || 'Connection failed')
+      }
+    } catch {
+      setTestStatus('error')
+      setTestMessage('Connection failed')
+    }
+    setTimeout(() => {
+      setTestStatus('idle')
+      setTestMessage('')
+    }, 5000)
+  }
+
+  if (isLoading) {
+    return <div style={styles.loading}>Loading settings...</div>
+  }
+
+  return (
+    <div style={styles.apiConfigRow}>
+      <div style={styles.apiConfigLeft}>
+        <h3 style={styles.subsectionTitle}>API Configuration</h3>
+
+        <div style={styles.form}>
+          <label style={styles.label}>
+            <span>API Key</span>
+            <div style={styles.inputWithStatus}>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder={settings?.resos_api_key_set ? '••••••••' : 'Enter API key'}
+                style={styles.input}
+              />
+              {settings?.resos_api_key_set && (
+                <span style={styles.keyStatus}>Key configured</span>
+              )}
+            </div>
+          </label>
+
+          <div style={styles.buttonRow}>
+            <button
+              onClick={handleSave}
+              disabled={saveStatus === 'saving'}
+              style={mergeStyles(
+                buttonStyle('primary'),
+                saveStatus === 'success' ? { background: colors.success } : {},
+                saveStatus === 'error' ? { background: colors.error } : {}
+              )}
+            >
+              {saveStatus === 'saving' ? 'Saving...' :
+               saveStatus === 'success' ? 'Saved!' :
+               saveStatus === 'error' ? 'Error' : 'Save Settings'}
+            </button>
+            <button
+              onClick={handleTestConnection}
+              disabled={testStatus === 'testing'}
+              style={buttonStyle('outline')}
+            >
+              {testStatus === 'testing' ? 'Testing...' : 'Test Connection'}
+            </button>
+          </div>
+
+          {testMessage && (
+            <div style={{
+              ...styles.statusMessage,
+              background: testStatus === 'success' ? colors.successBg : colors.errorBg,
+              color: testStatus === 'success' ? colors.success : colors.error,
+            }}>
+              {testMessage}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={styles.apiConfigRight}>
+        <h3 style={styles.subsectionTitle}>Connection Status</h3>
+        <div style={styles.statusGridVertical}>
+          <div style={styles.statusItem}>
+            <span style={styles.statusLabel}>API Key</span>
+            <span style={settings?.resos_api_key_set ? styles.statusOk : styles.statusPending}>
+              {settings?.resos_api_key_set ? 'Configured' : 'Not set'}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================
+// RESOS CUSTOM FIELD MAPPING SECTION
+// ============================================
+
+const ResosCustomFieldMappingSection: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [fetchStatus, setFetchStatus] = useState<'idle' | 'fetching' | 'success' | 'error'>('idle')
+  const [fetchMessage, setFetchMessage] = useState('')
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
+  const [saveMessage, setSaveMessage] = useState('')
+  const [customFieldMapping, setCustomFieldMapping] = useState<Record<string, string>>({})
+
+  const { data: customFields, isLoading } = useQuery<ResosCustomField[]>({
+    queryKey: ['resos-custom-fields-list'],
+    queryFn: async () => {
+      const response = await fetch('/api/resos/custom-fields', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+  })
+
+  const { data: existingMappings } = useQuery<CustomFieldMapping[]>({
+    queryKey: ['resos-custom-field-mapping'],
+    queryFn: async () => {
+      const response = await fetch('/api/resos/custom-field-mapping', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+  })
+
+  React.useEffect(() => {
+    if (existingMappings) {
+      // Convert from array to simple mapping object: {mapping_type: field_id}
+      const mappingObj: Record<string, string> = {}
+      existingMappings.forEach(m => {
+        mappingObj[m.mapping_type] = m.custom_field_id
+      })
+      setCustomFieldMapping(mappingObj)
+    }
+  }, [existingMappings])
+
+  const handleFetch = async () => {
+    setFetchStatus('fetching')
+    setFetchMessage('')
+    try {
+      const response = await fetch('/api/resos/custom-fields', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      const data = await response.json()
+      if (response.ok) {
+        setFetchStatus('success')
+        setFetchMessage('Custom fields fetched successfully')
+        queryClient.invalidateQueries({ queryKey: ['resos-custom-fields-list'] })
+      } else {
+        setFetchStatus('error')
+        setFetchMessage(data.detail || 'Failed to fetch custom fields')
+      }
+    } catch {
+      setFetchStatus('error')
+      setFetchMessage('Failed to fetch custom fields')
+    }
+    setTimeout(() => {
+      setFetchStatus('idle')
+      setFetchMessage('')
+    }, 5000)
+  }
+
+  const handleSaveMappings = async () => {
+    setSaveStatus('saving')
+    setSaveMessage('')
+    try {
+      // Convert mapping object back to array format for API
+      const mappingsArray = Object.entries(customFieldMapping)
+        .filter(([_, fieldId]) => fieldId) // Only include non-empty mappings
+        .map(([mappingType, fieldId]) => ({
+          custom_field_id: fieldId,
+          mapping_type: mappingType
+        }))
+
+      const response = await fetch('/api/resos/custom-field-mapping', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ mappings: mappingsArray })
+      })
+      if (response.ok) {
+        setSaveStatus('success')
+        setSaveMessage('Mappings saved successfully')
+        queryClient.invalidateQueries({ queryKey: ['resos-custom-field-mapping'] })
+      } else {
+        const data = await response.json()
+        setSaveStatus('error')
+        setSaveMessage(data.detail || 'Failed to save mappings')
+      }
+    } catch {
+      setSaveStatus('error')
+      setSaveMessage('Failed to save mappings')
+    }
+    setTimeout(() => {
+      setSaveStatus('idle')
+      setSaveMessage('')
+    }, 5000)
+  }
+
+  // Define predefined mapping targets (like kitchen app)
+  const mappingTargets = [
+    { key: 'booking_number', label: 'Hotel Booking #', hint: 'Hotel booking reference number from Resos custom field' },
+    { key: 'hotel_guest', label: 'Hotel Guest', hint: 'Yes/No field indicating if diner is a hotel guest' },
+    { key: 'dbb', label: 'DBB (Dinner B&B)', hint: 'Yes/No field indicating Dinner Bed & Breakfast package guests' },
+    { key: 'package', label: 'Package', hint: 'Yes/No field indicating package deal bookings' },
+    { key: 'group_exclude', label: 'Group/Exclude', hint: 'Free-text field for group codes and exclusions (e.g., "#12345,NOT-#56789")' },
+    { key: 'allergies', label: 'Allergies', hint: 'Multi-select or text field with allergy information' },
+  ]
+
+  return (
+    <div style={styles.subsection}>
+      <h3 style={styles.subsectionTitle}>Custom Field Mapping</h3>
+      <p style={styles.hint}>
+        Map Resos custom fields to booking data fields. Fetch custom fields first, then select which Resos field maps to each target.
+      </p>
+
+      <div style={styles.buttonRow}>
+        <button
+          onClick={handleFetch}
+          disabled={fetchStatus === 'fetching'}
+          style={mergeStyles(
+            buttonStyle('outline'),
+            fetchStatus === 'success' ? { borderColor: colors.success, color: colors.success } : {},
+            fetchStatus === 'error' ? { borderColor: colors.error, color: colors.error } : {}
+          )}
+        >
+          {fetchStatus === 'fetching' ? 'Fetching...' : 'Fetch Custom Fields'}
+        </button>
+        {customFields && customFields.length > 0 && (
+          <span style={styles.glAccountCount}>{customFields.length} fields loaded</span>
+        )}
+      </div>
+
+      {fetchMessage && (
+        <div style={{
+          ...styles.statusMessage,
+          background: fetchStatus === 'success' ? colors.successBg : colors.errorBg,
+          color: fetchStatus === 'success' ? colors.success : colors.error,
+          marginTop: spacing.sm,
+        }}>
+          {fetchMessage}
+        </div>
+      )}
+
+      {isLoading ? (
+        <div style={styles.loading}>Loading custom fields...</div>
+      ) : customFields && customFields.length > 0 ? (
+        <>
+          <div style={{ marginTop: spacing.lg, display: 'flex', flexDirection: 'column', gap: spacing.md }}>
+            {mappingTargets.map((target) => (
+              <div key={target.key} style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: spacing.xs,
+              }}>
+                <label style={{
+                  fontWeight: typography.medium,
+                  color: colors.text,
+                  fontSize: typography.sm
+                }}>
+                  {target.label}
+                </label>
+                <select
+                  value={customFieldMapping[target.key] || ''}
+                  onChange={(e) => setCustomFieldMapping({
+                    ...customFieldMapping,
+                    [target.key]: e.target.value
+                  })}
+                  style={styles.select}
+                >
+                  <option value="">-- Select Field --</option>
+                  {customFields.map((field) => (
+                    <option key={field.id} value={field.id}>
+                      {field.name} ({field.type})
+                    </option>
+                  ))}
+                </select>
+                <small style={{
+                  ...styles.hint,
+                  marginTop: 0,
+                  fontSize: typography.xs
+                }}>
+                  {target.hint}
+                </small>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ ...styles.buttonRow, marginTop: spacing.lg }}>
+            <button
+              onClick={handleSaveMappings}
+              disabled={saveStatus === 'saving'}
+              style={mergeStyles(
+                buttonStyle('primary'),
+                saveStatus === 'success' ? { background: colors.success } : {},
+                saveStatus === 'error' ? { background: colors.error } : {}
+              )}
+            >
+              {saveStatus === 'saving' ? 'Saving...' :
+               saveStatus === 'success' ? 'Saved!' :
+               saveStatus === 'error' ? 'Error' : 'Save Mappings'}
+            </button>
+          </div>
+
+          {saveMessage && (
+            <div style={{
+              ...styles.statusMessage,
+              background: saveStatus === 'success' ? colors.successBg : colors.errorBg,
+              color: saveStatus === 'success' ? colors.success : colors.error,
+              marginTop: spacing.sm,
+            }}>
+              {saveMessage}
+            </div>
+          )}
+        </>
+      ) : (
+        <div style={styles.emptyState}>
+          No custom fields loaded. Click "Fetch Custom Fields" to load from Resos.
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ============================================
+// RESOS OPENING HOURS MAPPING SECTION
+// ============================================
+
+const ResosOpeningHoursMappingSection: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [fetchStatus, setFetchStatus] = useState<'idle' | 'fetching' | 'success' | 'error'>('idle')
+  const [fetchMessage, setFetchMessage] = useState('')
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
+  const [saveMessage, setSaveMessage] = useState('')
+  const [mappings, setMappings] = useState<Record<string, OpeningHourMapping>>({})
+
+  const { data: openingHours, isLoading } = useQuery<ResosOpeningHour[]>({
+    queryKey: ['resos-opening-hours-list'],
+    queryFn: async () => {
+      const response = await fetch('/api/resos/opening-hours', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+  })
+
+  const { data: existingMappings } = useQuery<OpeningHourMapping[]>({
+    queryKey: ['resos-opening-hours-mapping'],
+    queryFn: async () => {
+      const response = await fetch('/api/resos/opening-hours-mapping', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+  })
+
+  React.useEffect(() => {
+    if (existingMappings) {
+      const mappingObj: Record<string, OpeningHourMapping> = {}
+      existingMappings.forEach(m => {
+        mappingObj[m.opening_hour_id] = m
+      })
+      setMappings(mappingObj)
+    }
+  }, [existingMappings])
+
+  const handleFetch = async () => {
+    setFetchStatus('fetching')
+    setFetchMessage('')
+    try {
+      const response = await fetch('/api/resos/opening-hours', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      const data = await response.json()
+      if (response.ok) {
+        setFetchStatus('success')
+        setFetchMessage('Opening hours fetched successfully')
+        queryClient.invalidateQueries({ queryKey: ['resos-opening-hours-list'] })
+      } else {
+        setFetchStatus('error')
+        setFetchMessage(data.detail || 'Failed to fetch opening hours')
+      }
+    } catch {
+      setFetchStatus('error')
+      setFetchMessage('Failed to fetch opening hours')
+    }
+    setTimeout(() => {
+      setFetchStatus('idle')
+      setFetchMessage('')
+    }, 5000)
+  }
+
+  const handleMappingChange = (hourId: string, periodType: string) => {
+    setMappings(prev => ({
+      ...prev,
+      [hourId]: {
+        opening_hour_id: hourId,
+        period_type: periodType,
+        display_name: prev[hourId]?.display_name
+      }
+    }))
+  }
+
+  const handleDisplayNameChange = (hourId: string, displayName: string) => {
+    setMappings(prev => ({
+      ...prev,
+      [hourId]: {
+        ...prev[hourId],
+        opening_hour_id: hourId,
+        period_type: prev[hourId]?.period_type || 'ignore',
+        display_name: displayName || undefined
+      }
+    }))
+  }
+
+  const handleSaveMappings = async () => {
+    setSaveStatus('saving')
+    setSaveMessage('')
+    try {
+      const mappingsArray = Object.values(mappings).filter(m => m.period_type !== 'ignore')
+      const response = await fetch('/api/resos/opening-hours-mapping', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ mappings: mappingsArray })
+      })
+      if (response.ok) {
+        setSaveStatus('success')
+        setSaveMessage('Mappings saved successfully')
+        queryClient.invalidateQueries({ queryKey: ['resos-opening-hours-mapping'] })
+      } else {
+        const data = await response.json()
+        setSaveStatus('error')
+        setSaveMessage(data.detail || 'Failed to save mappings')
+      }
+    } catch {
+      setSaveStatus('error')
+      setSaveMessage('Failed to save mappings')
+    }
+    setTimeout(() => {
+      setSaveStatus('idle')
+      setSaveMessage('')
+    }, 5000)
+  }
+
+  return (
+    <div style={styles.subsection}>
+      <h3 style={styles.subsectionTitle}>Opening Hours Mapping</h3>
+      <p style={styles.hint}>
+        Map Resos opening hours to meal periods. Fetch opening hours first, then assign period types.
+      </p>
+
+      <div style={styles.buttonRow}>
+        <button
+          onClick={handleFetch}
+          disabled={fetchStatus === 'fetching'}
+          style={mergeStyles(
+            buttonStyle('outline'),
+            fetchStatus === 'success' ? { borderColor: colors.success, color: colors.success } : {},
+            fetchStatus === 'error' ? { borderColor: colors.error, color: colors.error } : {}
+          )}
+        >
+          {fetchStatus === 'fetching' ? 'Fetching...' : 'Fetch Opening Hours'}
+        </button>
+        {openingHours && openingHours.length > 0 && (
+          <span style={styles.glAccountCount}>{openingHours.length} hours loaded</span>
+        )}
+      </div>
+
+      {fetchMessage && (
+        <div style={{
+          ...styles.statusMessage,
+          background: fetchStatus === 'success' ? colors.successBg : colors.errorBg,
+          color: fetchStatus === 'success' ? colors.success : colors.error,
+          marginTop: spacing.sm,
+        }}>
+          {fetchMessage}
+        </div>
+      )}
+
+      {isLoading ? (
+        <div style={styles.loading}>Loading opening hours...</div>
+      ) : openingHours && openingHours.length > 0 ? (
+        <>
+          <div style={{ marginTop: spacing.lg }}>
+            {openingHours.map((hour) => {
+              const mapping = mappings[hour.id]
+              const periodType = mapping?.period_type || 'ignore'
+
+              return (
+                <div key={hour.id} style={{
+                  display: 'grid',
+                  gridTemplateColumns: '2fr 2fr 2fr',
+                  gap: spacing.md,
+                  marginBottom: spacing.md,
+                  alignItems: 'center',
+                  padding: spacing.sm,
+                  background: colors.background,
+                  borderRadius: radius.md,
+                  border: `1px solid ${colors.borderLight}`,
+                }}>
+                  <div>
+                    <div style={{ fontWeight: typography.medium, color: colors.text }}>
+                      {hour.name}
+                    </div>
+                    <div style={{ fontSize: typography.xs, color: colors.textMuted }}>
+                      {hour.start_time} - {hour.end_time}
+                    </div>
+                  </div>
+                  <select
+                    value={periodType}
+                    onChange={(e) => handleMappingChange(hour.id, e.target.value)}
+                    style={styles.select}
+                  >
+                    <option value="ignore">Ignore</option>
+                    <option value="breakfast">Breakfast</option>
+                    <option value="lunch">Lunch</option>
+                    <option value="afternoon">Afternoon</option>
+                    <option value="dinner">Dinner</option>
+                    <option value="other">Other</option>
+                  </select>
+                  <input
+                    type="text"
+                    value={mapping?.display_name || ''}
+                    onChange={(e) => handleDisplayNameChange(hour.id, e.target.value)}
+                    placeholder="Display name (optional)"
+                    style={styles.input}
+                    disabled={periodType === 'ignore'}
+                  />
+                </div>
+              )
+            })}
+          </div>
+
+          <div style={styles.buttonRow}>
+            <button
+              onClick={handleSaveMappings}
+              disabled={saveStatus === 'saving'}
+              style={mergeStyles(
+                buttonStyle('primary'),
+                saveStatus === 'success' ? { background: colors.success } : {},
+                saveStatus === 'error' ? { background: colors.error } : {}
+              )}
+            >
+              {saveStatus === 'saving' ? 'Saving...' :
+               saveStatus === 'success' ? 'Saved!' :
+               saveStatus === 'error' ? 'Error' : 'Save Mappings'}
+            </button>
+          </div>
+
+          {saveMessage && (
+            <div style={{
+              ...styles.statusMessage,
+              background: saveStatus === 'success' ? colors.successBg : colors.errorBg,
+              color: saveStatus === 'success' ? colors.success : colors.error,
+              marginTop: spacing.sm,
+            }}>
+              {saveMessage}
+            </div>
+          )}
+        </>
+      ) : (
+        <div style={styles.emptyState}>
+          No opening hours loaded. Click "Fetch Opening Hours" to load from Resos.
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ============================================
+// RESOS MANUAL BREAKFAST CONFIGURATION SECTION
+// ============================================
+
+const ResosManualBreakfastSection: React.FC = () => {
+  const [enabled, setEnabled] = useState(false)
+  const [periods, setPeriods] = useState<ManualBreakfastPeriod[]>([
+    { day_of_week: 1, start_time: '07:00', end_time: '10:00', is_active: true },
+    { day_of_week: 2, start_time: '07:00', end_time: '10:00', is_active: true },
+    { day_of_week: 3, start_time: '07:00', end_time: '10:00', is_active: true },
+    { day_of_week: 4, start_time: '07:00', end_time: '10:00', is_active: true },
+    { day_of_week: 5, start_time: '07:00', end_time: '10:00', is_active: true },
+    { day_of_week: 6, start_time: '08:00', end_time: '11:00', is_active: true },
+    { day_of_week: 0, start_time: '08:00', end_time: '11:00', is_active: true },
+  ])
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
+  const [saveMessage, setSaveMessage] = useState('')
+
+  const { data: existingPeriods, isLoading } = useQuery<{ enabled: boolean; periods: ManualBreakfastPeriod[] }>({
+    queryKey: ['resos-manual-breakfast'],
+    queryFn: async () => {
+      const response = await fetch('/api/resos/manual-breakfast-periods', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return { enabled: false, periods: [] }
+      return response.json()
+    },
+  })
+
+  React.useEffect(() => {
+    if (existingPeriods && existingPeriods.periods.length > 0) {
+      setEnabled(existingPeriods.enabled)
+      setPeriods(existingPeriods.periods)
+    }
+  }, [existingPeriods])
+
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+  const handlePeriodChange = (index: number, field: keyof ManualBreakfastPeriod, value: string | boolean) => {
+    const newPeriods = [...periods]
+    newPeriods[index] = { ...newPeriods[index], [field]: value }
+    setPeriods(newPeriods)
+  }
+
+  const handleSave = async () => {
+    setSaveStatus('saving')
+    setSaveMessage('')
+    try {
+      const response = await fetch('/api/resos/manual-breakfast-periods', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ enabled, periods })
+      })
+      if (response.ok) {
+        setSaveStatus('success')
+        setSaveMessage('Manual breakfast configuration saved successfully')
+      } else {
+        const data = await response.json()
+        setSaveStatus('error')
+        setSaveMessage(data.detail || 'Failed to save configuration')
+      }
+    } catch {
+      setSaveStatus('error')
+      setSaveMessage('Failed to save configuration')
+    }
+    setTimeout(() => {
+      setSaveStatus('idle')
+      setSaveMessage('')
+    }, 5000)
+  }
+
+  if (isLoading) {
+    return <div style={styles.loading}>Loading manual breakfast configuration...</div>
+  }
+
+  return (
+    <div style={styles.subsection}>
+      <h3 style={styles.subsectionTitle}>Manual Breakfast Configuration</h3>
+      <p style={styles.hint}>
+        Configure breakfast periods manually instead of using Resos opening hours. Useful for custom scheduling.
+      </p>
+
+      <label style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: spacing.sm,
+        marginBottom: spacing.lg,
+        cursor: 'pointer',
+      }}>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+          style={styles.checkbox}
+        />
+        <span style={{ fontWeight: typography.medium, color: colors.text }}>
+          Enable manual breakfast configuration
+        </span>
+      </label>
+
+      {enabled && (
+        <>
+          <div style={{ marginBottom: spacing.lg }}>
+            {periods.map((period, index) => (
+              <div key={period.day_of_week} style={{
+                display: 'grid',
+                gridTemplateColumns: '150px 120px 120px 100px',
+                gap: spacing.md,
+                marginBottom: spacing.sm,
+                alignItems: 'center',
+                padding: spacing.sm,
+                background: colors.background,
+                borderRadius: radius.md,
+                border: `1px solid ${colors.borderLight}`,
+              }}>
+                <div style={{ fontWeight: typography.medium, color: colors.text }}>
+                  {dayNames[period.day_of_week]}
+                </div>
+                <input
+                  type="time"
+                  value={period.start_time}
+                  onChange={(e) => handlePeriodChange(index, 'start_time', e.target.value)}
+                  style={styles.input}
+                  disabled={!period.is_active}
+                />
+                <input
+                  type="time"
+                  value={period.end_time}
+                  onChange={(e) => handlePeriodChange(index, 'end_time', e.target.value)}
+                  style={styles.input}
+                  disabled={!period.is_active}
+                />
+                <label style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: spacing.xs,
+                  cursor: 'pointer',
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={period.is_active}
+                    onChange={(e) => handlePeriodChange(index, 'is_active', e.target.checked)}
+                    style={styles.checkbox}
+                  />
+                  <span style={{ fontSize: typography.sm, color: colors.text }}>Active</span>
+                </label>
+              </div>
+            ))}
+          </div>
+
+          <div style={styles.buttonRow}>
+            <button
+              onClick={handleSave}
+              disabled={saveStatus === 'saving'}
+              style={mergeStyles(
+                buttonStyle('primary'),
+                saveStatus === 'success' ? { background: colors.success } : {},
+                saveStatus === 'error' ? { background: colors.error } : {}
+              )}
+            >
+              {saveStatus === 'saving' ? 'Saving...' :
+               saveStatus === 'success' ? 'Saved!' :
+               saveStatus === 'error' ? 'Error' : 'Save Configuration'}
+            </button>
+          </div>
+
+          {saveMessage && (
+            <div style={{
+              ...styles.statusMessage,
+              background: saveStatus === 'success' ? colors.successBg : colors.errorBg,
+              color: saveStatus === 'success' ? colors.success : colors.error,
+              marginTop: spacing.sm,
+            }}>
+              {saveMessage}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ============================================
+// RESOS AVERAGE SPEND CONFIGURATION SECTION
+// ============================================
+
+const ResosAverageSpendSection: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [breakfastFoodSpend, setBreakfastFoodSpend] = useState('')
+  const [breakfastDrinksSpend, setBreakfastDrinksSpend] = useState('')
+  const [lunchFoodSpend, setLunchFoodSpend] = useState('')
+  const [lunchDrinksSpend, setLunchDrinksSpend] = useState('')
+  const [dinnerFoodSpend, setDinnerFoodSpend] = useState('')
+  const [dinnerDrinksSpend, setDinnerDrinksSpend] = useState('')
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
+  const [saveMessage, setSaveMessage] = useState('')
+
+  const { data: spendSettings, isLoading } = useQuery({
+    queryKey: ['resos-average-spend'],
+    queryFn: async () => {
+      const response = await fetch('/api/resos/average-spend', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return null
+      return response.json()
+    },
+  })
+
+  // Update local state when settings load
+  React.useEffect(() => {
+    if (spendSettings) {
+      setBreakfastFoodSpend(spendSettings.breakfast_food_spend?.toString() || '')
+      setBreakfastDrinksSpend(spendSettings.breakfast_drinks_spend?.toString() || '')
+      setLunchFoodSpend(spendSettings.lunch_food_spend?.toString() || '')
+      setLunchDrinksSpend(spendSettings.lunch_drinks_spend?.toString() || '')
+      setDinnerFoodSpend(spendSettings.dinner_food_spend?.toString() || '')
+      setDinnerDrinksSpend(spendSettings.dinner_drinks_spend?.toString() || '')
+    }
+  }, [spendSettings])
+
+  const handleSave = async () => {
+    setSaveStatus('saving')
+    setSaveMessage('')
+    try {
+      const response = await fetch('/api/resos/average-spend', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({
+          breakfast_food_spend: parseFloat(breakfastFoodSpend) || 0,
+          breakfast_drinks_spend: parseFloat(breakfastDrinksSpend) || 0,
+          lunch_food_spend: parseFloat(lunchFoodSpend) || 0,
+          lunch_drinks_spend: parseFloat(lunchDrinksSpend) || 0,
+          dinner_food_spend: parseFloat(dinnerFoodSpend) || 0,
+          dinner_drinks_spend: parseFloat(dinnerDrinksSpend) || 0
+        })
+      })
+      if (response.ok) {
+        setSaveStatus('success')
+        setSaveMessage('Average spend settings saved successfully')
+        queryClient.invalidateQueries({ queryKey: ['resos-average-spend'] })
+      } else {
+        const data = await response.json()
+        setSaveStatus('error')
+        setSaveMessage(data.detail || 'Failed to save settings')
+      }
+    } catch {
+      setSaveStatus('error')
+      setSaveMessage('Failed to save settings')
+    }
+    setTimeout(() => {
+      setSaveStatus('idle')
+      setSaveMessage('')
+    }, 3000)
+  }
+
+  return (
+    <div style={styles.subsection}>
+      <h3 style={styles.subsectionTitle}>Average Spend per Cover (Gross inc VAT)</h3>
+      <p style={styles.hint}>
+        Configure average spend values per cover for revenue forecasting. Enter gross amounts (including VAT) - the system will calculate net revenue at 20% VAT automatically. These are interim values until till integration provides live data.
+      </p>
+
+      {isLoading ? (
+        <div style={styles.loading}>Loading settings...</div>
+      ) : (
+        <>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, 1fr)',
+            gap: spacing.lg,
+            marginBottom: spacing.lg,
+          }}>
+            {/* Breakfast Section */}
+            <div style={{
+              padding: spacing.md,
+              background: colors.background,
+              borderRadius: radius.md,
+              border: `1px solid ${colors.borderLight}`,
+            }}>
+              <h4 style={{ margin: 0, marginBottom: spacing.md, fontSize: typography.base, fontWeight: typography.medium }}>
+                Breakfast
+              </h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm }}>
+                <label style={styles.label}>
+                  <span>Food Spend (£)</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={breakfastFoodSpend}
+                    onChange={(e) => setBreakfastFoodSpend(e.target.value)}
+                    placeholder="e.g. 15.00"
+                    style={styles.input}
+                  />
+                </label>
+                <label style={styles.label}>
+                  <span>Drinks Spend (£)</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={breakfastDrinksSpend}
+                    onChange={(e) => setBreakfastDrinksSpend(e.target.value)}
+                    placeholder="e.g. 5.00"
+                    style={styles.input}
+                  />
+                </label>
+              </div>
+            </div>
+
+            {/* Lunch Section */}
+            <div style={{
+              padding: spacing.md,
+              background: colors.background,
+              borderRadius: radius.md,
+              border: `1px solid ${colors.borderLight}`,
+            }}>
+              <h4 style={{ margin: 0, marginBottom: spacing.md, fontSize: typography.base, fontWeight: typography.medium }}>
+                Lunch
+              </h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm }}>
+                <label style={styles.label}>
+                  <span>Food Spend (£)</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={lunchFoodSpend}
+                    onChange={(e) => setLunchFoodSpend(e.target.value)}
+                    placeholder="e.g. 25.00"
+                    style={styles.input}
+                  />
+                </label>
+                <label style={styles.label}>
+                  <span>Drinks Spend (£)</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={lunchDrinksSpend}
+                    onChange={(e) => setLunchDrinksSpend(e.target.value)}
+                    placeholder="e.g. 12.00"
+                    style={styles.input}
+                  />
+                </label>
+              </div>
+            </div>
+
+            {/* Dinner Section */}
+            <div style={{
+              padding: spacing.md,
+              background: colors.background,
+              borderRadius: radius.md,
+              border: `1px solid ${colors.borderLight}`,
+            }}>
+              <h4 style={{ margin: 0, marginBottom: spacing.md, fontSize: typography.base, fontWeight: typography.medium }}>
+                Dinner
+              </h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: spacing.sm }}>
+                <label style={styles.label}>
+                  <span>Food Spend (£)</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={dinnerFoodSpend}
+                    onChange={(e) => setDinnerFoodSpend(e.target.value)}
+                    placeholder="e.g. 45.00"
+                    style={styles.input}
+                  />
+                </label>
+                <label style={styles.label}>
+                  <span>Drinks Spend (£)</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={dinnerDrinksSpend}
+                    onChange={(e) => setDinnerDrinksSpend(e.target.value)}
+                    placeholder="e.g. 20.00"
+                    style={styles.input}
+                  />
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div style={styles.buttonRow}>
+            <button
+              onClick={handleSave}
+              disabled={saveStatus === 'saving'}
+              style={mergeStyles(
+                buttonStyle('primary'),
+                saveStatus === 'success' ? { background: colors.success } : {},
+                saveStatus === 'error' ? { background: colors.error } : {}
+              )}
+            >
+              {saveStatus === 'saving' ? 'Saving...' :
+               saveStatus === 'success' ? 'Saved!' :
+               saveStatus === 'error' ? 'Error' : 'Save Settings'}
+            </button>
+          </div>
+
+          {saveMessage && (
+            <div style={{
+              ...styles.statusMessage,
+              background: saveStatus === 'success' ? colors.successBg : colors.errorBg,
+              color: saveStatus === 'success' ? colors.success : colors.error,
+              marginTop: spacing.sm,
+            }}>
+              {saveMessage}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ============================================
+// RESOS SYNC CONFIGURATION SECTION
+// ============================================
+
+const ResosSyncConfigSection: React.FC = () => {
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState(false)
+  const [syncTime, setSyncTime] = useState('03:00')
+  const [fromDate, setFromDate] = useState('')
+  const [toDate, setToDate] = useState('')
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
+  const [saveMessage, setSaveMessage] = useState('')
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'success' | 'error'>('idle')
+  const [syncMessage, setSyncMessage] = useState('')
+
+  const { data: syncConfig, isLoading: configLoading } = useQuery({
+    queryKey: ['resos-sync-config'],
+    queryFn: async () => {
+      const response = await fetch('/api/sync/resos-bookings/config', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return null
+      return response.json()
+    },
+  })
+
+  const { data: lastSyncStatus, refetch: refetchStatus } = useQuery<SyncStatus>({
+    queryKey: ['resos-sync-status'],
+    queryFn: async () => {
+      const response = await fetch('/api/sync/resos-bookings/status', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return {}
+      return response.json()
+    },
+    refetchInterval: 30000,
+  })
+
+  React.useEffect(() => {
+    if (syncConfig) {
+      setAutoSyncEnabled(syncConfig.auto_sync_enabled || false)
+      setSyncTime(syncConfig.sync_time || '03:00')
+    }
+  }, [syncConfig])
+
+  React.useEffect(() => {
+    const today = new Date()
+    const sevenDaysAgo = new Date(today)
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+
+    setFromDate(sevenDaysAgo.toISOString().split('T')[0])
+    setToDate(today.toISOString().split('T')[0])
+  }, [])
+
+  const handleSaveConfig = async () => {
+    setSaveStatus('saving')
+    setSaveMessage('')
+    try {
+      const response = await fetch('/api/sync/resos-bookings/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({
+          auto_sync_enabled: autoSyncEnabled,
+          sync_time: syncTime
+        })
+      })
+      if (response.ok) {
+        setSaveStatus('success')
+        setSaveMessage('Sync configuration saved successfully')
+      } else {
+        const data = await response.json()
+        setSaveStatus('error')
+        setSaveMessage(data.detail || 'Failed to save configuration')
+      }
+    } catch {
+      setSaveStatus('error')
+      setSaveMessage('Failed to save configuration')
+    }
+    setTimeout(() => {
+      setSaveStatus('idle')
+      setSaveMessage('')
+    }, 5000)
+  }
+
+  const handleTriggerSync = async () => {
+    setSyncStatus('syncing')
+    setSyncMessage('')
+    try {
+      // Build query params with from_date and to_date
+      const params = new URLSearchParams()
+      if (fromDate) params.append('from_date', fromDate)
+      if (toDate) params.append('to_date', toDate)
+
+      const response = await fetch(`/api/sync/resos-bookings/sync?${params.toString()}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        }
+      })
+      const data = await response.json()
+      if (response.ok) {
+        setSyncStatus('success')
+        setSyncMessage(data.message || 'Sync triggered successfully')
+        refetchStatus()
+      } else {
+        setSyncStatus('error')
+        setSyncMessage(data.detail || 'Failed to trigger sync')
+      }
+    } catch {
+      setSyncStatus('error')
+      setSyncMessage('Failed to trigger sync')
+    }
+    setTimeout(() => {
+      setSyncStatus('idle')
+      setSyncMessage('')
+    }, 5000)
+  }
+
+  if (configLoading) {
+    return <div style={styles.loading}>Loading sync configuration...</div>
+  }
+
+  return (
+    <div style={styles.subsection}>
+      <h3 style={styles.subsectionTitle}>Sync Configuration</h3>
+      <p style={styles.hint}>
+        Configure automatic synchronization or trigger manual syncs of booking data from Resos.
+      </p>
+
+      <div style={{ marginBottom: spacing.lg }}>
+        <h4 style={{ ...styles.subsectionTitle, fontSize: typography.base, marginBottom: spacing.md }}>
+          Automatic Sync
+        </h4>
+
+        <label style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: spacing.sm,
+          marginBottom: spacing.md,
+          cursor: 'pointer',
+        }}>
+          <input
+            type="checkbox"
+            checked={autoSyncEnabled}
+            onChange={(e) => setAutoSyncEnabled(e.target.checked)}
+            style={styles.checkbox}
+          />
+          <span style={{ fontWeight: typography.medium, color: colors.text }}>
+            Enable automatic sync
+          </span>
+        </label>
+
+        {autoSyncEnabled && (
+          <label style={styles.label}>
+            <span>Sync Time (HH:MM)</span>
+            <input
+              type="time"
+              value={syncTime}
+              onChange={(e) => setSyncTime(e.target.value)}
+              style={{ ...styles.input, maxWidth: '200px' }}
+            />
+          </label>
+        )}
+
+        <div style={styles.buttonRow}>
+          <button
+            onClick={handleSaveConfig}
+            disabled={saveStatus === 'saving'}
+            style={mergeStyles(
+              buttonStyle('primary'),
+              saveStatus === 'success' ? { background: colors.success } : {},
+              saveStatus === 'error' ? { background: colors.error } : {}
+            )}
+          >
+            {saveStatus === 'saving' ? 'Saving...' :
+             saveStatus === 'success' ? 'Saved!' :
+             saveStatus === 'error' ? 'Error' : 'Save Configuration'}
+          </button>
+        </div>
+
+        {saveMessage && (
+          <div style={{
+            ...styles.statusMessage,
+            background: saveStatus === 'success' ? colors.successBg : colors.errorBg,
+            color: saveStatus === 'success' ? colors.success : colors.error,
+            marginTop: spacing.sm,
+          }}>
+            {saveMessage}
+          </div>
+        )}
+      </div>
+
+      <div style={styles.divider} />
+
+      <div style={{ marginTop: spacing.lg }}>
+        <h4 style={{ ...styles.subsectionTitle, fontSize: typography.base, marginBottom: spacing.md }}>
+          Manual Sync
+        </h4>
+
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+          gap: spacing.md,
+          marginBottom: spacing.md,
+        }}>
+          <label style={styles.label}>
+            <span>From Date</span>
+            <input
+              type="date"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+              style={styles.input}
+            />
+          </label>
+          <label style={styles.label}>
+            <span>To Date</span>
+            <input
+              type="date"
+              value={toDate}
+              onChange={(e) => setToDate(e.target.value)}
+              style={styles.input}
+            />
+          </label>
+        </div>
+
+        <div style={styles.buttonRow}>
+          <button
+            onClick={handleTriggerSync}
+            disabled={syncStatus === 'syncing'}
+            style={mergeStyles(
+              buttonStyle('outline'),
+              syncStatus === 'success' ? { borderColor: colors.success, color: colors.success } : {},
+              syncStatus === 'error' ? { borderColor: colors.error, color: colors.error } : {}
+            )}
+          >
+            {syncStatus === 'syncing' ? 'Syncing...' : 'Trigger Sync'}
+          </button>
+        </div>
+
+        {syncMessage && (
+          <div style={{
+            ...styles.statusMessage,
+            background: syncStatus === 'success' ? colors.successBg : colors.errorBg,
+            color: syncStatus === 'success' ? colors.success : colors.error,
+            marginTop: spacing.sm,
+          }}>
+            {syncMessage}
+          </div>
+        )}
+
+        {lastSyncStatus && lastSyncStatus.last_sync && (
+          <div style={{
+            marginTop: spacing.lg,
+            padding: spacing.md,
+            background: colors.background,
+            borderRadius: radius.md,
+            border: `1px solid ${colors.borderLight}`,
+          }}>
+            <h4 style={{ fontSize: typography.sm, fontWeight: typography.medium, marginBottom: spacing.sm, color: colors.text }}>
+              Last Sync Status
+            </h4>
+            <div style={{ fontSize: typography.sm, color: colors.textSecondary }}>
+              <div style={{ marginBottom: spacing.xs }}>
+                <strong>Time:</strong> {lastSyncStatus.last_sync.completed_at
+                  ? new Date(lastSyncStatus.last_sync.completed_at).toLocaleString()
+                  : lastSyncStatus.last_sync.started_at
+                    ? new Date(lastSyncStatus.last_sync.started_at).toLocaleString()
+                    : 'N/A'}
+              </div>
+              {lastSyncStatus.last_sync.status && (
+                <div style={{ marginBottom: spacing.xs }}>
+                  <strong>Status:</strong>{' '}
+                  <span style={{
+                    color: lastSyncStatus.last_sync.status === 'success' ? colors.success : colors.error
+                  }}>
+                    {lastSyncStatus.last_sync.status}
+                  </span>
+                </div>
+              )}
+              {lastSyncStatus.last_sync.error_message && (
+                <div>
+                  <strong>Message:</strong> {lastSyncStatus.last_sync.error_message}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -2393,669 +4213,6 @@ const SpecialDatesPage: React.FC = () => {
 }
 
 // ============================================
-// TFT TRAINING PAGE
-// ============================================
-
-interface TFTSettings {
-  encoder_length: number
-  prediction_length: number
-  hidden_size: number
-  attention_heads: number
-  learning_rate: number
-  batch_size: number
-  max_epochs: number
-  training_days: number
-  dropout: number
-  use_gpu: boolean
-  auto_retrain: boolean
-  use_cached_model: boolean
-  use_special_dates: boolean
-  use_otb_data: boolean
-  early_stop_patience: number
-  early_stop_min_delta: number
-  cpu_threads: number
-}
-
-interface TFTModel {
-  id: number
-  metric_code: string
-  model_name: string
-  file_path: string | null
-  file_size_bytes: number | null
-  trained_at: string
-  training_config: Record<string, number | boolean>
-  training_time_seconds: number | null
-  validation_loss: number | null
-  epochs_completed: number | null
-  is_active: boolean
-  created_by: string | null
-  notes: string | null
-}
-
-interface TrainingJob {
-  job_id: string
-  metric_code: string
-  status: 'pending' | 'running' | 'completed' | 'failed'
-  started_at: string | null
-  completed_at: string | null
-  progress_pct: number
-  current_epoch: number
-  total_epochs: number
-  error_message: string | null
-}
-
-const TFTTrainingPage: React.FC = () => {
-  const queryClient = useQueryClient()
-  const [settings, setSettings] = useState<TFTSettings | null>(null)
-  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
-  const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
-  const [selectedMetric, setSelectedMetric] = useState('hotel_occupancy_pct')
-  const [modelName, setModelName] = useState('')
-  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle')
-  const [uploadMessage, setUploadMessage] = useState('')
-  const fileInputRef = React.useRef<HTMLInputElement>(null)
-
-  // Fetch TFT settings
-  const { data: settingsData, isLoading: settingsLoading } = useQuery<TFTSettings>({
-    queryKey: ['tft-settings'],
-    queryFn: async () => {
-      const response = await fetch('/api/config/tft-settings', {
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-      })
-      if (!response.ok) throw new Error('Failed to fetch settings')
-      return response.json()
-    },
-  })
-
-  // Fetch TFT models
-  const { data: models, isLoading: modelsLoading, refetch: refetchModels } = useQuery<TFTModel[]>({
-    queryKey: ['tft-models'],
-    queryFn: async () => {
-      const response = await fetch('/api/config/tft-models', {
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-      })
-      if (!response.ok) return []
-      return response.json()
-    },
-  })
-
-  // Update local state when settings load
-  React.useEffect(() => {
-    if (settingsData) {
-      setSettings(settingsData)
-    }
-  }, [settingsData])
-
-  // Poll training job status
-  React.useEffect(() => {
-    if (trainingJob && ['pending', 'running'].includes(trainingJob.status)) {
-      const interval = setInterval(async () => {
-        try {
-          const response = await fetch(`/api/config/tft-models/training-status/${trainingJob.job_id}`, {
-            headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-          })
-          if (response.ok) {
-            const job: TrainingJob = await response.json()
-            setTrainingJob(job)
-            if (['completed', 'failed'].includes(job.status)) {
-              clearInterval(interval)
-              refetchModels()
-            }
-          }
-        } catch {
-          // Ignore polling errors
-        }
-      }, 2000)
-      return () => clearInterval(interval)
-    }
-  }, [trainingJob, refetchModels])
-
-  // Save settings
-  const handleSaveSettings = async () => {
-    if (!settings) return
-    setSaveStatus('saving')
-    try {
-      const response = await fetch('/api/config/tft-settings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${localStorage.getItem('token')}`
-        },
-        body: JSON.stringify(settings)
-      })
-      if (response.ok) {
-        setSaveStatus('saved')
-        queryClient.invalidateQueries({ queryKey: ['tft-settings'] })
-        setTimeout(() => setSaveStatus('idle'), 2000)
-      } else {
-        setSaveStatus('error')
-        setTimeout(() => setSaveStatus('idle'), 3000)
-      }
-    } catch {
-      setSaveStatus('error')
-      setTimeout(() => setSaveStatus('idle'), 3000)
-    }
-  }
-
-  // Start training
-  const handleStartTraining = async () => {
-    try {
-      const name = modelName || `model_${new Date().toISOString().slice(0, 10)}`
-      const response = await fetch('/api/config/tft-models/train', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${localStorage.getItem('token')}`
-        },
-        body: JSON.stringify({ metric_code: selectedMetric, model_name: name })
-      })
-      if (response.ok) {
-        const data = await response.json()
-        setTrainingJob({
-          job_id: data.job_id,
-          metric_code: selectedMetric,
-          status: 'pending',
-          started_at: null,
-          completed_at: null,
-          progress_pct: 0,
-          current_epoch: 0,
-          total_epochs: settings?.max_epochs || 100,
-          error_message: null
-        })
-        setModelName('')
-      }
-    } catch (err) {
-      console.error('Failed to start training', err)
-    }
-  }
-
-  // Download model
-  const handleDownloadModel = async (model: TFTModel) => {
-    try {
-      const response = await fetch(`/api/config/tft-models/${model.id}/download`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-      })
-      if (response.ok) {
-        const blob = await response.blob()
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = `${model.metric_code}_${model.model_name}.pt`
-        a.click()
-        URL.revokeObjectURL(url)
-      }
-    } catch (err) {
-      console.error('Failed to download model', err)
-    }
-  }
-
-  // Upload model
-  const handleUploadModel = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-
-    setUploadStatus('uploading')
-    setUploadMessage('')
-
-    const formData = new FormData()
-    formData.append('file', file)
-    formData.append('metric_code', selectedMetric)
-    formData.append('model_name', modelName || `imported_${new Date().toISOString().slice(0, 10)}`)
-
-    try {
-      const response = await fetch('/api/config/tft-models/upload', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
-        body: formData
-      })
-      if (response.ok) {
-        setUploadStatus('success')
-        setUploadMessage('Model uploaded successfully')
-        refetchModels()
-        setModelName('')
-      } else {
-        const data = await response.json()
-        setUploadStatus('error')
-        setUploadMessage(data.detail || 'Upload failed')
-      }
-    } catch {
-      setUploadStatus('error')
-      setUploadMessage('Upload failed')
-    }
-    setTimeout(() => {
-      setUploadStatus('idle')
-      setUploadMessage('')
-    }, 3000)
-    if (fileInputRef.current) fileInputRef.current.value = ''
-  }
-
-  // Activate model
-  const handleActivateModel = async (model: TFTModel) => {
-    try {
-      await fetch(`/api/config/tft-models/${model.id}/activate`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-      })
-      refetchModels()
-    } catch (err) {
-      console.error('Failed to activate model', err)
-    }
-  }
-
-  // Delete model
-  const handleDeleteModel = async (model: TFTModel) => {
-    if (!confirm(`Delete model "${model.model_name}"?`)) return
-    try {
-      await fetch(`/api/config/tft-models/${model.id}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-      })
-      refetchModels()
-    } catch (err) {
-      console.error('Failed to delete model', err)
-    }
-  }
-
-  const formatBytes = (bytes: number | null) => {
-    if (!bytes) return '-'
-    if (bytes < 1024) return `${bytes} B`
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-  }
-
-  const formatDuration = (seconds: number | null) => {
-    if (!seconds) return '-'
-    if (seconds < 60) return `${seconds}s`
-    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
-  }
-
-  return (
-    <div style={styles.pageContent}>
-      <h2 style={styles.pageTitle}>TFT Model Training</h2>
-      <p style={styles.pageSubtitle}>
-        Configure and train Temporal Fusion Transformer models for forecasting.
-        Trained models can be exported and imported between machines.
-      </p>
-
-      {/* Settings Section */}
-      <div style={styles.subsection}>
-        <h3 style={styles.subsectionTitle}>Training Hyperparameters</h3>
-
-        {settingsLoading ? (
-          <div style={styles.loading}>Loading settings...</div>
-        ) : settings ? (
-          <>
-            <div style={styles.settingsGrid}>
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="How many days of past data the model looks at when making a prediction. Longer = more context but slower training. 90 days captures quarterly patterns.">Encoder Length</label>
-                <input
-                  type="number"
-                  value={settings.encoder_length}
-                  onChange={(e) => setSettings({ ...settings, encoder_length: parseInt(e.target.value) || 60 })}
-                  style={styles.settingInput}
-                  min={30}
-                  max={180}
-                />
-                <span style={styles.settingHint}>Days of historical context</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Size of the neural network's hidden layers. Larger = more capacity to learn complex patterns but requires more data and training time. 64 is a good balance for most datasets.">Hidden Size</label>
-                <select
-                  value={settings.hidden_size}
-                  onChange={(e) => setSettings({ ...settings, hidden_size: parseInt(e.target.value) })}
-                  style={styles.settingSelect}
-                >
-                  <option value={32}>32 (Fast)</option>
-                  <option value={64}>64 (Balanced)</option>
-                  <option value={128}>128 (Accurate)</option>
-                </select>
-                <span style={styles.settingHint}>Model complexity</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Maximum number of training passes through the data. Training will stop earlier if early stopping triggers. Higher values allow more learning but increase training time.">Max Epochs</label>
-                <input
-                  type="number"
-                  value={settings.max_epochs}
-                  onChange={(e) => setSettings({ ...settings, max_epochs: parseInt(e.target.value) || 100 })}
-                  style={styles.settingInput}
-                  min={10}
-                  max={500}
-                />
-                <span style={styles.settingHint}>Training iterations (ceiling)</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Number of epochs to wait for improvement before stopping. Higher values = train longer but risk overfitting. Lower values = stop sooner but might miss optimal performance. 10-20 is typical.">Early Stop Patience</label>
-                <input
-                  type="number"
-                  value={settings.early_stop_patience ?? 10}
-                  onChange={(e) => setSettings({ ...settings, early_stop_patience: parseInt(e.target.value) || 10 })}
-                  style={styles.settingInput}
-                  min={3}
-                  max={50}
-                />
-                <span style={styles.settingHint}>Epochs without improvement before stopping</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Minimum reduction in validation loss to count as improvement. Smaller values = more sensitive to tiny improvements (trains longer). Larger values = only count significant improvements (stops sooner).">Early Stop Min Delta</label>
-                <select
-                  value={settings.early_stop_min_delta ?? 0.0001}
-                  onChange={(e) => setSettings({ ...settings, early_stop_min_delta: parseFloat(e.target.value) })}
-                  style={styles.settingSelect}
-                >
-                  <option value={0.00001}>0.00001 (Very sensitive)</option>
-                  <option value={0.0001}>0.0001 (Default)</option>
-                  <option value={0.001}>0.001 (Less sensitive)</option>
-                  <option value={0.01}>0.01 (Least sensitive)</option>
-                </select>
-                <span style={styles.settingHint}>Minimum loss improvement to count</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="How fast the model learns. Lower = slower but more stable learning, less likely to overshoot. Higher = faster training but might miss optimal weights. 0.001 is a safe default.">Learning Rate</label>
-                <select
-                  value={settings.learning_rate}
-                  onChange={(e) => setSettings({ ...settings, learning_rate: parseFloat(e.target.value) })}
-                  style={styles.settingSelect}
-                >
-                  <option value={0.0001}>0.0001 (Slow)</option>
-                  <option value={0.001}>0.001 (Default)</option>
-                  <option value={0.01}>0.01 (Fast)</option>
-                </select>
-                <span style={styles.settingHint}>Training speed</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Number of samples processed before updating model weights. Larger batches = faster training, more memory usage, smoother gradients. Smaller batches = slower, less memory, more noise (can help escape local minima).">Batch Size</label>
-                <select
-                  value={settings.batch_size}
-                  onChange={(e) => setSettings({ ...settings, batch_size: parseInt(e.target.value) })}
-                  style={styles.settingSelect}
-                >
-                  <option value={32}>32</option>
-                  <option value={64}>64</option>
-                  <option value={128}>128</option>
-                  <option value={256}>256</option>
-                </select>
-                <span style={styles.settingHint}>Samples per batch</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="How many days of historical data to use for training. More data = better seasonality capture but longer training. 2555 days (~7 years) captures multi-year trends. Minimum 365 for yearly patterns.">Training Days</label>
-                <input
-                  type="number"
-                  value={settings.training_days}
-                  onChange={(e) => setSettings({ ...settings, training_days: parseInt(e.target.value) || 2555 })}
-                  style={styles.settingInput}
-                  min={365}
-                  max={3650}
-                />
-                <span style={styles.settingHint}>Historical data to use</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Use NVIDIA GPU for training if available. Significantly faster for large models/datasets. Requires CUDA-compatible GPU and drivers. Falls back to CPU if unavailable.">
-                  <input
-                    type="checkbox"
-                    checked={settings.use_gpu}
-                    onChange={(e) => setSettings({ ...settings, use_gpu: e.target.checked })}
-                    style={styles.checkbox}
-                  />
-                  Use GPU
-                </label>
-                <span style={styles.settingHint}>CUDA acceleration if available</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Maximum CPU threads for training. Lower values prevent container lockup during training but train slower. Higher values train faster but may impact other services. 2-4 is recommended for shared containers.">CPU Threads</label>
-                <select
-                  value={settings.cpu_threads ?? 2}
-                  onChange={(e) => setSettings({ ...settings, cpu_threads: parseInt(e.target.value) })}
-                  style={styles.settingSelect}
-                >
-                  <option value={1}>1 (Minimal)</option>
-                  <option value={2}>2 (Recommended)</option>
-                  <option value={4}>4 (Faster)</option>
-                  <option value={8}>8 (Fast, high resource use)</option>
-                </select>
-                <span style={styles.settingHint}>Prevents container lockup during training</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="When enabled, TFT preview uses the active trained model instead of training a new one. Much faster for previews. Disable to always train fresh (slower but uses current settings).">
-                  <input
-                    type="checkbox"
-                    checked={settings.use_cached_model}
-                    onChange={(e) => setSettings({ ...settings, use_cached_model: e.target.checked })}
-                    style={styles.checkbox}
-                  />
-                  Use Cached Model
-                </label>
-                <span style={styles.settingHint}>Use trained model for previews</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Include holidays and special events (from Settings > Special Dates) as model features. Helps capture demand spikes around holidays. Model trained with this must have matching data at inference time.">
-                  <input
-                    type="checkbox"
-                    checked={settings.use_special_dates}
-                    onChange={(e) => setSettings({ ...settings, use_special_dates: e.target.checked })}
-                    style={styles.checkbox}
-                  />
-                  Include Special Dates
-                </label>
-                <span style={styles.settingHint}>Use holidays/events from Settings as features</span>
-              </div>
-
-              <div style={styles.settingItem}>
-                <label style={styles.settingLabel} title="Include On-The-Books booking data (reservations at 30d, 14d, 7d out) as features. Helps model learn pickup patterns and improve short-term accuracy. Requires booking_pace data to be populated.">
-                  <input
-                    type="checkbox"
-                    checked={settings.use_otb_data}
-                    onChange={(e) => setSettings({ ...settings, use_otb_data: e.target.checked })}
-                    style={styles.checkbox}
-                  />
-                  Include OTB Data
-                </label>
-                <span style={styles.settingHint}>Use On-The-Books pickup patterns as features</span>
-              </div>
-            </div>
-
-            <div style={styles.buttonRow}>
-              <button
-                onClick={handleSaveSettings}
-                disabled={saveStatus === 'saving'}
-                style={mergeStyles(
-                  buttonStyle('primary'),
-                  saveStatus === 'saved' ? { background: colors.success } : {}
-                )}
-              >
-                {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved!' : 'Save Settings'}
-              </button>
-            </div>
-          </>
-        ) : null}
-      </div>
-
-      {/* Training Section */}
-      <div style={styles.subsection}>
-        <h3 style={styles.subsectionTitle}>Train Model</h3>
-
-        <div style={styles.trainControlRow}>
-          <div style={styles.trainControl}>
-            <label style={styles.settingLabel}>Metric</label>
-            <select
-              value={selectedMetric}
-              onChange={(e) => setSelectedMetric(e.target.value)}
-              style={styles.settingSelect}
-              disabled={!!(trainingJob && ['pending', 'running'].includes(trainingJob.status))}
-            >
-              <option value="hotel_occupancy_pct">Hotel Occupancy %</option>
-              <option value="hotel_room_nights">Hotel Room Nights</option>
-            </select>
-          </div>
-
-          <div style={styles.trainControl}>
-            <label style={styles.settingLabel}>Model Name (optional)</label>
-            <input
-              type="text"
-              value={modelName}
-              onChange={(e) => setModelName(e.target.value)}
-              placeholder="e.g., weekly_retrain"
-              style={styles.settingInput}
-              disabled={!!(trainingJob && ['pending', 'running'].includes(trainingJob.status))}
-            />
-          </div>
-
-          <button
-            onClick={handleStartTraining}
-            disabled={!!(trainingJob && ['pending', 'running'].includes(trainingJob.status))}
-            style={buttonStyle('primary')}
-          >
-            {trainingJob && ['pending', 'running'].includes(trainingJob.status)
-              ? 'Training...'
-              : 'Start Training'}
-          </button>
-        </div>
-
-        {trainingJob && (
-          <div style={styles.trainingProgress}>
-            <div style={styles.progressHeader}>
-              <span>Training {trainingJob.metric_code}</span>
-              <span style={styles.progressStatus}>
-                {trainingJob.status === 'completed' ? 'Completed' :
-                 trainingJob.status === 'failed' ? 'Failed' :
-                 `Epoch ${trainingJob.current_epoch}/${trainingJob.total_epochs}`}
-              </span>
-            </div>
-            <div style={styles.progressBarOuter}>
-              <div
-                style={{
-                  ...styles.progressBarInner,
-                  width: `${trainingJob.progress_pct}%`,
-                  background: trainingJob.status === 'failed' ? colors.error :
-                              trainingJob.status === 'completed' ? colors.success : colors.primary
-                }}
-              />
-            </div>
-            {trainingJob.error_message && (
-              <div style={{ color: colors.error, marginTop: spacing.xs }}>{trainingJob.error_message}</div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Import/Export Section */}
-      <div style={styles.subsection}>
-        <h3 style={styles.subsectionTitle}>Import Model</h3>
-        <p style={styles.hint}>Import a trained model from another machine.</p>
-
-        <div style={styles.buttonRow}>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".pt"
-            onChange={handleUploadModel}
-            style={{ display: 'none' }}
-          />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploadStatus === 'uploading'}
-            style={buttonStyle('outline')}
-          >
-            {uploadStatus === 'uploading' ? 'Uploading...' : 'Upload Model (.pt)'}
-          </button>
-          {uploadMessage && (
-            <span style={{
-              color: uploadStatus === 'success' ? colors.success : colors.error,
-              marginLeft: spacing.sm
-            }}>
-              {uploadMessage}
-            </span>
-          )}
-        </div>
-      </div>
-
-      {/* Models List Section */}
-      <div style={styles.subsection}>
-        <h3 style={styles.subsectionTitle}>Saved Models</h3>
-
-        {modelsLoading ? (
-          <div style={styles.loading}>Loading models...</div>
-        ) : models && models.length > 0 ? (
-          <div style={styles.modelsList}>
-            {models.map((model) => (
-              <div key={model.id} style={styles.modelCard}>
-                <div style={styles.modelHeader}>
-                  <span style={styles.modelName}>{model.model_name}</span>
-                  {model.is_active && (
-                    <span style={{ ...badgeStyle('success'), marginLeft: spacing.xs }}>Active</span>
-                  )}
-                </div>
-                <div style={styles.modelMeta}>
-                  <span>Metric: {model.metric_code}</span>
-                  <span>Size: {formatBytes(model.file_size_bytes)}</span>
-                  <span>Training: {formatDuration(model.training_time_seconds)}</span>
-                  {model.validation_loss && <span>Loss: {model.validation_loss.toFixed(4)}</span>}
-                  {model.epochs_completed && <span>Epochs: {model.epochs_completed}</span>}
-                </div>
-                <div style={styles.modelMeta}>
-                  <span>Trained: {new Date(model.trained_at).toLocaleString()}</span>
-                  {model.created_by && <span>By: {model.created_by}</span>}
-                </div>
-                <div style={styles.modelMeta}>
-                  <span>Features: </span>
-                  {model.training_config?.use_special_dates !== false && (
-                    <span style={{ ...badgeStyle('info'), marginRight: spacing.xs }}>Special Dates</span>
-                  )}
-                  {model.training_config?.use_otb_data && (
-                    <span style={{ ...badgeStyle('info'), marginRight: spacing.xs }}>OTB Data</span>
-                  )}
-                  {!model.training_config?.use_special_dates && !model.training_config?.use_otb_data && (
-                    <span style={{ color: colors.textMuted }}>Base features only</span>
-                  )}
-                </div>
-                <div style={styles.modelActions}>
-                  <button
-                    onClick={() => handleDownloadModel(model)}
-                    style={buttonStyle('outline')}
-                  >
-                    Export
-                  </button>
-                  {!model.is_active && (
-                    <button
-                      onClick={() => handleActivateModel(model)}
-                      style={buttonStyle('outline')}
-                    >
-                      Activate
-                    </button>
-                  )}
-                  {!model.is_active && (
-                    <button
-                      onClick={() => handleDeleteModel(model)}
-                      style={{ ...buttonStyle('outline'), color: colors.error, borderColor: colors.error }}
-                    >
-                      Delete
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div style={styles.emptyState}>
-            No trained models yet. Train a model or import one to get started.
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ============================================
 // USERS PAGE
 // ============================================
 
@@ -3063,7 +4220,7 @@ const UsersPage: React.FC = () => {
   const { user: currentUser } = useAuth()
   const queryClient = useQueryClient()
   const [showAddForm, setShowAddForm] = useState(false)
-  const [newUser, setNewUser] = useState({ username: '', password: '', display_name: '' })
+  const [newUser, setNewUser] = useState({ username: '', password: '', display_name: '', role: 'admin' })
   const [error, setError] = useState('')
 
   const { data: users, isLoading } = useQuery({
@@ -3076,7 +4233,7 @@ const UsersPage: React.FC = () => {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['users'] })
       setShowAddForm(false)
-      setNewUser({ username: '', password: '', display_name: '' })
+      setNewUser({ username: '', password: '', display_name: '', role: 'admin' })
       setError('')
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
@@ -3104,6 +4261,7 @@ const UsersPage: React.FC = () => {
       username: newUser.username,
       password: newUser.password,
       display_name: newUser.display_name || undefined,
+      role: newUser.role,
     })
   }
 
@@ -3169,6 +4327,17 @@ const UsersPage: React.FC = () => {
                   placeholder="Optional"
                 />
               </div>
+              <div style={styles.formField}>
+                <label style={styles.label}>Role</label>
+                <select
+                  value={newUser.role}
+                  onChange={(e) => setNewUser({ ...newUser, role: e.target.value })}
+                  style={styles.input}
+                >
+                  <option value="admin">Admin</option>
+                  <option value="staff">Staff</option>
+                </select>
+              </div>
               <button
                 type="submit"
                 style={mergeStyles(buttonStyle('secondary'), { alignSelf: 'flex-end' })}
@@ -3204,6 +4373,9 @@ const UsersPage: React.FC = () => {
                 </div>
               </div>
               <div style={styles.userActions}>
+                <span style={badgeStyle(user.role === 'staff' ? 'warning' : 'info')}>
+                  {user.role === 'staff' ? 'Staff' : 'Admin'}
+                </span>
                 <span style={user.is_active ? badgeStyle('success') : badgeStyle('error')}>
                   {user.is_active ? 'Active' : 'Inactive'}
                 </span>
@@ -3235,16 +4407,2061 @@ const DatabasePage: React.FC = () => {
     <div style={styles.section}>
       <h2 style={styles.sectionTitle}>Database Browser</h2>
       <p style={styles.hint}>
-        Browse and manage the database using Adminer. Login with: Server: <strong>db</strong>, Username: <strong>forecast</strong>, Password: <strong>forecast_secret</strong>, Database: <strong>forecast</strong>
+        Browse and manage the database using Adminer. Login with: Server: <strong>db</strong>, Username: <strong>forecast</strong>, Password: <strong>forecast_secret</strong>, Database: <strong>forecast_data</strong>
       </p>
 
       <div style={styles.iframeContainer}>
         <iframe
-          src="/adminer/?pgsql=db&username=forecast&db=forecast"
+          src="/adminer/?pgsql=db&username=forecast&db=forecast_data"
           style={styles.iframe}
           title="Database Browser"
         />
       </div>
+    </div>
+  )
+}
+
+// ============================================
+// BUDGET PAGE
+// ============================================
+
+interface MonthlyBudget {
+  id: number
+  year: number
+  month: number
+  budget_type: string
+  budget_value: number
+  notes: string | null
+  created_at: string
+  updated_at: string
+}
+
+interface DailyBudget {
+  date: string
+  budget_type: string
+  budget_value: number
+  distribution_method: string
+  prior_year_pct: number | null
+}
+
+interface UploadResult {
+  status: string
+  filename: string
+  records_created: number
+  records_updated: number
+  total_records: number
+  errors: string[] | null
+}
+
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+const BudgetPage: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [selectedYear, setSelectedYear] = useState(new Date().getFullYear())
+  const [selectedMonth, setSelectedMonth] = useState<number | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [uploadResult, setUploadResult] = useState<UploadResult | null>(null)
+  const [distributing, setDistributing] = useState(false)
+  const [distributeStatus, setDistributeStatus] = useState<string | null>(null)
+  const [dragOver, setDragOver] = useState(false)
+
+  // Fetch monthly budgets for selected year
+  const { data: monthlyBudgets, isLoading: loadingMonthly } = useQuery<MonthlyBudget[]>({
+    queryKey: ['monthly-budgets', selectedYear],
+    queryFn: async () => {
+      const response = await fetch(`/api/budget/monthly?year=${selectedYear}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+  })
+
+  // Fetch daily budgets for selected month
+  const { data: dailyBudgets, isLoading: loadingDaily } = useQuery<DailyBudget[]>({
+    queryKey: ['daily-budgets', selectedYear, selectedMonth],
+    queryFn: async () => {
+      if (selectedMonth === null) return []
+      const startDate = `${selectedYear}-${String(selectedMonth).padStart(2, '0')}-01`
+      const lastDay = new Date(selectedYear, selectedMonth, 0).getDate()
+      const endDate = `${selectedYear}-${String(selectedMonth).padStart(2, '0')}-${lastDay}`
+      const response = await fetch(`/api/budget/daily?from_date=${startDate}&to_date=${endDate}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+    enabled: selectedMonth !== null,
+  })
+
+  // Handle file upload
+  const handleFileUpload = async (file: File) => {
+    const validTypes = ['.csv', '.xlsx', '.xls']
+    const ext = file.name.toLowerCase().substring(file.name.lastIndexOf('.'))
+    if (!validTypes.includes(ext)) {
+      setUploadResult({
+        status: 'error',
+        filename: file.name,
+        records_created: 0,
+        records_updated: 0,
+        total_records: 0,
+        errors: ['Invalid file type. Please upload a CSV or Excel file.']
+      })
+      return
+    }
+
+    setUploading(true)
+    setUploadResult(null)
+
+    const formData = new FormData()
+    formData.append('file', file)
+
+    try {
+      const response = await fetch('/api/budget/upload', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
+        body: formData
+      })
+      const result = await response.json()
+      if (response.ok) {
+        setUploadResult(result)
+        queryClient.invalidateQueries({ queryKey: ['monthly-budgets'] })
+      } else {
+        setUploadResult({
+          status: 'error',
+          filename: file.name,
+          records_created: 0,
+          records_updated: 0,
+          total_records: 0,
+          errors: [result.detail || 'Upload failed']
+        })
+      }
+    } catch (err) {
+      setUploadResult({
+        status: 'error',
+        filename: file.name,
+        records_created: 0,
+        records_updated: 0,
+        total_records: 0,
+        errors: ['Failed to upload file']
+      })
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // Handle drag and drop
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    setDragOver(false)
+    const file = e.dataTransfer.files[0]
+    if (file) handleFileUpload(file)
+  }
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    setDragOver(true)
+  }
+
+  const handleDragLeave = () => {
+    setDragOver(false)
+  }
+
+  // Handle file input
+  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) handleFileUpload(file)
+    e.target.value = '' // Reset input
+  }
+
+  // Download template
+  const handleDownloadTemplate = async () => {
+    try {
+      const response = await fetch('/api/budget/template', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (response.ok) {
+        const blob = await response.blob()
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `budget_template_${selectedYear}.xlsx`
+        a.click()
+        window.URL.revokeObjectURL(url)
+      }
+    } catch (err) {
+      console.error('Failed to download template', err)
+    }
+  }
+
+  // Distribute all budgets
+  const handleDistributeAll = async () => {
+    setDistributing(true)
+    setDistributeStatus(null)
+    let totalDays = 0
+
+    try {
+      for (let month = 1; month <= 12; month++) {
+        const response = await fetch(`/api/budget/distribute?year=${selectedYear}&month=${month}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+        })
+        if (response.ok) {
+          const result = await response.json()
+          totalDays += result.days_distributed || 0
+        }
+      }
+      setDistributeStatus(`Distributed ${totalDays} days successfully`)
+      queryClient.invalidateQueries({ queryKey: ['daily-budgets'] })
+    } catch (err) {
+      setDistributeStatus('Failed to distribute budgets')
+    } finally {
+      setDistributing(false)
+      setTimeout(() => setDistributeStatus(null), 5000)
+    }
+  }
+
+  // Distribute single month
+  const handleDistributeMonth = async (month: number) => {
+    setDistributing(true)
+    try {
+      const response = await fetch(`/api/budget/distribute?year=${selectedYear}&month=${month}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (response.ok) {
+        queryClient.invalidateQueries({ queryKey: ['daily-budgets'] })
+        setSelectedMonth(month)
+      }
+    } catch (err) {
+      console.error('Failed to distribute budget', err)
+    } finally {
+      setDistributing(false)
+    }
+  }
+
+  // Organize monthly budgets by month
+  const budgetsByMonth: Record<number, Record<string, number>> = {}
+  monthlyBudgets?.forEach(b => {
+    if (!budgetsByMonth[b.month]) budgetsByMonth[b.month] = {}
+    budgetsByMonth[b.month][b.budget_type] = b.budget_value
+  })
+
+  // Organize daily budgets by date
+  const dailyByDate: Record<string, Record<string, number>> = {}
+  let dailyTotals = { net_accom: 0, net_dry: 0, net_wet: 0 }
+  dailyBudgets?.forEach(d => {
+    if (!dailyByDate[d.date]) dailyByDate[d.date] = {}
+    dailyByDate[d.date][d.budget_type] = d.budget_value
+    if (d.budget_type in dailyTotals) {
+      dailyTotals[d.budget_type as keyof typeof dailyTotals] += d.budget_value
+    }
+  })
+
+  // Generate year options
+  const currentYear = new Date().getFullYear()
+  const yearOptions = [currentYear - 1, currentYear, currentYear + 1, currentYear + 2]
+
+  // Format currency
+  const formatCurrency = (value: number | undefined) => {
+    if (value === undefined || value === null) return '-'
+    return `£${value.toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+  }
+
+  return (
+    <div style={styles.section}>
+      <h2 style={styles.sectionTitle}>Budget Management</h2>
+      <p style={styles.hint}>
+        Upload budget spreadsheets from FD and distribute to daily values for forecast comparison.
+      </p>
+
+      {/* Upload Section */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Upload Budget Spreadsheet</h3>
+        <p style={styles.hint}>
+          Upload a CSV or Excel file with format: Row labels (accom, dry, wet) in first column, month headers (mm/yy) across top.
+        </p>
+
+        <div
+          style={{
+            ...budgetStyles.dropZone,
+            ...(dragOver ? budgetStyles.dropZoneActive : {})
+          }}
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+        >
+          <input
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            onChange={handleFileInput}
+            style={budgetStyles.fileInput}
+            id="budget-file-input"
+          />
+          <label htmlFor="budget-file-input" style={budgetStyles.dropZoneLabel}>
+            {uploading ? 'Uploading...' : 'Drag & drop CSV or Excel file here, or click to browse'}
+          </label>
+        </div>
+
+        <div style={styles.buttonRow}>
+          <button onClick={handleDownloadTemplate} style={buttonStyle('outline')}>
+            Download Template
+          </button>
+        </div>
+
+        {uploadResult && (
+          <div style={{
+            ...styles.statusMessage,
+            background: uploadResult.status === 'success' ? colors.successBg : colors.errorBg,
+            color: uploadResult.status === 'success' ? colors.success : colors.error,
+            marginTop: spacing.md
+          }}>
+            {uploadResult.status === 'success' ? (
+              <>
+                <strong>Upload successful!</strong> {uploadResult.records_created} created, {uploadResult.records_updated} updated
+              </>
+            ) : (
+              <>
+                <strong>Upload failed:</strong> {uploadResult.errors?.join(', ')}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div style={styles.divider} />
+
+      {/* Monthly Budgets Table */}
+      <div style={styles.subsection}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md }}>
+          <h3 style={{ ...styles.subsectionTitle, margin: 0 }}>Monthly Budgets</h3>
+          <select
+            value={selectedYear}
+            onChange={(e) => setSelectedYear(Number(e.target.value))}
+            style={budgetStyles.yearSelect}
+          >
+            {yearOptions.map(y => (
+              <option key={y} value={y}>{y}</option>
+            ))}
+          </select>
+        </div>
+
+        {loadingMonthly ? (
+          <div style={styles.loading}>Loading budgets...</div>
+        ) : (
+          <>
+            <div style={budgetStyles.tableContainer}>
+              <table style={budgetStyles.table}>
+                <thead>
+                  <tr>
+                    <th style={budgetStyles.th}>Month</th>
+                    <th style={budgetStyles.thRight}>Accommodation</th>
+                    <th style={budgetStyles.thRight}>Dry</th>
+                    <th style={budgetStyles.thRight}>Wet</th>
+                    <th style={budgetStyles.thCenter}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {MONTH_NAMES.map((name, idx) => {
+                    const month = idx + 1
+                    const data = budgetsByMonth[month] || {}
+                    const hasData = Object.keys(data).length > 0
+                    return (
+                      <tr key={month} style={budgetStyles.tr}>
+                        <td style={budgetStyles.td}>{name}</td>
+                        <td style={budgetStyles.tdRight}>{formatCurrency(data.net_accom)}</td>
+                        <td style={budgetStyles.tdRight}>{formatCurrency(data.net_dry)}</td>
+                        <td style={budgetStyles.tdRight}>{formatCurrency(data.net_wet)}</td>
+                        <td style={budgetStyles.tdCenter}>
+                          {hasData && (
+                            <button
+                              onClick={() => {
+                                handleDistributeMonth(month)
+                              }}
+                              style={buttonStyle('ghost')}
+                              disabled={distributing}
+                            >
+                              View Daily
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ ...styles.buttonRow, marginTop: spacing.md }}>
+              <button
+                onClick={handleDistributeAll}
+                disabled={distributing || !monthlyBudgets?.length}
+                style={buttonStyle('primary')}
+              >
+                {distributing ? 'Distributing...' : 'Distribute All to Daily'}
+              </button>
+              {distributeStatus && (
+                <span style={{
+                  color: distributeStatus.includes('Failed') ? colors.error : colors.success,
+                  fontSize: typography.sm,
+                  marginLeft: spacing.md
+                }}>
+                  {distributeStatus}
+                </span>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Daily Distribution View */}
+      {selectedMonth !== null && (
+        <>
+          <div style={styles.divider} />
+
+          <div style={styles.subsection}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md }}>
+              <h3 style={{ ...styles.subsectionTitle, margin: 0 }}>
+                Daily Distribution - {MONTH_NAMES[selectedMonth - 1]} {selectedYear}
+              </h3>
+              <button
+                onClick={() => setSelectedMonth(null)}
+                style={buttonStyle('ghost')}
+              >
+                Close
+              </button>
+            </div>
+
+            {loadingDaily ? (
+              <div style={styles.loading}>Loading daily budgets...</div>
+            ) : dailyBudgets && dailyBudgets.length > 0 ? (
+              <div style={budgetStyles.tableContainer}>
+                <table style={budgetStyles.table}>
+                  <thead>
+                    <tr>
+                      <th style={budgetStyles.th}>Date</th>
+                      <th style={budgetStyles.thRight}>Accommodation</th>
+                      <th style={budgetStyles.thRight}>Dry</th>
+                      <th style={budgetStyles.thRight}>Wet</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.keys(dailyByDate).sort().map(dateStr => {
+                      const data = dailyByDate[dateStr]
+                      const date = new Date(dateStr)
+                      const dayName = date.toLocaleDateString('en-GB', { weekday: 'short' })
+                      const dayNum = date.getDate()
+                      return (
+                        <tr key={dateStr} style={budgetStyles.tr}>
+                          <td style={budgetStyles.td}>{dayName} {dayNum}</td>
+                          <td style={budgetStyles.tdRight}>{formatCurrency(data.net_accom)}</td>
+                          <td style={budgetStyles.tdRight}>{formatCurrency(data.net_dry)}</td>
+                          <td style={budgetStyles.tdRight}>{formatCurrency(data.net_wet)}</td>
+                        </tr>
+                      )
+                    })}
+                    <tr style={budgetStyles.trTotal}>
+                      <td style={{ ...budgetStyles.td, fontWeight: typography.semibold }}>Total</td>
+                      <td style={{ ...budgetStyles.tdRight, fontWeight: typography.semibold }}>{formatCurrency(dailyTotals.net_accom)}</td>
+                      <td style={{ ...budgetStyles.tdRight, fontWeight: typography.semibold }}>{formatCurrency(dailyTotals.net_dry)}</td>
+                      <td style={{ ...budgetStyles.tdRight, fontWeight: typography.semibold }}>{formatCurrency(dailyTotals.net_wet)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p style={styles.hint}>No daily budgets found. Click "Distribute All to Daily" to generate.</p>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// ============================================
+// TAX RATES PAGE
+// ============================================
+
+interface TaxRate {
+  id: number
+  tax_type: string
+  rate: number
+  effective_from: string
+  created_at: string | null
+}
+
+const TaxRatesPage: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [newRate, setNewRate] = useState('')
+  const [newEffectiveFrom, setNewEffectiveFrom] = useState('')
+  const [addingRate, setAddingRate] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Fetch all tax rates
+  const { data: taxRates, isLoading } = useQuery<TaxRate[]>({
+    queryKey: ['tax-rates'],
+    queryFn: async () => {
+      const response = await fetch('/api/config/tax-rates', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+  })
+
+  // Group rates by type
+  const ratesByType = (taxRates || []).reduce((acc, rate) => {
+    if (!acc[rate.tax_type]) acc[rate.tax_type] = []
+    acc[rate.tax_type].push(rate)
+    return acc
+  }, {} as Record<string, TaxRate[]>)
+
+  const handleAddRate = async () => {
+    if (!newRate || !newEffectiveFrom) {
+      setError('Please enter both rate and effective date')
+      return
+    }
+
+    const rateValue = parseFloat(newRate) / 100 // Convert percentage to decimal
+    if (isNaN(rateValue) || rateValue < 0 || rateValue > 1) {
+      setError('Rate must be a valid percentage between 0 and 100')
+      return
+    }
+
+    setAddingRate(true)
+    setError(null)
+
+    try {
+      const response = await fetch('/api/config/tax-rates', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('token')}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          tax_type: 'accommodation_vat',
+          rate: rateValue,
+          effective_from: newEffectiveFrom
+        })
+      })
+
+      if (response.ok) {
+        queryClient.invalidateQueries({ queryKey: ['tax-rates'] })
+        setNewRate('')
+        setNewEffectiveFrom('')
+      } else {
+        const data = await response.json()
+        setError(data.detail || 'Failed to add tax rate')
+      }
+    } catch {
+      setError('Failed to add tax rate')
+    } finally {
+      setAddingRate(false)
+    }
+  }
+
+  const handleDeleteRate = async (id: number) => {
+    if (!confirm('Are you sure you want to delete this tax rate?')) return
+
+    try {
+      const response = await fetch(`/api/config/tax-rates/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+
+      if (response.ok) {
+        queryClient.invalidateQueries({ queryKey: ['tax-rates'] })
+      }
+    } catch {
+      // Silent fail
+    }
+  }
+
+  const formatDate = (dateStr: string) => {
+    const date = new Date(dateStr)
+    return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+  }
+
+  return (
+    <div>
+      <h2 style={styles.pageTitle}>Tax Rates</h2>
+      <p style={styles.hint}>
+        Configure tax rates with effective dates. The most recent rate before a given date will be used for calculations.
+        For example, if VAT changes from 20% to 22% on 1st April 2026, add a new entry with that date.
+      </p>
+
+      {/* Add New Rate Form */}
+      <div style={taxRateStyles.addForm}>
+        <h3 style={styles.sectionTitle}>Add Accommodation VAT Rate</h3>
+        <div style={taxRateStyles.formRow}>
+          <div style={taxRateStyles.inputGroup}>
+            <label style={taxRateStyles.label}>Rate (%)</label>
+            <input
+              type="number"
+              step="0.1"
+              min="0"
+              max="100"
+              value={newRate}
+              onChange={(e) => setNewRate(e.target.value)}
+              placeholder="e.g. 20"
+              style={taxRateStyles.input}
+            />
+          </div>
+          <div style={taxRateStyles.inputGroup}>
+            <label style={taxRateStyles.label}>Effective From</label>
+            <input
+              type="date"
+              value={newEffectiveFrom}
+              onChange={(e) => setNewEffectiveFrom(e.target.value)}
+              style={taxRateStyles.input}
+            />
+          </div>
+          <button
+            onClick={handleAddRate}
+            disabled={addingRate}
+            style={mergeStyles(buttonStyle('primary'), { alignSelf: 'flex-end' })}
+          >
+            {addingRate ? 'Adding...' : 'Add Rate'}
+          </button>
+        </div>
+        {error && <p style={taxRateStyles.error}>{error}</p>}
+      </div>
+
+      {/* Existing Rates */}
+      <div style={taxRateStyles.ratesSection}>
+        <h3 style={styles.sectionTitle}>Current Tax Rates</h3>
+
+        {isLoading ? (
+          <div style={styles.loading}>Loading tax rates...</div>
+        ) : Object.keys(ratesByType).length === 0 ? (
+          <p style={styles.hint}>No tax rates configured. Add your first rate above.</p>
+        ) : (
+          Object.entries(ratesByType).map(([taxType, rates]) => (
+            <div key={taxType} style={taxRateStyles.rateGroup}>
+              <h4 style={taxRateStyles.rateGroupTitle}>
+                {taxType === 'accommodation_vat' ? 'Accommodation VAT' : taxType}
+              </h4>
+              <table style={budgetStyles.table}>
+                <thead>
+                  <tr>
+                    <th style={budgetStyles.th}>Effective From</th>
+                    <th style={budgetStyles.thRight}>Rate</th>
+                    <th style={budgetStyles.thCenter}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rates.map((rate, idx) => (
+                    <tr key={rate.id} style={budgetStyles.tr}>
+                      <td style={budgetStyles.td}>
+                        {formatDate(rate.effective_from)}
+                        {idx === 0 && (
+                          <span style={taxRateStyles.currentBadge}>Current</span>
+                        )}
+                      </td>
+                      <td style={budgetStyles.tdRight}>{(rate.rate * 100).toFixed(1)}%</td>
+                      <td style={budgetStyles.tdCenter}>
+                        <button
+                          onClick={() => handleDeleteRate(rate.id)}
+                          style={mergeStyles(buttonStyle('outline'), taxRateStyles.deleteBtn)}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+const taxRateStyles: Record<string, React.CSSProperties> = {
+  addForm: {
+    background: colors.surface,
+    padding: spacing.lg,
+    borderRadius: radius.lg,
+    marginBottom: spacing.xl,
+    border: `1px solid ${colors.border}`,
+  },
+  formRow: {
+    display: 'flex',
+    gap: spacing.md,
+    alignItems: 'flex-end',
+    flexWrap: 'wrap',
+  },
+  inputGroup: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: spacing.xs,
+  },
+  label: {
+    fontSize: typography.sm,
+    color: colors.textSecondary,
+    fontWeight: typography.medium,
+  },
+  input: {
+    padding: `${spacing.sm} ${spacing.md}`,
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+    fontSize: typography.base,
+    background: colors.background,
+    minWidth: '150px',
+  },
+  error: {
+    color: colors.error,
+    fontSize: typography.sm,
+    marginTop: spacing.sm,
+  },
+  ratesSection: {
+    marginTop: spacing.xl,
+  },
+  rateGroup: {
+    marginBottom: spacing.lg,
+  },
+  rateGroupTitle: {
+    fontSize: typography.base,
+    fontWeight: typography.semibold,
+    color: colors.text,
+    marginBottom: spacing.sm,
+  },
+  currentBadge: {
+    display: 'inline-block',
+    marginLeft: spacing.sm,
+    padding: `2px ${spacing.xs}`,
+    fontSize: typography.xs,
+    background: colors.success,
+    color: 'white',
+    borderRadius: radius.sm,
+  },
+  deleteBtn: {
+    padding: `${spacing.xs} ${spacing.sm}`,
+    fontSize: typography.xs,
+  },
+}
+
+const budgetStyles: Record<string, React.CSSProperties> = {
+  dropZone: {
+    border: `2px dashed ${colors.border}`,
+    borderRadius: radius.lg,
+    padding: spacing.xl,
+    textAlign: 'center',
+    cursor: 'pointer',
+    transition: 'all 0.2s ease',
+    background: colors.background,
+  },
+  dropZoneActive: {
+    borderColor: colors.accent,
+    background: `${colors.accent}15`,
+  },
+  dropZoneLabel: {
+    display: 'block',
+    color: colors.textSecondary,
+    fontSize: typography.sm,
+    cursor: 'pointer',
+  },
+  fileInput: {
+    display: 'none',
+  },
+  yearSelect: {
+    padding: `${spacing.xs} ${spacing.sm}`,
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+    fontSize: typography.base,
+    background: colors.surface,
+    cursor: 'pointer',
+  },
+  tableContainer: {
+    overflowX: 'auto',
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+  },
+  table: {
+    width: '100%',
+    borderCollapse: 'collapse',
+    fontSize: typography.sm,
+  },
+  th: {
+    padding: spacing.sm,
+    textAlign: 'left',
+    background: colors.background,
+    borderBottom: `1px solid ${colors.border}`,
+    fontWeight: typography.medium,
+    color: colors.textSecondary,
+  },
+  thRight: {
+    padding: spacing.sm,
+    textAlign: 'right',
+    background: colors.background,
+    borderBottom: `1px solid ${colors.border}`,
+    fontWeight: typography.medium,
+    color: colors.textSecondary,
+  },
+  thCenter: {
+    padding: spacing.sm,
+    textAlign: 'center',
+    background: colors.background,
+    borderBottom: `1px solid ${colors.border}`,
+    fontWeight: typography.medium,
+    color: colors.textSecondary,
+  },
+  tr: {
+    borderBottom: `1px solid ${colors.borderLight}`,
+  },
+  trTotal: {
+    background: colors.background,
+    borderTop: `2px solid ${colors.border}`,
+  },
+  td: {
+    padding: spacing.sm,
+    color: colors.text,
+  },
+  tdRight: {
+    padding: spacing.sm,
+    textAlign: 'right',
+    color: colors.text,
+    fontFamily: 'monospace',
+  },
+  tdCenter: {
+    padding: spacing.sm,
+    textAlign: 'center',
+  },
+}
+
+// ============================================
+// BACKUP & RESTORE PAGE
+// ============================================
+
+interface BackupSettings {
+  backup_frequency: string
+  backup_retention_count: number
+  backup_destination: string
+  backup_time: string | null
+  backup_last_run_at: string | null
+  backup_last_status: string | null
+}
+
+interface BackupHistoryEntry {
+  id: number
+  backup_type: string
+  status: string
+  filename: string
+  file_path: string
+  file_size_bytes: number | null
+  snapshot_count: number | null
+  file_count: number | null
+  started_at: string
+  completed_at: string | null
+  error_message: string | null
+  created_by: string | null
+}
+
+const BackupPage: React.FC = () => {
+  const queryClient = useQueryClient()
+  const { token } = useAuth()
+  const [backupMessage, setBackupMessage] = useState<string | null>(null)
+  const [uploadDragActive, setUploadDragActive] = useState(false)
+  const [restoreConfirmOpen, setRestoreConfirmOpen] = useState(false)
+  const [restoreTarget, setRestoreTarget] = useState<File | number | null>(null)
+
+  // State for settings form
+  const [frequency, setFrequency] = useState('manual')
+  const [retentionCount, setRetentionCount] = useState(7)
+  const [backupTime, setBackupTime] = useState('02:00')
+
+  // Fetch backup settings
+  const { data: backupSettings } = useQuery<BackupSettings>({
+    queryKey: ['backup-settings'],
+    queryFn: async () => {
+      const res = await fetch('/api/backup/settings', {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!res.ok) throw new Error('Failed to fetch backup settings')
+      return res.json()
+    }
+  })
+
+  // Sync form state when backup settings load
+  useEffect(() => {
+    if (backupSettings) {
+      setFrequency(backupSettings.backup_frequency)
+      setRetentionCount(backupSettings.backup_retention_count)
+      if (backupSettings.backup_time) setBackupTime(backupSettings.backup_time)
+    }
+  }, [backupSettings])
+
+  // Fetch backup history
+  const { data: backupHistory, refetch: refetchHistory } = useQuery({
+    queryKey: ['backup-history'],
+    queryFn: async () => {
+      const res = await fetch('/api/backup/history', {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!res.ok) throw new Error('Failed to fetch backup history')
+      return res.json() as Promise<BackupHistoryEntry[]>
+    }
+  })
+
+  // Save settings mutation
+  const saveSettingsMutation = useMutation({
+    mutationFn: async (updates: any) => {
+      const res = await fetch('/api/backup/settings', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(updates)
+      })
+      if (!res.ok) throw new Error('Failed to save settings')
+      return res.json()
+    },
+    onSuccess: () => {
+      setBackupMessage('Settings saved successfully')
+      queryClient.invalidateQueries({ queryKey: ['backup-settings'] })
+      setTimeout(() => setBackupMessage(null), 3000)
+    },
+    onError: (error: any) => {
+      setBackupMessage(`Error: ${error.message}`)
+      setTimeout(() => setBackupMessage(null), 5000)
+    }
+  })
+
+  // Create backup mutation
+  const createBackupMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/backup/create', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!res.ok) throw new Error('Failed to create backup')
+      return res.json()
+    },
+    onSuccess: (data) => {
+      setBackupMessage(`Backup created: ${data.message}`)
+      refetchHistory()
+      setTimeout(() => setBackupMessage(null), 5000)
+    },
+    onError: (error: any) => {
+      setBackupMessage(`Error: ${error.message}`)
+      setTimeout(() => setBackupMessage(null), 5000)
+    }
+  })
+
+  // Upload and restore mutation
+  const uploadRestoreMutation = useMutation({
+    mutationFn: async (file: File) => {
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await fetch('/api/backup/upload-restore', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData
+      })
+      if (!res.ok) throw new Error('Failed to restore backup')
+      return res.json()
+    },
+    onSuccess: () => {
+      setBackupMessage('Restore successful! Redirecting to login...')
+      setTimeout(() => {
+        localStorage.removeItem('token')
+        window.location.href = '/login'
+      }, 2000)
+    },
+    onError: (error: any) => {
+      setBackupMessage(`Error: ${error.message}`)
+      setTimeout(() => setBackupMessage(null), 5000)
+    }
+  })
+
+  // Restore from history mutation
+  const restoreBackupMutation = useMutation({
+    mutationFn: async (backupId: number) => {
+      const res = await fetch(`/api/backup/${backupId}/restore`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!res.ok) throw new Error('Failed to restore backup')
+      return res.json()
+    },
+    onSuccess: () => {
+      setBackupMessage('Restore successful! Redirecting to login...')
+      setTimeout(() => {
+        localStorage.removeItem('token')
+        window.location.href = '/login'
+      }, 2000)
+    },
+    onError: (error: any) => {
+      setBackupMessage(`Error: ${error.message}`)
+      setTimeout(() => setBackupMessage(null), 5000)
+    }
+  })
+
+  // Delete backup mutation
+  const deleteBackupMutation = useMutation({
+    mutationFn: async (backupId: number) => {
+      const res = await fetch(`/api/backup/${backupId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!res.ok) throw new Error('Failed to delete backup')
+      return res.json()
+    },
+    onSuccess: () => {
+      setBackupMessage('Backup deleted successfully')
+      refetchHistory()
+      setTimeout(() => setBackupMessage(null), 3000)
+    },
+    onError: (error: any) => {
+      setBackupMessage(`Error: ${error.message}`)
+      setTimeout(() => setBackupMessage(null), 5000)
+    }
+  })
+
+  const handleSaveSettings = () => {
+    saveSettingsMutation.mutate({
+      frequency,
+      retention_count: retentionCount,
+      time: backupTime
+    })
+  }
+
+  const handleCreateBackup = () => {
+    createBackupMutation.mutate()
+  }
+
+  const handleFileUpload = (file: File) => {
+    if (!file.name.endsWith('.zip')) {
+      setBackupMessage('Error: Only ZIP files are accepted')
+      setTimeout(() => setBackupMessage(null), 3000)
+      return
+    }
+    setRestoreTarget(file)
+    setRestoreConfirmOpen(true)
+  }
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setUploadDragActive(true)
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setUploadDragActive(false)
+  }
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setUploadDragActive(false)
+
+    const files = e.dataTransfer.files
+    if (files && files[0]) {
+      handleFileUpload(files[0])
+    }
+  }
+
+  const handleDownload = async (backup: BackupHistoryEntry) => {
+    try {
+      const res = await fetch(`/api/backup/${backup.id}/download`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!res.ok) throw new Error('Download failed')
+      const blob = await res.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = backup.filename
+      document.body.appendChild(a)
+      a.click()
+      window.URL.revokeObjectURL(url)
+      document.body.removeChild(a)
+    } catch (err) {
+      setBackupMessage('Error: Download failed')
+      setTimeout(() => setBackupMessage(null), 3000)
+    }
+  }
+
+  const formatFileSize = (bytes: number | null): string => {
+    if (!bytes) return '-'
+    const mb = bytes / 1024 / 1024
+    if (mb < 1) return `${(bytes / 1024).toFixed(1)} KB`
+    if (mb < 1024) return `${mb.toFixed(1)} MB`
+    return `${(mb / 1024).toFixed(1)} GB`
+  }
+
+  const formatDate = (dateStr: string | null): string => {
+    if (!dateStr) return '-'
+    return new Date(dateStr).toLocaleString()
+  }
+
+  const getStatusBadge = (status: string) => {
+    const colors = {
+      success: { bg: '#d4edda', color: '#155724', border: '#c3e6cb' },
+      running: { bg: '#fff3cd', color: '#856404', border: '#ffeaa7' },
+      failed: { bg: '#f8d7da', color: '#721c24', border: '#f5c6cb' }
+    }
+    const style = colors[status as keyof typeof colors] || colors.failed
+    return (
+      <span
+        style={{
+          padding: '0.25rem 0.5rem',
+          borderRadius: radius.sm,
+          fontSize: typography.xs,
+          fontWeight: typography.semibold,
+          background: style.bg,
+          color: style.color,
+          border: `1px solid ${style.border}`,
+          textTransform: 'uppercase'
+        }}
+      >
+        {status}
+      </span>
+    )
+  }
+
+  const getTypeBadge = (type: string) => {
+    const isManual = type === 'manual'
+    return (
+      <span
+        style={{
+          padding: '0.25rem 0.5rem',
+          borderRadius: radius.sm,
+          fontSize: typography.xs,
+          fontWeight: typography.medium,
+          background: isManual ? '#e7f5ff' : '#f3f4f6',
+          color: isManual ? '#1971c2' : '#4b5563',
+          border: `1px solid ${isManual ? '#a5d8ff' : '#d1d5db'}`
+        }}
+      >
+        {type}
+      </span>
+    )
+  }
+
+  const isOperationInProgress =
+    createBackupMutation.isPending ||
+    uploadRestoreMutation.isPending ||
+    restoreBackupMutation.isPending ||
+    deleteBackupMutation.isPending
+
+  return (
+    <div style={styles.section}>
+      <div style={styles.sectionHeader}>
+        <div>
+          <h2 style={styles.sectionTitle}>Backup & Restore</h2>
+          <p style={styles.hint}>
+            Create and manage database backups for disaster recovery
+          </p>
+        </div>
+      </div>
+
+      {backupMessage && (
+        <div
+          style={{
+            padding: spacing.md,
+            marginBottom: spacing.lg,
+            borderRadius: radius.md,
+            background: backupMessage.startsWith('Error')
+              ? colors.errorBg
+              : '#d4edda',
+            color: backupMessage.startsWith('Error') ? colors.error : '#155724',
+            border: `1px solid ${backupMessage.startsWith('Error') ? colors.error : '#c3e6cb'}`,
+            fontSize: typography.sm
+          }}
+        >
+          {backupMessage}
+        </div>
+      )}
+
+      {/* Backup Settings */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Backup Settings</h3>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Frequency</label>
+          <select
+            value={frequency}
+            onChange={(e) => setFrequency(e.target.value)}
+            style={styles.select}
+            disabled={isOperationInProgress}
+          >
+            <option value="manual">Manual Only</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+          </select>
+        </div>
+
+        {frequency !== 'manual' && (
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Backup Time</label>
+            <input
+              type="time"
+              value={backupTime}
+              onChange={(e) => setBackupTime(e.target.value)}
+              style={styles.input}
+              disabled={isOperationInProgress}
+            />
+          </div>
+        )}
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Retention Count</label>
+          <input
+            type="number"
+            min="1"
+            max="30"
+            value={retentionCount}
+            onChange={(e) => setRetentionCount(parseInt(e.target.value))}
+            style={styles.input}
+            disabled={isOperationInProgress}
+          />
+          <p style={styles.hint}>Number of backups to keep (older ones will be deleted)</p>
+        </div>
+
+        {backupSettings?.backup_last_run_at && (
+          <div style={{ marginTop: spacing.md }}>
+            <p style={{ ...styles.label, marginBottom: spacing.xs }}>Last Backup:</p>
+            <p style={styles.hint}>
+              {formatDate(backupSettings.backup_last_run_at)} -{' '}
+              {getStatusBadge(backupSettings.backup_last_status || 'unknown')}
+            </p>
+          </div>
+        )}
+
+        <button
+          onClick={handleSaveSettings}
+          style={mergeStyles(
+            buttonStyle(),
+            isOperationInProgress ? { opacity: 0.6, cursor: 'not-allowed' } : {}
+          )}
+          disabled={isOperationInProgress}
+        >
+          {saveSettingsMutation.isPending ? 'Saving...' : 'Save Settings'}
+        </button>
+      </div>
+
+      <div style={styles.divider} />
+
+      {/* Manual Backup */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Create Backup</h3>
+        <p style={styles.hint}>
+          Create a full backup of your database and files. This may take several minutes.
+        </p>
+        <button
+          onClick={handleCreateBackup}
+          style={mergeStyles(
+            buttonStyle(),
+            { background: colors.success },
+            isOperationInProgress ? { opacity: 0.6, cursor: 'not-allowed' } : {}
+          )}
+          disabled={isOperationInProgress}
+        >
+          {createBackupMutation.isPending ? 'Creating Backup...' : 'Create Backup Now'}
+        </button>
+      </div>
+
+      <div style={styles.divider} />
+
+      {/* Restore from File */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Restore from File</h3>
+        <p style={styles.hint}>Upload a backup ZIP file to restore your data.</p>
+
+        <div
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          style={{
+            border: `2px dashed ${uploadDragActive ? colors.primary : colors.border}`,
+            borderRadius: radius.md,
+            padding: spacing.xl,
+            textAlign: 'center',
+            background: uploadDragActive ? '#fff5f7' : colors.surfaceHover,
+            cursor: 'pointer',
+            transition: 'all 0.2s'
+          }}
+          onClick={() => document.getElementById('backup-upload-input')?.click()}
+        >
+          <div style={{ fontSize: '3rem', marginBottom: spacing.sm }}>📦</div>
+          <p style={{ margin: `${spacing.sm} 0`, fontWeight: typography.medium }}>
+            {uploadDragActive ? 'Drop backup file here' : 'Drag and drop backup file here'}
+          </p>
+          <p style={{ margin: `${spacing.sm} 0`, fontSize: typography.sm, color: colors.textMuted }}>
+            or{' '}
+            <span style={{ color: colors.primary, textDecoration: 'underline' }}>
+              click to browse
+            </span>
+          </p>
+          <p style={{ margin: `${spacing.sm} 0`, fontSize: typography.xs, color: colors.textMuted }}>
+            Only .zip backup files are accepted
+          </p>
+          <input
+            type="file"
+            accept=".zip"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) {
+                handleFileUpload(file)
+                e.target.value = ''
+              }
+            }}
+            style={{ display: 'none' }}
+            id="backup-upload-input"
+          />
+        </div>
+      </div>
+
+      <div style={styles.divider} />
+
+      {/* Backup History */}
+      <div style={styles.subsection}>
+        <h3 style={styles.subsectionTitle}>Backup History</h3>
+
+        {backupHistory && backupHistory.length > 0 ? (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={styles.th}>Started</th>
+                  <th style={styles.th}>Type</th>
+                  <th style={styles.th}>Status</th>
+                  <th style={styles.th}>Size</th>
+                  <th style={styles.th}>Snapshots</th>
+                  <th style={styles.th}>Files</th>
+                  <th style={styles.th}>Created By</th>
+                  <th style={styles.th}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {backupHistory.map((backup) => (
+                  <tr key={backup.id}>
+                    <td style={styles.td}>{formatDate(backup.started_at)}</td>
+                    <td style={styles.td}>{getTypeBadge(backup.backup_type)}</td>
+                    <td style={styles.td}>{getStatusBadge(backup.status)}</td>
+                    <td style={styles.td}>{formatFileSize(backup.file_size_bytes)}</td>
+                    <td style={styles.td}>
+                      {backup.snapshot_count !== null ? backup.snapshot_count.toLocaleString() : '-'}
+                    </td>
+                    <td style={styles.td}>
+                      {backup.file_count !== null ? backup.file_count.toLocaleString() : '-'}
+                    </td>
+                    <td style={styles.td}>
+                      {backup.created_by || (
+                        <span style={{ fontStyle: 'italic', color: colors.textMuted }}>scheduled</span>
+                      )}
+                    </td>
+                    <td style={styles.td}>
+                      <div style={{ display: 'flex', gap: spacing.xs }}>
+                        <button
+                          onClick={() => handleDownload(backup)}
+                          disabled={backup.status !== 'success'}
+                          style={mergeStyles(
+                            buttonStyle('secondary'),
+                            {
+                              padding: `${spacing.xs} ${spacing.sm}`,
+                              fontSize: typography.sm
+                            },
+                            backup.status !== 'success' ? { opacity: 0.5, cursor: 'not-allowed' } : {}
+                          )}
+                        >
+                          Download
+                        </button>
+                        <button
+                          onClick={() => {
+                            setRestoreTarget(backup.id)
+                            setRestoreConfirmOpen(true)
+                          }}
+                          disabled={backup.status !== 'success' || isOperationInProgress}
+                          style={mergeStyles(
+                            buttonStyle('secondary'),
+                            {
+                              padding: `${spacing.xs} ${spacing.sm}`,
+                              fontSize: typography.sm,
+                              background: '#f59e0b',
+                              color: colors.textLight
+                            },
+                            (backup.status !== 'success' || isOperationInProgress) ? {
+                              opacity: 0.5,
+                              cursor: 'not-allowed'
+                            } : {}
+                          )}
+                        >
+                          Restore
+                        </button>
+                        <button
+                          onClick={() => {
+                            if (confirm(`Delete backup "${backup.filename}"? This cannot be undone.`)) {
+                              deleteBackupMutation.mutate(backup.id)
+                            }
+                          }}
+                          disabled={isOperationInProgress}
+                          style={mergeStyles(
+                            buttonStyle('secondary'),
+                            {
+                              padding: `${spacing.xs} ${spacing.sm}`,
+                              fontSize: typography.sm,
+                              background: colors.error,
+                              color: colors.textLight
+                            },
+                            isOperationInProgress ? { opacity: 0.5, cursor: 'not-allowed' } : {}
+                          )}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p style={styles.hint}>No backups yet. Create your first backup above.</p>
+        )}
+      </div>
+
+      {/* Restore Confirmation Modal */}
+      {restoreConfirmOpen && (
+        <div
+          style={styles.modal}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setRestoreConfirmOpen(false)
+              setRestoreTarget(null)
+            }
+          }}
+        >
+          <div style={{ ...styles.modalContent, maxWidth: '600px' }}>
+            <h3 style={{ marginTop: 0, display: 'flex', alignItems: 'center', gap: spacing.sm }}>
+              <span style={{ fontSize: '1.5rem' }}>⚠️</span>
+              Confirm Backup Restore
+            </h3>
+
+            <div
+              style={{
+                padding: spacing.md,
+                background: '#fff3cd',
+                border: '1px solid #ffc107',
+                borderRadius: radius.md,
+                marginBottom: spacing.md
+              }}
+            >
+              <strong style={{ color: '#856404' }}>Warning: Data Restore Operation</strong>
+              <p style={{ margin: `${spacing.sm} 0 0 0`, fontSize: typography.sm, color: '#856404' }}>
+                This operation will restore data from the backup file. Please review:
+              </p>
+            </div>
+
+            <ul style={{ marginLeft: spacing.lg, marginBottom: spacing.lg, lineHeight: 1.8 }}>
+              <li>
+                <strong>Database:</strong> Full database restore (all current data will be replaced)
+              </li>
+              <li>
+                <strong>Files:</strong> Missing files will be restored
+              </li>
+              <li>
+                <strong>Existing files:</strong> Will NOT be overwritten
+              </li>
+              <li>
+                <strong>After restore:</strong> You will need to log in again
+              </li>
+            </ul>
+
+            <div style={{ display: 'flex', gap: spacing.md, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => {
+                  setRestoreConfirmOpen(false)
+                  setRestoreTarget(null)
+                }}
+                style={{ ...buttonStyle, background: colors.textMuted }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (typeof restoreTarget === 'number') {
+                    restoreBackupMutation.mutate(restoreTarget)
+                  } else if (restoreTarget instanceof File) {
+                    uploadRestoreMutation.mutate(restoreTarget)
+                  }
+                  setRestoreConfirmOpen(false)
+                  setRestoreTarget(null)
+                }}
+                style={{ ...buttonStyle, background: colors.error }}
+                disabled={isOperationInProgress}
+              >
+                {isOperationInProgress ? 'Restoring...' : 'Confirm Restore'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ============================================
+// FORECAST SNAPSHOTS PAGE
+// ============================================
+
+interface ForecastSnapshotSettings {
+  enabled: boolean
+  time: string
+  models: string
+  days_ahead: number
+}
+
+const ForecastSnapshotsPage: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle')
+  const [testStatus, setTestStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
+  const [testMessage, setTestMessage] = useState('')
+
+  // Fetch settings
+  const { data: settings, isLoading } = useQuery<ForecastSnapshotSettings>({
+    queryKey: ['forecast-snapshot-settings'],
+    queryFn: async () => {
+      const response = await fetch('/api/config/settings/forecast-snapshot', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch settings')
+      return response.json()
+    },
+  })
+
+  const [formData, setFormData] = useState<ForecastSnapshotSettings>({
+    enabled: false,
+    time: '06:00',
+    models: 'prophet,xgboost,catboost,blended',
+    days_ahead: 90
+  })
+
+  // Update form when settings load
+  React.useEffect(() => {
+    if (settings) {
+      setFormData(settings)
+    }
+  }, [settings])
+
+  const handleSave = async () => {
+    setSaveStatus('saving')
+    try {
+      const response = await fetch('/api/config/settings/forecast-snapshot', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify(formData)
+      })
+
+      if (response.ok) {
+        setSaveStatus('success')
+        queryClient.invalidateQueries({ queryKey: ['forecast-snapshot-settings'] })
+      } else {
+        setSaveStatus('error')
+      }
+    } catch {
+      setSaveStatus('error')
+    }
+
+    setTimeout(() => setSaveStatus('idle'), 3000)
+  }
+
+  const handleTest = async () => {
+    setTestStatus('running')
+    setTestMessage('Running forecast snapshot...')
+
+    try {
+      const response = await fetch('/api/config/settings/forecast-snapshot/test', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+
+      const data = await response.json()
+
+      if (response.ok) {
+        setTestStatus('success')
+        setTestMessage(data.message || 'Forecast snapshot completed successfully')
+      } else {
+        setTestStatus('error')
+        setTestMessage(data.detail || 'Forecast snapshot failed')
+      }
+    } catch (err) {
+      setTestStatus('error')
+      setTestMessage('Failed to run forecast snapshot')
+    }
+
+    setTimeout(() => {
+      setTestStatus('idle')
+      setTestMessage('')
+    }, 8000)
+  }
+
+  if (isLoading) {
+    return <div style={styles.loading}>Loading settings...</div>
+  }
+
+  return (
+    <div>
+      <div style={styles.header}>
+        <h1 style={styles.title}>Forecast Snapshot Automation</h1>
+        <p style={styles.hint}>
+          Automatically create weekly forecast snapshots for all non-COVID metrics
+        </p>
+      </div>
+
+      <div style={styles.section}>
+        <h3 style={styles.sectionTitle}>Automation Settings</h3>
+
+        {/* Enabled Toggle */}
+        <div style={styles.formRow}>
+          <div style={styles.formField}>
+            <label style={styles.label}>
+              <input
+                type="checkbox"
+                checked={formData.enabled}
+                onChange={(e) => setFormData({ ...formData, enabled: e.target.checked })}
+              />
+              <span style={{ marginLeft: spacing.sm }}>Enable weekly forecast snapshots</span>
+            </label>
+            <p style={styles.hint}>
+              When enabled, forecast snapshots will be created automatically every Monday
+            </p>
+          </div>
+        </div>
+
+        {/* Time */}
+        <div style={styles.formRow}>
+          <div style={styles.formField}>
+            <label style={styles.label}>Snapshot Time</label>
+            <input
+              type="time"
+              value={formData.time}
+              onChange={(e) => setFormData({ ...formData, time: e.target.value })}
+              style={styles.input}
+              disabled={!formData.enabled}
+            />
+            <p style={styles.hint}>
+              Time to run the snapshot (default: 06:00)
+            </p>
+          </div>
+        </div>
+
+        {/* Models */}
+        <div style={styles.formRow}>
+          <div style={styles.formField}>
+            <label style={styles.label}>Models</label>
+            <input
+              type="text"
+              value={formData.models}
+              onChange={(e) => setFormData({ ...formData, models: e.target.value })}
+              style={styles.input}
+              disabled={!formData.enabled}
+              placeholder="prophet,xgboost,catboost,blended"
+            />
+            <p style={styles.hint}>
+              Comma-separated list of models to run (prophet, xgboost, catboost, pickup, blended). Blended averages the other models.
+            </p>
+          </div>
+        </div>
+
+        {/* Days Ahead */}
+        <div style={styles.formRow}>
+          <div style={styles.formField}>
+            <label style={styles.label}>Forecast Horizon (days)</label>
+            <input
+              type="number"
+              value={formData.days_ahead}
+              onChange={(e) => setFormData({ ...formData, days_ahead: parseInt(e.target.value) || 90 })}
+              style={styles.input}
+              disabled={!formData.enabled}
+              min="1"
+              max="365"
+            />
+            <p style={styles.hint}>
+              Number of days ahead to forecast (default: 90)
+            </p>
+          </div>
+        </div>
+
+        {/* Save Button */}
+        <div style={styles.actions}>
+          <button
+            onClick={handleSave}
+            style={{
+              ...buttonStyle(),
+              ...(saveStatus === 'saving' ? { opacity: 0.6, cursor: 'wait' } : {})
+            }}
+            disabled={saveStatus === 'saving'}
+          >
+            {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'success' ? '✓ Saved' : 'Save Settings'}
+          </button>
+
+          <button
+            onClick={handleTest}
+            style={{
+              ...buttonStyle('secondary'),
+              ...(testStatus === 'running' || !formData.enabled ? { opacity: 0.6 } : {})
+            }}
+            disabled={testStatus === 'running' || !formData.enabled}
+          >
+            {testStatus === 'running' ? 'Running...' : 'Test Now'}
+          </button>
+        </div>
+
+        {testMessage && (
+          <div style={{
+            padding: spacing.md,
+            borderRadius: radius.md,
+            marginTop: spacing.md,
+            background: testStatus === 'error' ? colors.errorBg : colors.successBg,
+            color: testStatus === 'error' ? colors.error : colors.success,
+          }}>
+            {testMessage}
+          </div>
+        )}
+      </div>
+
+      <div style={styles.infoBox}>
+        <h4 style={{ margin: `0 0 ${spacing.sm} 0`, fontSize: typography.base }}>How it works</h4>
+        <ul style={{ margin: 0, paddingLeft: spacing.lg, fontSize: typography.sm, lineHeight: 1.6 }}>
+          <li>Forecast snapshots are created every Monday at the specified time</li>
+          <li>Snapshots capture forecasts for all active metrics using the configured models</li>
+          <li>The forecast horizon determines how many days ahead to predict</li>
+          <li>Snapshots use standard models (without "_postcovid" suffix) that include all historical data</li>
+          <li>Forecasts are stored in the database for historical comparison and trend analysis</li>
+        </ul>
+      </div>
+    </div>
+  )
+}
+
+// ============================================
+// API KEYS PAGE
+// ============================================
+
+interface ApiKey {
+  id: number
+  key_prefix: string
+  name: string
+  is_active: boolean
+  created_at: string
+  last_used_at: string | null
+  created_by: string | null
+}
+
+interface CreateApiKeyResponse {
+  id: number
+  key: string
+  key_prefix: string
+  name: string
+}
+
+const ApiKeysPage: React.FC = () => {
+  const queryClient = useQueryClient()
+  const [showCreateForm, setShowCreateForm] = useState(false)
+  const [newKeyName, setNewKeyName] = useState('')
+  const [createdKey, setCreatedKey] = useState<CreateApiKeyResponse | null>(null)
+  const [showKeyModal, setShowKeyModal] = useState(false)
+  const [error, setError] = useState('')
+  const [copied, setCopied] = useState(false)
+
+  const { data: apiKeys, isLoading } = useQuery<ApiKey[]>({
+    queryKey: ['api-keys'],
+    queryFn: async () => {
+      const response = await fetch('/api/config/api-keys', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch API keys')
+      return response.json()
+    },
+  })
+
+  const createMutation = useMutation({
+    mutationFn: async (name: string) => {
+      const response = await fetch('/api/config/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ name })
+      })
+      if (!response.ok) {
+        const errData = await response.json()
+        throw new Error(errData.detail || 'Failed to create API key')
+      }
+      return response.json()
+    },
+    onSuccess: (data: CreateApiKeyResponse) => {
+      queryClient.invalidateQueries({ queryKey: ['api-keys'] })
+      setCreatedKey(data)
+      setShowKeyModal(true)
+      setShowCreateForm(false)
+      setNewKeyName('')
+      setError('')
+    },
+    onError: (err: Error) => {
+      setError(err.message)
+    },
+  })
+
+  const revokeMutation = useMutation({
+    mutationFn: async (keyId: number) => {
+      const response = await fetch(`/api/config/api-keys/${keyId}/revoke`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to revoke API key')
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['api-keys'] })
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: async (keyId: number) => {
+      const response = await fetch(`/api/config/api-keys/${keyId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to delete API key')
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['api-keys'] })
+    },
+  })
+
+  const handleCreate = (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!newKeyName.trim()) {
+      setError('Please enter a name for the API key')
+      return
+    }
+    createMutation.mutate(newKeyName.trim())
+  }
+
+  const handleRevoke = (key: ApiKey) => {
+    if (confirm(`Revoke API key "${key.name}"? It will no longer work for API requests.`)) {
+      revokeMutation.mutate(key.id)
+    }
+  }
+
+  const handleDelete = (key: ApiKey) => {
+    if (confirm(`Permanently delete API key "${key.name}"? This cannot be undone.`)) {
+      deleteMutation.mutate(key.id)
+    }
+  }
+
+  const handleCopyKey = async () => {
+    if (createdKey) {
+      await navigator.clipboard.writeText(createdKey.key)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    }
+  }
+
+  const closeKeyModal = () => {
+    setShowKeyModal(false)
+    setCreatedKey(null)
+    setCopied(false)
+  }
+
+  const formatDate = (dateStr: string | null) => {
+    if (!dateStr) return 'Never'
+    return new Date(dateStr).toLocaleString()
+  }
+
+  return (
+    <div style={styles.section}>
+      <div style={styles.sectionHeader}>
+        <div>
+          <h2 style={styles.sectionTitle}>API Keys</h2>
+          <p style={styles.hint}>Generate API keys for external applications to access forecast data.</p>
+        </div>
+        <button
+          onClick={() => setShowCreateForm(!showCreateForm)}
+          style={buttonStyle('primary')}
+        >
+          {showCreateForm ? 'Cancel' : 'Generate New Key'}
+        </button>
+      </div>
+
+      {showCreateForm && (
+        <div style={styles.addForm}>
+          <form onSubmit={handleCreate}>
+            {error && <div style={styles.error}>{error}</div>}
+            <div style={styles.formRow}>
+              <div style={styles.formField}>
+                <label style={styles.label}>Key Name</label>
+                <input
+                  type="text"
+                  value={newKeyName}
+                  onChange={(e) => setNewKeyName(e.target.value)}
+                  style={styles.input}
+                  placeholder="e.g., Kitchen Flash App"
+                  required
+                />
+              </div>
+              <button
+                type="submit"
+                style={mergeStyles(buttonStyle('secondary'), { alignSelf: 'flex-end' })}
+                disabled={createMutation.isPending}
+              >
+                {createMutation.isPending ? 'Generating...' : 'Generate'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {isLoading ? (
+        <div style={styles.loading}>Loading API keys...</div>
+      ) : apiKeys && apiKeys.length > 0 ? (
+        <div style={styles.userList}>
+          {apiKeys.map((key) => (
+            <div key={key.id} style={styles.userCard}>
+              <div style={styles.userInfo}>
+                <div style={styles.userName}>
+                  {key.name}
+                  <span style={{
+                    marginLeft: spacing.sm,
+                    fontFamily: 'monospace',
+                    fontSize: typography.sm,
+                    color: colors.textSecondary,
+                  }}>
+                    {key.key_prefix}...
+                  </span>
+                </div>
+                <div style={styles.userMeta}>
+                  Created: {formatDate(key.created_at)}
+                  <span style={styles.userDate}>
+                    {' • '}Last used: {formatDate(key.last_used_at)}
+                  </span>
+                </div>
+              </div>
+              <div style={styles.userActions}>
+                <span style={key.is_active ? badgeStyle('success') : badgeStyle('error')}>
+                  {key.is_active ? 'Active' : 'Revoked'}
+                </span>
+                {key.is_active && (
+                  <button
+                    onClick={() => handleRevoke(key)}
+                    style={mergeStyles(buttonStyle('secondary'), { padding: `${spacing.xs} ${spacing.sm}` })}
+                    disabled={revokeMutation.isPending}
+                    title="Revoke key"
+                  >
+                    Revoke
+                  </button>
+                )}
+                <button
+                  onClick={() => handleDelete(key)}
+                  style={styles.deleteButton}
+                  disabled={deleteMutation.isPending}
+                  title="Delete key"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={styles.emptyState}>
+          <p>No API keys created yet.</p>
+          <p style={{ fontSize: typography.sm, color: colors.textSecondary }}>
+            Generate an API key to allow external applications like Kitchen Flash to access forecast data.
+          </p>
+        </div>
+      )}
+
+      <div style={styles.infoBox}>
+        <h4 style={{ margin: `0 0 ${spacing.sm} 0`, fontSize: typography.base }}>Using API Keys</h4>
+        <ul style={{ margin: 0, paddingLeft: spacing.lg, fontSize: typography.sm, lineHeight: 1.6 }}>
+          <li>Include the API key in requests using the <code>X-API-Key</code> header</li>
+          <li>Example: <code>curl -H "X-API-Key: fk_..." /api/public/forecast/rooms</code></li>
+          <li>Available endpoints: <code>/public/forecast/rooms</code>, <code>/public/forecast/covers</code>, <code>/public/forecast/revenue</code></li>
+          <li>API keys provide read-only access to forecast data</li>
+          <li>Revoked keys will no longer work for API requests</li>
+        </ul>
+      </div>
+
+      {/* Key Created Modal */}
+      {showKeyModal && createdKey && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0, 0, 0, 0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+        }}>
+          <div style={{
+            background: colors.surface,
+            borderRadius: radius.xl,
+            padding: spacing.xl,
+            maxWidth: '500px',
+            width: '90%',
+            boxShadow: shadows.lg,
+          }}>
+            <h3 style={{ margin: `0 0 ${spacing.md} 0`, color: colors.success }}>
+              API Key Created
+            </h3>
+            <p style={{ margin: `0 0 ${spacing.md} 0`, color: colors.textSecondary }}>
+              Copy this key now. You won't be able to see it again!
+            </p>
+            <div style={{
+              background: colors.background,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.lg,
+              padding: spacing.md,
+              fontFamily: 'monospace',
+              fontSize: typography.sm,
+              wordBreak: 'break-all',
+              marginBottom: spacing.md,
+            }}>
+              {createdKey.key}
+            </div>
+            <div style={{ display: 'flex', gap: spacing.sm, justifyContent: 'flex-end' }}>
+              <button
+                onClick={handleCopyKey}
+                style={mergeStyles(
+                  buttonStyle('secondary'),
+                  copied ? { background: colors.success, color: '#fff' } : {}
+                )}
+              >
+                {copied ? 'Copied!' : 'Copy to Clipboard'}
+              </button>
+              <button
+                onClick={closeKeyModal}
+                style={buttonStyle('primary')}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -3562,6 +6779,15 @@ const styles: Record<string, React.CSSProperties> = {
   roomCategoryCount: {
     fontSize: typography.xs,
     color: colors.textMuted,
+    marginRight: spacing.sm,
+  },
+  displayOrderInput: {
+    width: '50px',
+    padding: `${spacing.xs} ${spacing.sm}`,
+    fontSize: typography.xs,
+    border: `1px solid ${colors.border}`,
+    borderRadius: radius.sm,
+    textAlign: 'center',
   },
   emptyState: {
     padding: spacing.lg,
@@ -3993,7 +7219,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: typography.sm,
     fontWeight: typography.medium,
   },
-  // TFT Training styles
+  // Settings grid styles
   settingsGrid: {
     display: 'grid',
     gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',

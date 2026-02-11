@@ -2,7 +2,7 @@
 Metrics aggregation job for forecast_data database
 Populates daily_metrics from newbook_bookings_stats
 
-This is the data source for forecasting models (Prophet, XGBoost, TFT).
+This is the data source for forecasting models (Prophet, XGBoost, CatBoost).
 """
 import logging
 from datetime import date, timedelta

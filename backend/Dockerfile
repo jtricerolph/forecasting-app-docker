@@ -3,9 +3,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system dependencies for Prophet (needs C++ compiler for CmdStan)
+# and PostgreSQL client tools for backup/restore
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
+    postgresql-client \
     g++ \
     make \
     && rm -rf /var/lib/apt/lists/*
@@ -13,12 +15,11 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install PyTorch CPU-only version first (smaller than GPU version)
-# This is needed for TFT (Temporal Fusion Transformer) model
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-
-# Install remaining requirements
+# Install requirements
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright and Chromium browser for booking.com scraping
+RUN playwright install chromium --with-deps
 
 # Install CmdStan for Prophet (required for Prophet 1.1+)
 RUN python -m cmdstanpy.install_cmdstan --cores 2

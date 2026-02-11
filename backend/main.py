@@ -24,19 +24,31 @@ from sqlalchemy import text
 from database import get_db, async_engine
 from auth import (
     Token, UserLogin, UserResponse, UserCreate,
-    authenticate_user, create_access_token, get_current_user,
+    authenticate_user, create_access_token, get_current_user, get_admin_user,
     get_all_users, create_user, delete_user,
     ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from typing import List
-from api import forecast, sync, export, budget, accuracy, evolution, crossref, explain, config, historical, resos, backtest, sync_bookings, reports, special_dates
+from api import forecast, sync, export, budget, accuracy, evolution, crossref, explain, config, historical, resos, backtest, sync_bookings, resos_sync, reports, special_dates, backup, public, bookability, competitor_rates, reconciliation
 from scheduler import start_scheduler, shutdown_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
-    # Startup
+    # Startup: clean up any scrape batches orphaned by previous shutdown
+    try:
+        from services.booking_scraper import cleanup_stale_batches
+        from database import SyncSessionLocal
+        db = SyncSessionLocal()
+        try:
+            cleanup_stale_batches(db, max_age_minutes=10)
+        finally:
+            db.close()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Stale batch cleanup on startup failed: {e}")
+
     start_scheduler()
     yield
     # Shutdown
@@ -44,8 +56,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Forecasting API",
-    description="Hotel & Restaurant Forecasting Service",
+    title="Finance API",
+    description="Hotel & Restaurant Finance Service",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -73,14 +85,20 @@ app.include_router(historical.router, prefix="/historical", tags=["Historical Da
 app.include_router(resos.router, prefix="/resos", tags=["Resos Mapping"])
 app.include_router(backtest.router, prefix="/backtest", tags=["Backtesting"])
 app.include_router(sync_bookings.router, prefix="/sync", tags=["Data Sync"])
+app.include_router(resos_sync.router, prefix="/sync", tags=["Data Sync"])
 app.include_router(reports.router, prefix="/reports", tags=["Reports"])
 app.include_router(special_dates.router, prefix="/settings", tags=["Settings"])
+app.include_router(backup.router, prefix="/backup", tags=["Backup & Restore"])
+app.include_router(public.router, prefix="/public", tags=["Public API"])
+app.include_router(bookability.router, prefix="/bookability", tags=["Bookability"])
+app.include_router(competitor_rates.router, prefix="/competitor-rates", tags=["Competitor Rates"])
+app.include_router(reconciliation.router, prefix="/reconciliation", tags=["Reconciliation"])
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "service": "forecasting-api"}
+    return {"status": "healthy", "service": "finance-api"}
 
 
 @app.get("/health/db")
@@ -105,7 +123,7 @@ async def login(user_login: UserLogin, db: AsyncSession = Depends(get_db)):
         )
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
+        data={"sub": user["username"], "role": user.get("role", "admin")}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -132,7 +150,7 @@ async def add_user(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new user"""
-    return await create_user(db, user_data.username, user_data.password, user_data.display_name)
+    return await create_user(db, user_data.username, user_data.password, user_data.display_name, user_data.role or 'admin')
 
 
 @app.delete("/auth/users/{user_id}")

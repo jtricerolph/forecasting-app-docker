@@ -37,6 +37,12 @@ class EarnedRevenueSyncConfig(BaseModel):
     sync_time: str = "05:10"  # HH:MM format
 
 
+class CurrentRatesSyncConfig(BaseModel):
+    """Auto sync configuration for current rates data (pickup-v2)"""
+    enabled: bool
+    sync_time: str = "05:20"  # HH:MM format
+
+
 @router.get("/bookings-data/status")
 async def get_bookings_sync_status(
     db: AsyncSession = Depends(get_db),
@@ -1051,3 +1057,362 @@ def run_earned_revenue_data_sync(
         raise
     finally:
         loop.close()
+
+
+# ============================================
+# CURRENT RATES SYNC (Pickup-V2)
+# ============================================
+
+@router.get("/current-rates/status")
+async def get_current_rates_sync_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get sync status for Newbook current rates data.
+    Used for pickup-v2 upper bound calculations.
+    """
+    # Auto-clear stuck syncs (running for more than 60 minutes)
+    await db.execute(
+        text("""
+            UPDATE sync_log
+            SET status = 'failed', completed_at = NOW(),
+                error_message = 'Auto-cleared: sync stuck for more than 60 minutes'
+            WHERE source = 'newbook' AND sync_type = 'current_rates'
+            AND status = 'running'
+            AND started_at < NOW() - INTERVAL '60 minutes'
+        """)
+    )
+    await db.commit()
+
+    # Get last successful sync
+    result = await db.execute(
+        text("""
+            SELECT id, sync_type, started_at, completed_at, status,
+                   records_fetched, records_created, records_updated,
+                   error_message, triggered_by
+            FROM sync_log
+            WHERE source = 'newbook' AND sync_type = 'current_rates'
+            AND status = 'success'
+            ORDER BY completed_at DESC
+            LIMIT 1
+        """)
+    )
+    last_success = result.fetchone()
+
+    # Get last sync (any status)
+    result = await db.execute(
+        text("""
+            SELECT id, sync_type, started_at, completed_at, status,
+                   records_fetched, records_created, records_updated,
+                   error_message, triggered_by
+            FROM sync_log
+            WHERE source = 'newbook' AND sync_type = 'current_rates'
+            ORDER BY started_at DESC
+            LIMIT 1
+        """)
+    )
+    last_sync = result.fetchone()
+
+    # Get auto sync config
+    result = await db.execute(
+        text("SELECT config_value FROM system_config WHERE config_key = 'sync_newbook_current_rates_enabled'")
+    )
+    row = result.fetchone()
+    auto_enabled = row.config_value.lower() == 'true' if row and row.config_value else False
+
+    result = await db.execute(
+        text("SELECT config_value FROM system_config WHERE config_key = 'sync_newbook_current_rates_time'")
+    )
+    row = result.fetchone()
+    sync_time = row.config_value if row and row.config_value else '05:20'
+
+    # Get total records in table
+    result = await db.execute(text("SELECT COUNT(*) as count FROM newbook_current_rates"))
+    total_records = result.fetchone().count
+
+    # Get date range of data
+    result = await db.execute(
+        text("SELECT MIN(rate_date) as min_date, MAX(rate_date) as max_date FROM newbook_current_rates")
+    )
+    date_range = result.fetchone()
+
+    # Get count by category
+    result = await db.execute(
+        text("SELECT category_id, COUNT(*) as count FROM newbook_current_rates GROUP BY category_id ORDER BY category_id")
+    )
+    category_counts = {row.category_id: row.count for row in result.fetchall()}
+
+    return {
+        "last_successful_sync": {
+            "completed_at": last_success.completed_at if last_success else None,
+            "records_fetched": last_success.records_fetched if last_success else None,
+            "records_created": last_success.records_created if last_success else None,
+            "triggered_by": last_success.triggered_by if last_success else None,
+        } if last_success else None,
+        "last_sync": {
+            "started_at": last_sync.started_at if last_sync else None,
+            "completed_at": last_sync.completed_at if last_sync else None,
+            "status": last_sync.status if last_sync else None,
+            "records_fetched": last_sync.records_fetched if last_sync else None,
+            "error_message": last_sync.error_message if last_sync else None,
+            "triggered_by": last_sync.triggered_by if last_sync else None,
+        } if last_sync else None,
+        "auto_sync": {
+            "enabled": auto_enabled,
+            "time": sync_time
+        },
+        "total_records": total_records,
+        "data_range": {
+            "from": date_range.min_date if date_range else None,
+            "to": date_range.max_date if date_range else None
+        },
+        "category_counts": category_counts
+    }
+
+
+@router.get("/current-rates/logs")
+async def get_current_rates_sync_logs(
+    limit: int = Query(5, description="Number of logs to return"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get recent sync logs for current rates data.
+    """
+    result = await db.execute(
+        text("""
+            SELECT id, sync_type, started_at, completed_at, status,
+                   records_fetched, records_created, records_updated,
+                   error_message, triggered_by
+            FROM sync_log
+            WHERE source = 'newbook' AND sync_type = 'current_rates'
+            ORDER BY started_at DESC
+            LIMIT :limit
+        """),
+        {"limit": limit}
+    )
+    rows = result.fetchall()
+
+    return [
+        {
+            "id": row.id,
+            "started_at": row.started_at,
+            "completed_at": row.completed_at,
+            "status": row.status,
+            "records_fetched": row.records_fetched,
+            "records_created": row.records_created,
+            "error_message": row.error_message,
+            "triggered_by": row.triggered_by
+        }
+        for row in rows
+    ]
+
+
+@router.post("/current-rates/sync")
+async def trigger_current_rates_sync(
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Trigger a current rates sync from Newbook API.
+    Fetches rates for all categories for the next 365 days.
+    """
+    # Auto-clear stuck syncs (running for more than 60 minutes)
+    await db.execute(
+        text("""
+            UPDATE sync_log
+            SET status = 'failed', completed_at = NOW(),
+                error_message = 'Auto-cleared: sync stuck for more than 60 minutes'
+            WHERE source = 'newbook' AND sync_type = 'current_rates'
+            AND status = 'running'
+            AND started_at < NOW() - INTERVAL '60 minutes'
+        """)
+    )
+    await db.commit()
+
+    # Check if a sync is already running
+    result = await db.execute(
+        text("""
+            SELECT id, started_at FROM sync_log
+            WHERE source = 'newbook' AND sync_type = 'current_rates'
+            AND status = 'running'
+            ORDER BY started_at DESC
+            LIMIT 1
+        """)
+    )
+    running = result.fetchone()
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A sync is already running (started at {running.started_at}). Please wait for it to complete."
+        )
+
+    # Queue background task
+    background_tasks.add_task(
+        run_current_rates_sync,
+        triggered_by=f"user:{current_user['username']}"
+    )
+
+    return {
+        "status": "started",
+        "message": "Current rates sync started - fetching rates for next 365 days"
+    }
+
+
+@router.post("/current-rates/config")
+async def update_current_rates_sync_config(
+    config: CurrentRatesSyncConfig,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Update auto sync configuration for current rates data.
+    """
+    # Upsert enabled setting
+    await db.execute(
+        text("""
+            INSERT INTO system_config (config_key, config_value, description, updated_at, updated_by)
+            VALUES ('sync_newbook_current_rates_enabled', :value, 'Enable automatic Newbook current rates sync', NOW(), :user)
+            ON CONFLICT (config_key) DO UPDATE SET
+                config_value = :value,
+                updated_at = NOW(),
+                updated_by = :user
+        """),
+        {"value": str(config.enabled).lower(), "user": current_user['username']}
+    )
+
+    # Upsert sync time setting
+    await db.execute(
+        text("""
+            INSERT INTO system_config (config_key, config_value, description, updated_at, updated_by)
+            VALUES ('sync_newbook_current_rates_time', :value, 'Newbook current rates sync time (HH:MM)', NOW(), :user)
+            ON CONFLICT (config_key) DO UPDATE SET
+                config_value = :value,
+                updated_at = NOW(),
+                updated_by = :user
+        """),
+        {"value": config.sync_time, "user": current_user['username']}
+    )
+
+    await db.commit()
+
+    return {
+        "status": "success",
+        "enabled": config.enabled,
+        "sync_time": config.sync_time
+    }
+
+
+@router.post("/current-rates/cancel")
+async def cancel_current_rates_sync(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Cancel/clear a stuck current rates sync.
+    Marks any running sync as failed so a new sync can be started.
+    """
+    result = await db.execute(
+        text("""
+            UPDATE sync_log
+            SET status = 'failed',
+                completed_at = NOW(),
+                error_message = 'Manually cancelled by user'
+            WHERE source = 'newbook'
+            AND sync_type = 'current_rates'
+            AND status = 'running'
+            RETURNING id, started_at
+        """)
+    )
+    cancelled_rows = result.fetchall()
+    await db.commit()
+
+    if cancelled_rows:
+        return {
+            "status": "success",
+            "message": f"Cancelled {len(cancelled_rows)} running sync(s)",
+            "cancelled_ids": [row.id for row in cancelled_rows]
+        }
+    else:
+        return {
+            "status": "success",
+            "message": "No running sync to cancel"
+        }
+
+
+def run_current_rates_sync(triggered_by: str = "scheduler"):
+    """
+    Background task to sync current rates from Newbook API.
+    """
+    import sys
+    import asyncio
+    from jobs.fetch_current_rates import run_fetch_current_rates
+    from database import SyncSessionLocal
+    from sqlalchemy import text
+
+    print(f"[SYNC-CURRENT-RATES] Starting sync", flush=True)
+    sys.stdout.flush()
+
+    db = SyncSessionLocal()
+    log_id = None
+
+    try:
+        # Create sync log entry
+        result = db.execute(
+            text("""
+                INSERT INTO sync_log (source, sync_type, started_at, status, triggered_by)
+                VALUES ('newbook', 'current_rates', NOW(), 'running', :triggered_by)
+                RETURNING id
+            """),
+            {"triggered_by": triggered_by}
+        )
+        log_id = result.fetchone().id
+        db.commit()
+
+        # Run async sync
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_fetch_current_rates())
+            print(f"[SYNC-CURRENT-RATES] Sync completed", flush=True)
+
+            # Count records
+            result = db.execute(text("SELECT COUNT(*) as count FROM newbook_current_rates"))
+            total_records = result.fetchone().count
+
+            # Update log as success
+            db.execute(
+                text("""
+                    UPDATE sync_log
+                    SET completed_at = NOW(), status = 'success',
+                        records_fetched = :count, records_created = :count
+                    WHERE id = :id
+                """),
+                {"id": log_id, "count": total_records}
+            )
+            db.commit()
+
+        except Exception as e:
+            print(f"[SYNC-CURRENT-RATES] FAILED: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+            # Update log as failed
+            if log_id:
+                db.execute(
+                    text("""
+                        UPDATE sync_log
+                        SET completed_at = NOW(), status = 'failed', error_message = :error
+                        WHERE id = :id
+                    """),
+                    {"id": log_id, "error": str(e)[:500]}
+                )
+                db.commit()
+            raise
+        finally:
+            loop.close()
+
+    finally:
+        db.close()

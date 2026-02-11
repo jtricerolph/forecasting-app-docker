@@ -111,6 +111,9 @@ async def run_bookings_aggregation(triggered_by: str = "manual"):
         for target_date in sorted(affected_dates):
             await aggregate_date(db, target_date, vat_rate)
 
+        # Fill any dates with occupancy data but no bookings (e.g., closed periods)
+        await fill_occupancy_only_dates(db, vat_rate)
+
         # Update booking pace table
         await update_booking_pace(db)
 
@@ -185,6 +188,25 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
 
     bookable_count = rooms_count - maintenance_count
 
+    # Fallback: If no occupancy data (bookable_count=0), use last known bookable_count
+    # This prevents division-by-zero issues in forecast models when occupancy report is missing
+    if bookable_count <= 0:
+        fallback_result = db.execute(
+            text("""
+                SELECT bookable_count
+                FROM newbook_bookings_stats
+                WHERE bookable_count > 5 AND date < :target_date
+                ORDER BY date DESC
+                LIMIT 1
+            """),
+            {"target_date": target_date}
+        )
+        fallback_row = fallback_result.fetchone()
+        if fallback_row and fallback_row.bookable_count:
+            bookable_count = fallback_row.bookable_count
+            rooms_count = bookable_count  # Assume same for rooms_count
+            logger.info(f"Using fallback bookable_count={bookable_count} for {target_date}")
+
     # Step 2: Get booking stats (bookings staying this night)
     # A booking is "in house" if: arrival_date <= date < departure_date
     # Only counts bookings for categories marked as is_included=true in settings
@@ -220,6 +242,7 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
 
     occupancy_by_category: Dict[str, Dict[str, Any]] = {}
     revenue_by_category: Dict[str, Dict[str, Any]] = {}
+    rate_stats_by_category: Dict[str, Dict[str, Any]] = {}  # Pickup-V2: min/max/adr per category
 
     for booking in bookings:
         booking_count += 1
@@ -244,6 +267,11 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
                 "guest_rate_total": Decimal('0'),
                 "net_booking_rev_total": Decimal('0')
             }
+        if cat_id not in rate_stats_by_category:
+            rate_stats_by_category[cat_id] = {
+                "rates": [],  # Collect all net rates for min/max/adr calculation
+                "rooms": 0
+            }
 
         # Update occupancy by category
         occupancy_by_category[cat_id]["booking_count"] += 1
@@ -265,6 +293,11 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
 
         revenue_by_category[cat_id]["guest_rate_total"] += calculated_amount
         revenue_by_category[cat_id]["net_booking_rev_total"] += net_amount
+
+        # Pickup-V2: Collect net rate for rate stats (only if rate > 0)
+        if net_amount > 0:
+            rate_stats_by_category[cat_id]["rates"].append(float(net_amount))
+            rate_stats_by_category[cat_id]["rooms"] += 1
 
     # Calculate occupancy percentages
     total_occupancy_pct = None
@@ -293,6 +326,18 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
             for k, v in d.items()
         }
 
+    # Pickup-V2: Calculate min/max/adr from collected rates
+    rate_stats_final: Dict[str, Dict[str, Any]] = {}
+    for cat_id, stats in rate_stats_by_category.items():
+        rates = stats["rates"]
+        if rates:
+            rate_stats_final[cat_id] = {
+                "min_net": round(min(rates), 2),
+                "max_net": round(max(rates), 2),
+                "adr_net": round(sum(rates) / len(rates), 2),
+                "rooms": stats["rooms"]
+            }
+
     occupancy_json = json.dumps({
         k: decimal_to_float(v) for k, v in occupancy_by_category.items()
     })
@@ -300,6 +345,7 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
         k: decimal_to_float(v) for k, v in revenue_by_category.items()
     })
     availability_json = json.dumps(availability_by_category)
+    rate_stats_json = json.dumps(rate_stats_final)
 
     # Upsert into newbook_bookings_stats
     db.execute(
@@ -310,6 +356,7 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
                 total_occupancy_pct, bookable_occupancy_pct,
                 guest_rate_total, net_booking_rev_total,
                 occupancy_by_category, revenue_by_category, availability_by_category,
+                rate_stats_by_category,
                 aggregated_at
             ) VALUES (
                 :date, :rooms_count, :maintenance_count, :bookable_count,
@@ -317,6 +364,7 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
                 :total_occupancy_pct, :bookable_occupancy_pct,
                 :guest_rate_total, :net_booking_rev_total,
                 :occupancy_by_category, :revenue_by_category, :availability_by_category,
+                :rate_stats_by_category,
                 NOW()
             )
             ON CONFLICT (date) DO UPDATE SET
@@ -335,6 +383,7 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
                 occupancy_by_category = :occupancy_by_category,
                 revenue_by_category = :revenue_by_category,
                 availability_by_category = :availability_by_category,
+                rate_stats_by_category = :rate_stats_by_category,
                 aggregated_at = NOW()
         """),
         {
@@ -353,7 +402,8 @@ async def aggregate_date(db, target_date: date, vat_rate: Decimal):
             "net_booking_rev_total": float(net_booking_rev_total),
             "occupancy_by_category": occupancy_json,
             "revenue_by_category": revenue_json,
-            "availability_by_category": availability_json
+            "availability_by_category": availability_json,
+            "rate_stats_by_category": rate_stats_json
         }
     )
 
@@ -380,7 +430,7 @@ def get_rate_for_date(raw_json: dict, target_date: date, vat_rate: Decimal) -> t
             # Try to get net from taxes array if available
             taxes = tariff.get("taxes", [])
             if taxes and charge_amount > 0:
-                tax_amount = sum(Decimal(str(t.get("amount", 0) or 0)) for t in taxes)
+                tax_amount = sum(Decimal(str(t.get("tax_amount", 0) or 0)) for t in taxes)
                 net_amount = charge_amount - tax_amount
             else:
                 # Fallback: calculate net using VAT rate
@@ -395,45 +445,50 @@ async def update_booking_pace(db):
     """
     Update booking pace table with current snapshots.
 
-    For each tracked interval, snapshot the current booking count for that arrival_date.
+    For each tracked interval, snapshot the current OCCUPANCY count for that stay_date.
+    Occupancy = arrivals + stayovers (guests already checked in from earlier dates).
+
+    This counts bookings where: arrival_date <= stay_date < departure_date
     Also ensures all dates in the forecast window have rows (prevents gaps when job misses a day).
     """
-    logger.info("Updating booking pace snapshots")
+    logger.info("Updating booking pace snapshots (occupancy-based)")
 
     today = date.today()
     updates = 0
 
-    # Step 1: Update tracked interval columns as before
+    # Step 1: Update tracked interval columns
     for interval in PACE_INTERVALS:
-        arrival_date = today + timedelta(days=interval)
+        stay_date = today + timedelta(days=interval)
 
-        # Count current bookings for this arrival_date (included categories only, valid statuses)
+        # Count OCCUPANCY for this stay_date (arrivals + stayovers)
+        # A booking occupies a date if: arrival_date <= stay_date < departure_date
         result = db.execute(
             text("""
                 SELECT COUNT(*) as count
                 FROM newbook_bookings_data b
                 JOIN newbook_room_categories c ON b.category_id = c.site_id
-                WHERE b.arrival_date = :arrival_date
+                WHERE b.arrival_date <= :stay_date
+                AND b.departure_date > :stay_date
                 AND b.status IN :valid_statuses
                 AND c.is_included = true
             """),
-            {"arrival_date": arrival_date, "valid_statuses": VALID_STATUSES}
+            {"stay_date": stay_date, "valid_statuses": VALID_STATUSES}
         )
         row = result.fetchone()
         booking_count = row.count if row else 0
 
-        # Upsert to pace table
+        # Upsert to pace table (column still named arrival_date for backwards compat)
         column_name = f"d{interval}"
 
         # Build dynamic SQL for upsert
         db.execute(
             text(f"""
                 INSERT INTO newbook_booking_pace (arrival_date, {column_name}, updated_at)
-                VALUES (:arrival_date, :count, NOW())
+                VALUES (:stay_date, :count, NOW())
                 ON CONFLICT (arrival_date) DO UPDATE
                 SET {column_name} = :count, updated_at = NOW()
             """),
-            {"arrival_date": arrival_date, "count": booking_count}
+            {"stay_date": stay_date, "count": booking_count}
         )
         updates += 1
 
@@ -444,7 +499,7 @@ async def update_booking_pace(db):
         if days_out in PACE_INTERVALS:
             continue  # Already handled in step 1
 
-        arrival_date = today + timedelta(days=days_out)
+        stay_date = today + timedelta(days=days_out)
 
         # Find the bracketed column (round up to next interval)
         bracket_col = None
@@ -456,17 +511,18 @@ async def update_booking_pace(db):
         if not bracket_col:
             continue
 
-        # Count current bookings
+        # Count OCCUPANCY (arrivals + stayovers)
         result = db.execute(
             text("""
                 SELECT COUNT(*) as count
                 FROM newbook_bookings_data b
                 JOIN newbook_room_categories c ON b.category_id = c.site_id
-                WHERE b.arrival_date = :arrival_date
+                WHERE b.arrival_date <= :stay_date
+                AND b.departure_date > :stay_date
                 AND b.status IN :valid_statuses
                 AND c.is_included = true
             """),
-            {"arrival_date": arrival_date, "valid_statuses": VALID_STATUSES}
+            {"stay_date": stay_date, "valid_statuses": VALID_STATUSES}
         )
         row = result.fetchone()
         booking_count = row.count if row else 0
@@ -475,15 +531,54 @@ async def update_booking_pace(db):
         db.execute(
             text(f"""
                 INSERT INTO newbook_booking_pace (arrival_date, {bracket_col}, updated_at)
-                VALUES (:arrival_date, :count, NOW())
+                VALUES (:stay_date, :count, NOW())
                 ON CONFLICT (arrival_date) DO UPDATE
                 SET {bracket_col} = :count, updated_at = NOW()
             """),
-            {"arrival_date": arrival_date, "count": booking_count}
+            {"stay_date": stay_date, "count": booking_count}
         )
         gap_updates += 1
 
-    logger.info(f"Updated {updates} pace snapshots + {gap_updates} gap dates")
+    logger.info(f"Updated {updates} pace snapshots + {gap_updates} gap dates (occupancy-based)")
+
+
+async def fill_occupancy_only_dates(db, vat_rate: Decimal = None):
+    """
+    Create stats rows for dates that have occupancy data but no bookings.
+
+    This ensures dates like closed periods (all rooms in maintenance) get proper
+    stats rows with bookable_count=0, so forecasts can cap correctly.
+    """
+    if vat_rate is None:
+        vat_rate_str = get_config_value(db, 'accommodation_vat_rate')
+        vat_rate = Decimal(vat_rate_str) if vat_rate_str else Decimal('0.20')
+
+    # Find dates with occupancy data but no stats row
+    result = db.execute(
+        text("""
+            SELECT DISTINCT o.date
+            FROM newbook_occupancy_report_data o
+            JOIN newbook_room_categories c ON o.category_id = c.site_id
+            WHERE c.is_included = true
+            AND NOT EXISTS (
+                SELECT 1 FROM newbook_bookings_stats s WHERE s.date = o.date
+            )
+            ORDER BY o.date
+        """)
+    )
+    missing_dates = [row.date for row in result.fetchall()]
+
+    if not missing_dates:
+        logger.info("No occupancy-only dates to fill")
+        return 0
+
+    logger.info(f"Filling {len(missing_dates)} occupancy-only dates (no bookings)")
+
+    for target_date in missing_dates:
+        await aggregate_date(db, target_date, vat_rate)
+
+    logger.info(f"Filled {len(missing_dates)} occupancy-only dates")
+    return len(missing_dates)
 
 
 async def backfill_aggregation(db=None):
@@ -532,30 +627,37 @@ async def backfill_aggregation(db=None):
         db.commit()
         print(f"[BACKFILL] Stats aggregation complete: {len(stay_dates)} dates", flush=True)
 
-        # Step 3: Get all unique arrival dates for pace backfill
-        print("[BACKFILL] Finding all arrival dates for pace...", flush=True)
+        # Step 2b: Fill in dates with occupancy data but no bookings (e.g., closed periods)
+        print("[BACKFILL] Filling occupancy-only dates (no bookings)...", flush=True)
+        filled_count = await fill_occupancy_only_dates(db, vat_rate)
+        db.commit()
+        print(f"[BACKFILL] Filled {filled_count} occupancy-only dates", flush=True)
+
+        # Step 3: Get ALL dates from stats for pace backfill
+        # This includes dates with 0 bookings (closed periods, future dates)
+        # Critical: Without pace entries, models may predict 100% occupancy
+        print("[BACKFILL] Finding all stats dates for pace...", flush=True)
         result = db.execute(
             text("""
-                SELECT DISTINCT arrival_date
-                FROM newbook_bookings_data
-                WHERE arrival_date IS NOT NULL
-                ORDER BY arrival_date
+                SELECT date as stay_date
+                FROM newbook_bookings_stats
+                ORDER BY date
             """)
         )
-        arrival_dates = [row.arrival_date for row in result.fetchall()]
-        print(f"[BACKFILL] Found {len(arrival_dates)} arrival dates for pace backfill", flush=True)
+        stay_dates_for_pace = [row.stay_date for row in result.fetchall()]
+        print(f"[BACKFILL] Found {len(stay_dates_for_pace)} stats dates for pace backfill", flush=True)
 
-        # Step 4: Backfill pace for each arrival date
+        # Step 4: Backfill pace for each stay date (occupancy-based)
         today = date.today()
-        for i, arrival_date in enumerate(arrival_dates):
+        for i, stay_date in enumerate(stay_dates_for_pace):
             if i % 100 == 0:
-                print(f"[BACKFILL] Backfilling pace: {i}/{len(arrival_dates)} dates...", flush=True)
+                print(f"[BACKFILL] Backfilling pace: {i}/{len(stay_dates_for_pace)} dates...", flush=True)
                 db.commit()
 
-            await backfill_pace_for_date(db, arrival_date, today)
+            await backfill_pace_for_date(db, stay_date, today)
 
         db.commit()
-        print(f"[BACKFILL] Pace backfill complete: {len(arrival_dates)} dates", flush=True)
+        print(f"[BACKFILL] Pace backfill complete: {len(stay_dates_for_pace)} dates (occupancy-based)", flush=True)
 
         # Update last aggregation timestamp
         db.execute(
@@ -583,20 +685,21 @@ async def backfill_aggregation(db=None):
             db.close()
 
 
-async def backfill_pace_for_date(db, arrival_date: date, today: date):
+async def backfill_pace_for_date(db, stay_date: date, today: date):
     """
-    Backfill pace snapshots for a single arrival date using booking_placed timestamps.
+    Backfill pace snapshots for a single stay date using booking_placed timestamps.
 
-    For historical arrivals: Reconstruct what bookings existed at each lead time
-    For future arrivals: Use current count for today's lead time
+    Tracks OCCUPANCY (arrivals + stayovers), not just arrivals.
+    For historical stays: Reconstruct what occupancy would have been at each lead time
+    For future stays: Use current count for today's lead time
     """
-    # For each interval, calculate what the booking count was at that point
+    # For each interval, calculate what the occupancy count was at that point
     # Using booking_placed to determine when each booking was created
     pace_values = {}
 
     for interval in PACE_INTERVALS:
         # The snapshot date is when we would have taken this measurement
-        snapshot_date = arrival_date - timedelta(days=interval)
+        snapshot_date = stay_date - timedelta(days=interval)
 
         if snapshot_date > today:
             # This snapshot hasn't happened yet - skip
@@ -606,22 +709,25 @@ async def backfill_pace_for_date(db, arrival_date: date, today: date):
             # Don't go too far back - skip ancient dates
             continue
 
-        # Count bookings that existed at the snapshot date
-        # A booking existed if: booking_placed <= snapshot_date
+        # Count OCCUPANCY that existed at the snapshot date
+        # A booking contributes to occupancy if:
+        #   - arrival_date <= stay_date < departure_date (booking spans this night)
+        #   - booking_placed <= snapshot_date (booking existed at measurement time)
         # Only counts categories with is_included = true
         result = db.execute(
             text("""
                 SELECT COUNT(*) as count
                 FROM newbook_bookings_data b
                 JOIN newbook_room_categories c ON b.category_id = c.site_id
-                WHERE b.arrival_date = :arrival_date
+                WHERE b.arrival_date <= :stay_date
+                AND b.departure_date > :stay_date
                 AND b.status IN :valid_statuses
                 AND c.is_included = true
                 AND b.booking_placed IS NOT NULL
                 AND b.booking_placed::date <= :snapshot_date
             """),
             {
-                "arrival_date": arrival_date,
+                "stay_date": stay_date,
                 "valid_statuses": VALID_STATUSES,
                 "snapshot_date": snapshot_date
             }
@@ -641,12 +747,67 @@ async def backfill_pace_for_date(db, arrival_date: date, today: date):
     db.execute(
         text(f"""
             INSERT INTO newbook_booking_pace (arrival_date, {insert_cols}, updated_at)
-            VALUES (:arrival_date, {insert_vals}, NOW())
+            VALUES (:stay_date, {insert_vals}, NOW())
             ON CONFLICT (arrival_date) DO UPDATE SET
                 {set_clauses}, updated_at = NOW()
         """),
-        {"arrival_date": arrival_date, **pace_values}
+        {"stay_date": stay_date, **pace_values}
     )
+
+
+async def fill_missing_pace_entries(db=None):
+    """
+    Fill pace entries for all stats dates that don't have pace rows.
+
+    This fixes gaps where dates exist in stats (with 0 or more bookings)
+    but have no pace data, causing models to predict incorrectly.
+    """
+    import sys
+    print("[PACE-FILL] Finding dates missing pace entries...", flush=True)
+
+    close_db = False
+    if db is None:
+        db = next(iter([SyncSessionLocal()]))
+        close_db = True
+
+    try:
+        # Find dates in stats but not in pace
+        result = db.execute(
+            text("""
+                SELECT s.date as stay_date
+                FROM newbook_bookings_stats s
+                LEFT JOIN newbook_booking_pace p ON s.date = p.arrival_date
+                WHERE p.arrival_date IS NULL
+                ORDER BY s.date
+            """)
+        )
+        missing_dates = [row.stay_date for row in result.fetchall()]
+
+        if not missing_dates:
+            print("[PACE-FILL] No missing pace entries found", flush=True)
+            return 0
+
+        print(f"[PACE-FILL] Found {len(missing_dates)} dates missing pace entries", flush=True)
+
+        today = date.today()
+        for i, stay_date in enumerate(missing_dates):
+            if i % 100 == 0:
+                print(f"[PACE-FILL] Processing: {i}/{len(missing_dates)} dates...", flush=True)
+                db.commit()
+
+            await backfill_pace_for_date(db, stay_date, today)
+
+        db.commit()
+        print(f"[PACE-FILL] Filled {len(missing_dates)} missing pace entries", flush=True)
+        return len(missing_dates)
+
+    except Exception as e:
+        print(f"[PACE-FILL] FAILED: {e}", flush=True)
+        db.rollback()
+        raise
+    finally:
+        if close_db:
+            db.close()
 
 
 def get_pace_interval(days_out: int) -> str:

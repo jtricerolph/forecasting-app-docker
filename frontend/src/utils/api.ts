@@ -34,6 +34,7 @@ export interface User {
   username: string
   display_name: string
   is_active: boolean
+  role?: string
 }
 
 export interface LoginResponse {
@@ -49,6 +50,7 @@ export interface CreateUserRequest {
   username: string
   password: string
   display_name?: string
+  role?: string
 }
 
 export const authApi = {

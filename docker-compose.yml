@@ -1,6 +1,6 @@
 services:
   # ============================================
-  # SHARED DATABASE (both old and new databases)
+  # DATABASE
   # ============================================
 
   db:
@@ -8,66 +8,22 @@ services:
     environment:
       - POSTGRES_USER=forecast
       - POSTGRES_PASSWORD=forecast_secret
-      - POSTGRES_DB=forecast
+      - POSTGRES_DB=forecast_data
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
-      - ./db/init_clean.sql:/docker-entrypoint-initdb.d/02-init-new.sql
+      - ./db/init_clean.sql:/docker-entrypoint-initdb.d/01-init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U forecast -d forecast"]
+      test: ["CMD-SHELL", "pg_isready -U forecast -d forecast_data"]
       interval: 5s
       timeout: 5s
       retries: 5
     restart: unless-stopped
 
   # ============================================
-  # OLD SYSTEM (Streamlit dashboard)
+  # BACKEND & FRONTEND
   # ============================================
 
   backend:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql://forecast:forecast_secret@db:5432/forecast
-      - JWT_SECRET=${JWT_SECRET}
-      - NEWBOOK_API_KEY=${NEWBOOK_API_KEY}
-      - NEWBOOK_USERNAME=${NEWBOOK_USERNAME}
-      - NEWBOOK_PASSWORD=${NEWBOOK_PASSWORD}
-      - NEWBOOK_REGION=${NEWBOOK_REGION}
-      - RESOS_API_KEY=${RESOS_API_KEY}
-      - TFT_USE_GPU=false
-    volumes:
-      - tft_models:/app/models/tft
-    # Resource limits to prevent TFT training from locking up container
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-
-  dashboard:
-    build: ./dashboard
-    ports:
-      - "8501:8501"
-    environment:
-      - BACKEND_URL=http://backend:8000
-    depends_on:
-      - backend
-    restart: unless-stopped
-
-  # ============================================
-  # NEW SYSTEM (React frontend)
-  # ============================================
-
-  backend-new:
     build: ./backend
     ports:
       - "8001:8000"
@@ -79,10 +35,8 @@ services:
       - NEWBOOK_PASSWORD=${NEWBOOK_PASSWORD}
       - NEWBOOK_REGION=${NEWBOOK_REGION}
       - RESOS_API_KEY=${RESOS_API_KEY}
-      - TFT_USE_GPU=false
     volumes:
-      - tft_models:/app/models/tft
-    # Resource limits to prevent TFT training from locking up container
+      - recon_uploads:/app/uploads/reconciliation
     deploy:
       resources:
         limits:
@@ -99,9 +53,9 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "3080:80"
+      - "3081:80"
     depends_on:
-      - backend-new
+      - backend
     restart: unless-stopped
 
   # ============================================
@@ -111,7 +65,7 @@ services:
   adminer:
     image: adminer:latest
     ports:
-      - "8080:8080"
+      - "8082:8080"
     environment:
       - ADMINER_DEFAULT_SERVER=db
       - ADMINER_DESIGN=nette
@@ -121,4 +75,4 @@ services:
 
 volumes:
   postgres_data:
-  tft_models:
+  recon_uploads:

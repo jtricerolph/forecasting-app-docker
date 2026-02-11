@@ -1,16 +1,19 @@
 """
-Authentication utilities - JWT based simple auth
+Authentication utilities - JWT based simple auth + API key auth
 """
 import os
 import bcrypt
+import hashlib
+import secrets
+import base64
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -43,12 +46,14 @@ class UserResponse(BaseModel):
     username: str
     display_name: Optional[str]
     is_active: bool
+    role: Optional[str] = 'admin'
 
 
 class UserCreate(BaseModel):
     username: str
     password: str
     display_name: Optional[str] = None
+    role: Optional[str] = 'admin'
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -72,6 +77,20 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return encoded_jwt
+
+
+async def get_admin_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db)
+) -> dict:
+    """Get current user and verify they have admin role"""
+    user = await get_current_user(credentials, db)
+    if user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return user
 
 
 async def get_current_user(
@@ -107,14 +126,15 @@ async def get_current_user(
         "id": user.id,
         "username": user.username,
         "display_name": user.display_name,
-        "is_active": user.is_active
+        "is_active": user.is_active,
+        "role": getattr(user, 'role', 'admin') or 'admin'
     }
 
 
 def select_user_by_username(username: str):
     """SQL query to select user by username"""
     from sqlalchemy import text
-    return text("SELECT id, username, password_hash, display_name, is_active FROM users WHERE username = :username").bindparams(username=username)
+    return text("SELECT id, username, password_hash, display_name, is_active, COALESCE(role, 'admin') as role FROM users WHERE username = :username").bindparams(username=username)
 
 
 async def authenticate_user(db: AsyncSession, username: str, password: str) -> Optional[dict]:
@@ -131,7 +151,8 @@ async def authenticate_user(db: AsyncSession, username: str, password: str) -> O
         "id": user.id,
         "username": user.username,
         "display_name": user.display_name,
-        "is_active": user.is_active
+        "is_active": user.is_active,
+        "role": getattr(user, 'role', 'admin') or 'admin'
     }
 
 
@@ -139,7 +160,7 @@ async def get_all_users(db: AsyncSession) -> list:
     """Get all users from database"""
     from sqlalchemy import text
     result = await db.execute(
-        text("SELECT id, username, display_name, is_active, created_at FROM users ORDER BY id")
+        text("SELECT id, username, display_name, is_active, created_at, COALESCE(role, 'admin') as role FROM users ORDER BY id")
     )
     users = result.fetchall()
     return [
@@ -148,13 +169,14 @@ async def get_all_users(db: AsyncSession) -> list:
             "username": u.username,
             "display_name": u.display_name,
             "is_active": u.is_active,
-            "created_at": u.created_at.isoformat() if u.created_at else None
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "role": u.role
         }
         for u in users
     ]
 
 
-async def create_user(db: AsyncSession, username: str, password: str, display_name: Optional[str] = None) -> dict:
+async def create_user(db: AsyncSession, username: str, password: str, display_name: Optional[str] = None, role: str = 'admin') -> dict:
     """Create a new user"""
     from sqlalchemy import text
 
@@ -169,13 +191,14 @@ async def create_user(db: AsyncSession, username: str, password: str, display_na
     password_hash = get_password_hash(password)
     result = await db.execute(
         text("""
-            INSERT INTO users (username, password_hash, display_name, is_active, created_at)
-            VALUES (:username, :password_hash, :display_name, true, NOW())
-            RETURNING id, username, display_name, is_active, created_at
+            INSERT INTO users (username, password_hash, display_name, is_active, role, created_at)
+            VALUES (:username, :password_hash, :display_name, true, :role, NOW())
+            RETURNING id, username, display_name, is_active, role, created_at
         """).bindparams(
             username=username,
             password_hash=password_hash,
-            display_name=display_name or username
+            display_name=display_name or username,
+            role=role
         )
     )
     await db.commit()
@@ -185,6 +208,7 @@ async def create_user(db: AsyncSession, username: str, password: str, display_na
         "username": user.username,
         "display_name": user.display_name,
         "is_active": user.is_active,
+        "role": user.role,
         "created_at": user.created_at.isoformat() if user.created_at else None
     }
 
@@ -207,6 +231,189 @@ async def delete_user(db: AsyncSession, user_id: int, current_user_id: int) -> b
     # Delete user
     await db.execute(
         text("DELETE FROM users WHERE id = :user_id").bindparams(user_id=user_id)
+    )
+    await db.commit()
+    return True
+
+
+# ============================================
+# API KEY AUTHENTICATION
+# ============================================
+
+def generate_api_key() -> tuple[str, str, str]:
+    """
+    Generate a new API key.
+    Returns: (full_key, key_hash, key_prefix)
+    - full_key: The complete key to give to user (shown only once)
+    - key_hash: SHA256 hash to store in database
+    - key_prefix: First 12 chars for display purposes
+    """
+    # Generate 32 random bytes and encode as URL-safe base64
+    random_bytes = secrets.token_bytes(32)
+    key_body = base64.urlsafe_b64encode(random_bytes).decode('utf-8').rstrip('=')
+    full_key = f"fk_{key_body}"
+
+    # Hash with SHA256 for storage
+    key_hash = hashlib.sha256(full_key.encode()).hexdigest()
+
+    # Prefix for display (first 12 chars)
+    key_prefix = full_key[:12] + "..."
+
+    return full_key, key_hash, key_prefix
+
+
+async def verify_api_key(api_key: str, db: AsyncSession) -> Optional[dict]:
+    """
+    Verify an API key and return key info if valid.
+    Also updates last_used_at timestamp.
+    """
+    if not api_key or not api_key.startswith("fk_"):
+        return None
+
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+    # Check if key exists and is active
+    result = await db.execute(
+        text("""
+            SELECT id, name, key_prefix, is_active, created_at
+            FROM api_keys
+            WHERE key_hash = :key_hash
+        """),
+        {"key_hash": key_hash}
+    )
+    key_record = result.fetchone()
+
+    if not key_record:
+        return None
+
+    if not key_record.is_active:
+        return None
+
+    # Update last_used_at
+    await db.execute(
+        text("UPDATE api_keys SET last_used_at = NOW() WHERE id = :key_id"),
+        {"key_id": key_record.id}
+    )
+    await db.commit()
+
+    return {
+        "id": key_record.id,
+        "name": key_record.name,
+        "key_prefix": key_record.key_prefix,
+        "is_active": key_record.is_active
+    }
+
+
+async def get_api_key_auth(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    db: AsyncSession = Depends(get_db)
+) -> dict:
+    """
+    FastAPI dependency for API key authentication.
+    Raises 401 if key is missing or invalid.
+    """
+    if not x_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key. Provide X-API-Key header.",
+        )
+
+    key_info = await verify_api_key(x_api_key, db)
+    if not key_info:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked API key",
+        )
+
+    return key_info
+
+
+async def get_all_api_keys(db: AsyncSession) -> list:
+    """Get all API keys (without the actual key values)"""
+    result = await db.execute(
+        text("""
+            SELECT id, key_prefix, name, is_active, created_at, last_used_at, created_by
+            FROM api_keys
+            ORDER BY created_at DESC
+        """)
+    )
+    keys = result.fetchall()
+    return [
+        {
+            "id": k.id,
+            "key_prefix": k.key_prefix,
+            "name": k.name,
+            "is_active": k.is_active,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+            "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+            "created_by": k.created_by
+        }
+        for k in keys
+    ]
+
+
+async def create_api_key(db: AsyncSession, name: str, created_by: str) -> dict:
+    """
+    Create a new API key.
+    Returns the full key (only time it's shown) plus metadata.
+    """
+    full_key, key_hash, key_prefix = generate_api_key()
+
+    result = await db.execute(
+        text("""
+            INSERT INTO api_keys (key_hash, key_prefix, name, is_active, created_at, created_by)
+            VALUES (:key_hash, :key_prefix, :name, true, NOW(), :created_by)
+            RETURNING id, key_prefix, name, is_active, created_at
+        """),
+        {
+            "key_hash": key_hash,
+            "key_prefix": key_prefix,
+            "name": name,
+            "created_by": created_by
+        }
+    )
+    await db.commit()
+    key_record = result.fetchone()
+
+    return {
+        "id": key_record.id,
+        "key": full_key,  # Only time the full key is returned!
+        "key_prefix": key_record.key_prefix,
+        "name": key_record.name,
+        "is_active": key_record.is_active,
+        "created_at": key_record.created_at.isoformat() if key_record.created_at else None
+    }
+
+
+async def revoke_api_key(db: AsyncSession, key_id: int) -> bool:
+    """Revoke (deactivate) an API key"""
+    result = await db.execute(
+        text("SELECT id FROM api_keys WHERE id = :key_id"),
+        {"key_id": key_id}
+    )
+    if not result.fetchone():
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    await db.execute(
+        text("UPDATE api_keys SET is_active = false WHERE id = :key_id"),
+        {"key_id": key_id}
+    )
+    await db.commit()
+    return True
+
+
+async def delete_api_key(db: AsyncSession, key_id: int) -> bool:
+    """Permanently delete an API key"""
+    result = await db.execute(
+        text("SELECT id FROM api_keys WHERE id = :key_id"),
+        {"key_id": key_id}
+    )
+    if not result.fetchone():
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    await db.execute(
+        text("DELETE FROM api_keys WHERE id = :key_id"),
+        {"key_id": key_id}
     )
     await db.commit()
     return True

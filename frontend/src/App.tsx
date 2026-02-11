@@ -6,11 +6,16 @@ import Settings from './pages/Settings'
 import Review from './pages/Review'
 import Forecasts from './pages/Forecasts'
 import Accuracy from './pages/Accuracy'
+import Bookability from './pages/Bookability'
+import Docs from './pages/Docs'
+import CompetitorRates from './pages/CompetitorRates'
+import Reconciliation from './pages/Reconciliation'
+import StaffCashUp from './pages/StaffCashUp'
 import { authApi } from './utils/api'
 import { colors, spacing, typography, radius, transitions, buttonStyle, mergeStyles } from './utils/theme'
 
 interface AuthContextType {
-  user: { id: number; username: string; display_name: string } | null
+  user: { id: number; username: string; display_name: string; role?: string } | null
   token: string | null
   logout: () => void
 }
@@ -24,7 +29,7 @@ export const useAuth = () => {
 }
 
 const App: React.FC = () => {
-  const [user, setUser] = useState<{ id: number; username: string; display_name: string } | null>(null)
+  const [user, setUser] = useState<{ id: number; username: string; display_name: string; role?: string } | null>(null)
   const [token, setToken] = useState<string | null>(localStorage.getItem('token'))
   const [loading, setLoading] = useState(true)
 
@@ -34,7 +39,7 @@ const App: React.FC = () => {
       if (storedToken) {
         try {
           const userData = await authApi.getMe()
-          setUser({ id: userData.id, username: userData.username, display_name: userData.display_name })
+          setUser({ id: userData.id, username: userData.username, display_name: userData.display_name, role: userData.role || 'admin' })
           setToken(storedToken)
         } catch {
           localStorage.removeItem('token')
@@ -47,7 +52,7 @@ const App: React.FC = () => {
     validateToken()
   }, [])
 
-  const handleLogin = (newToken: string, userData: { id: number; username: string; display_name: string }) => {
+  const handleLogin = (newToken: string, userData: { id: number; username: string; display_name: string; role?: string }) => {
     setToken(newToken)
     setUser(userData)
     localStorage.setItem('token', newToken)
@@ -67,45 +72,82 @@ const App: React.FC = () => {
     )
   }
 
+  const isAdmin = user?.role === 'admin' || !user?.role
+  const isStaff = user?.role === 'staff'
+  const defaultRoute = isStaff ? '/staff' : '/'
+
+  // Admin-only route helper
+  const adminRoute = (component: React.ReactNode) =>
+    !token ? <Navigate to="/login" /> : isStaff ? <Navigate to="/staff" /> : component
+
   return (
     <AuthContext.Provider value={{ user, token, logout }}>
       <div style={styles.app}>
-        {token && user && <Header />}
+        {token && user && !isStaff && <Header />}
+        {token && user && isStaff && <StaffHeader />}
         <main style={styles.main}>
           <Routes>
             <Route
               path="/login"
-              element={token ? <Navigate to="/" /> : <Login onLogin={handleLogin} />}
+              element={token ? <Navigate to={defaultRoute} /> : <Login onLogin={handleLogin} />}
             />
             <Route
               path="/"
-              element={token ? <Dashboard /> : <Navigate to="/login" />}
+              element={adminRoute(<Dashboard />)}
             />
             <Route
               path="/settings"
-              element={token ? <Settings /> : <Navigate to="/login" />}
+              element={adminRoute(<Settings />)}
             />
             <Route
               path="/review"
-              element={token ? <Review /> : <Navigate to="/login" />}
+              element={adminRoute(<Review />)}
             />
             <Route
               path="/review/:reportId"
-              element={token ? <Review /> : <Navigate to="/login" />}
+              element={adminRoute(<Review />)}
             />
             <Route
               path="/forecasts"
-              element={token ? <Forecasts /> : <Navigate to="/login" />}
+              element={adminRoute(<Forecasts />)}
             />
             <Route
               path="/forecasts/:forecastId"
-              element={token ? <Forecasts /> : <Navigate to="/login" />}
+              element={adminRoute(<Forecasts />)}
             />
             <Route
               path="/accuracy"
-              element={token ? <Accuracy /> : <Navigate to="/login" />}
+              element={adminRoute(<Accuracy />)}
             />
-            <Route path="*" element={<Navigate to="/" />} />
+            <Route
+              path="/bookability"
+              element={adminRoute(<Bookability />)}
+            />
+            <Route
+              path="/competitor-rates"
+              element={adminRoute(<CompetitorRates />)}
+            />
+            <Route
+              path="/reconciliation"
+              element={adminRoute(<Reconciliation />)}
+            />
+            <Route
+              path="/reconciliation/:subPage"
+              element={adminRoute(<Reconciliation />)}
+            />
+            <Route
+              path="/docs"
+              element={adminRoute(<Docs />)}
+            />
+            <Route
+              path="/staff"
+              element={token ? <StaffCashUp /> : <Navigate to="/login" />}
+            />
+            <Route
+              path="/staff/:subPage"
+              element={token ? <StaffCashUp /> : <Navigate to="/login" />}
+            />
+            <Route path="*" element={<Navigate to={defaultRoute} />} />
           </Routes>
         </main>
       </div>
@@ -123,20 +165,30 @@ const Header: React.FC = () => {
     navigate('/login')
   }
 
-  const navItems = [
+  // Simple nav items (no dropdown)
+  const simpleNavItems = [
     { path: '/', label: 'Dashboard' },
     { path: '/review', label: 'History' },
-    { path: '/forecasts', label: 'Forecasts' },
-    { path: '/accuracy', label: 'Accuracy' },
+  ]
+
+  // Forecasts is now a simple nav item (Accuracy moved to Forecasts sidebar)
+  // Keep the structure in case we want to add more items later
+
+  // Remaining simple nav items
+  const remainingNavItems = [
+    { path: '/bookability', label: 'Bookability' },
+    { path: '/competitor-rates', label: 'Competitors' },
+    { path: '/reconciliation', label: 'Reconciliation' },
     { path: '/settings', label: 'Settings' },
+    { path: '/docs', label: 'Docs' },
   ]
 
   return (
     <header style={styles.header}>
       <div style={styles.headerContent}>
-        <div style={styles.logo}>Forecasting</div>
+        <div style={styles.logo}>Finance</div>
         <nav style={styles.nav}>
-          {navItems.map((item) => (
+          {simpleNavItems.map((item) => (
             <Link
               key={item.path}
               to={item.path}
@@ -148,7 +200,54 @@ const Header: React.FC = () => {
               {item.label}
             </Link>
           ))}
+          <Link
+            to="/forecasts"
+            style={{
+              ...styles.navLink,
+              ...(location.pathname.startsWith('/forecasts') ? styles.navLinkActive : {}),
+            }}
+          >
+            Forecasts
+          </Link>
+          {remainingNavItems.map((item) => (
+            <Link
+              key={item.path}
+              to={item.path}
+              style={{
+                ...styles.navLink,
+                ...((item.path === '/reconciliation'
+                  ? location.pathname.startsWith('/reconciliation')
+                  : location.pathname === item.path) ? styles.navLinkActive : {}),
+              }}
+            >
+              {item.label}
+            </Link>
+          ))}
         </nav>
+        <div style={styles.userSection}>
+          <span style={styles.userName}>{user?.display_name || user?.username}</span>
+          <button onClick={handleLogout} style={styles.logoutButton}>
+            Logout
+          </button>
+        </div>
+      </div>
+    </header>
+  )
+}
+
+const StaffHeader: React.FC = () => {
+  const { user, logout } = useAuth()
+  const navigate = useNavigate()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login')
+  }
+
+  return (
+    <header style={styles.header}>
+      <div style={styles.headerContent}>
+        <div style={styles.logo}>Cash Up</div>
         <div style={styles.userSection}>
           <span style={styles.userName}>{user?.display_name || user?.username}</span>
           <button onClick={handleLogout} style={styles.logoutButton}>

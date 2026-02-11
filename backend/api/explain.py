@@ -19,7 +19,7 @@ router = APIRouter()
 async def explain_forecast(
     forecast_date: date = Query(...),
     forecast_type: str = Query(...),
-    model: str = Query("prophet", description="Model: prophet, xgboost, pickup, tft"),
+    model: str = Query("prophet", description="Model: prophet, xgboost, pickup"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -60,8 +60,6 @@ async def explain_forecast(
         return await _get_xgboost_explanation(db, forecast_date, forecast_type, forecast)
     elif model == "pickup":
         return await _get_pickup_explanation(db, forecast_date, forecast_type, forecast)
-    elif model == "tft":
-        return await _get_tft_explanation(db, forecast_date, forecast_type, forecast)
     else:
         return {
             "forecast_date": forecast_date,
@@ -328,93 +326,3 @@ async def get_pickup_breakdown(
     )
 
 
-async def _get_tft_explanation(db, forecast_date, forecast_type, forecast):
-    """Get TFT attention-based explanation"""
-    query = """
-        SELECT
-            encoder_attention,
-            decoder_attention,
-            variable_importance,
-            quantile_10,
-            quantile_50,
-            quantile_90,
-            top_historical_drivers,
-            top_future_drivers
-        FROM tft_explanations
-        WHERE forecast_date = :forecast_date
-            AND forecast_type = :forecast_type
-        ORDER BY generated_at DESC
-        LIMIT 1
-    """
-
-    result = await db.execute(text(query), {
-        "forecast_date": forecast_date,
-        "forecast_type": forecast_type
-    })
-    tft = result.fetchone()
-
-    explanation = {
-        "forecast_date": forecast_date,
-        "forecast_type": forecast_type,
-        "model": "tft",
-        "predicted_value": float(forecast.predicted_value),
-        "lower_bound": float(forecast.lower_bound) if forecast.lower_bound else None,
-        "upper_bound": float(forecast.upper_bound) if forecast.upper_bound else None,
-        "generated_at": forecast.generated_at
-    }
-
-    if tft:
-        explanation["quantiles"] = {
-            "p10": float(tft.quantile_10) if tft.quantile_10 else None,
-            "p50": float(tft.quantile_50) if tft.quantile_50 else None,
-            "p90": float(tft.quantile_90) if tft.quantile_90 else None
-        }
-        explanation["variable_importance"] = tft.variable_importance
-        explanation["top_drivers"] = {
-            "historical": tft.top_historical_drivers or [],
-            "future_known": tft.top_future_drivers or []
-        }
-        explanation["attention"] = {
-            "encoder": tft.encoder_attention,
-            "decoder": tft.decoder_attention
-        }
-
-        # Build human-readable summary
-        summary_parts = []
-        if tft.top_historical_drivers:
-            for item in tft.top_historical_drivers[:2]:
-                if isinstance(item, dict):
-                    summary_parts.append(
-                        f"{item.get('feature', 'Unknown')} ({item.get('importance', 0):.2f})"
-                    )
-        if tft.top_future_drivers:
-            for item in tft.top_future_drivers[:2]:
-                if isinstance(item, dict):
-                    summary_parts.append(
-                        f"{item.get('feature', 'Unknown')} ({item.get('importance', 0):.2f})"
-                    )
-
-        explanation["summary"] = f"Key drivers: {', '.join(summary_parts)}" if summary_parts else None
-
-    return explanation
-
-
-@router.get("/tft")
-async def get_tft_attention(
-    forecast_date: date = Query(...),
-    forecast_type: str = Query(...),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    """
-    Get TFT attention weights and variable importance for a forecast.
-    """
-    return await _get_tft_explanation(
-        db, forecast_date, forecast_type,
-        type('obj', (object,), {
-            'predicted_value': 0,
-            'lower_bound': None,
-            'upper_bound': None,
-            'generated_at': None
-        })()
-    )

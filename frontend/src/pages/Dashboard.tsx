@@ -6,7 +6,7 @@ const Dashboard: React.FC = () => {
     <div style={styles.container}>
       <div style={styles.header}>
         <h1 style={components.title}>Dashboard</h1>
-        <p style={components.subtitle}>Welcome to the Forecasting System</p>
+        <p style={components.subtitle}>Welcome to the Finance System</p>
       </div>
 
       <div style={styles.content}>

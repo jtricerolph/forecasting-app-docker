@@ -44,7 +44,7 @@ async def run_historical_forecast(
         metric_codes = ['hotel_room_nights', 'hotel_occupancy_pct', 'resos_dinner_covers', 'resos_lunch_covers']
 
     if models is None:
-        models = ['prophet', 'xgboost', 'pickup']
+        models = ['prophet', 'xgboost', 'pickup', 'catboost']
 
     forecast_from = simulated_today + timedelta(days=1)
     forecast_to = simulated_today + timedelta(days=forecast_days)
@@ -72,6 +72,10 @@ async def run_historical_forecast(
                     )
                 elif model == 'pickup':
                     forecasts = await _run_pickup_historical(
+                        db, metric_code, simulated_today, forecast_from, forecast_to
+                    )
+                elif model == 'catboost':
+                    forecasts = await _run_catboost_historical(
                         db, metric_code, simulated_today, forecast_from, forecast_to
                     )
                 else:
@@ -431,6 +435,142 @@ async def _run_pickup_historical(
 
     logger.info(f"Historical Pickup forecast for {metric_code} as of {simulated_today}: {len(forecasts)} records")
     return forecasts
+
+
+async def _run_catboost_historical(
+    db,
+    metric_code: str,
+    simulated_today: date,
+    forecast_from: date,
+    forecast_to: date,
+    training_days: int = 2555
+) -> List[dict]:
+    """Run CatBoost using only data available before simulated_today."""
+    try:
+        from catboost import CatBoostRegressor
+
+        training_to = simulated_today - timedelta(days=1)
+        training_from = training_to - timedelta(days=training_days + 60)
+
+        result = await db.execute(
+            text("""
+            SELECT date, actual_value
+            FROM daily_metrics
+            WHERE metric_code = :metric_code
+                AND date BETWEEN :from_date AND :to_date
+                AND actual_value IS NOT NULL
+            ORDER BY date
+            """),
+            {"metric_code": metric_code, "from_date": training_from, "to_date": training_to}
+        )
+        rows = result.fetchall()
+
+        if len(rows) < 60:
+            logger.warning(f"Insufficient data for historical CatBoost: {metric_code} has {len(rows)} records")
+            return []
+
+        df = pd.DataFrame([{"ds": pd.Timestamp(row.date), "y": float(row.actual_value)} for row in rows])
+        df = df.sort_values('ds').reset_index(drop=True)
+        df = _create_catboost_features(df)
+        df = df.dropna()
+
+        categorical_features = ['day_of_week', 'month']
+        numerical_features = [
+            'day_of_month', 'week_of_year', 'is_weekend',
+            'lag_7', 'lag_14', 'lag_21', 'lag_28',
+            'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_28',
+            'rolling_std_7', 'rolling_std_14', 'rolling_std_28'
+        ]
+
+        if 'lag_365' in df.columns and df['lag_365'].notna().sum() > 30:
+            numerical_features.append('lag_365')
+
+        feature_cols = categorical_features + numerical_features
+
+        X = df[feature_cols]
+        y = df['y']
+
+        model = CatBoostRegressor(
+            iterations=200,
+            depth=6,
+            learning_rate=0.1,
+            loss_function='RMSE',
+            cat_features=categorical_features,
+            verbose=False,
+            random_seed=42
+        )
+        model.fit(X, y)
+
+        forecasts = []
+        current_df = df.copy()
+
+        for forecast_date in pd.date_range(start=forecast_from, end=forecast_to, freq='D'):
+            new_row = pd.DataFrame([{"ds": forecast_date, "y": np.nan}])
+            current_df = pd.concat([current_df, new_row], ignore_index=True)
+            current_df = _create_catboost_features(current_df)
+
+            X_pred = current_df[feature_cols].iloc[-1:].copy()
+            for col in numerical_features:
+                if col in X_pred.columns:
+                    X_pred[col] = X_pred[col].ffill()
+                    if X_pred[col].isna().any():
+                        X_pred[col] = X_pred[col].fillna(0)
+
+            prediction = float(model.predict(X_pred)[0])
+            prediction = max(0, prediction)
+            current_df.iloc[-1, current_df.columns.get_loc('y')] = prediction
+
+            forecast_record = {
+                "forecast_date": forecast_date.date(),
+                "forecast_type": metric_code,
+                "model_type": "catboost",
+                "predicted_value": round(float(prediction), 2)
+            }
+            forecasts.append(forecast_record)
+
+            await db.execute(
+                text("""
+                INSERT INTO forecasts (
+                    forecast_date, forecast_type, model_type, predicted_value, generated_at
+                ) VALUES (
+                    :forecast_date, :forecast_type, :model_type, :predicted_value, :generated_at
+                )
+                """),
+                {**forecast_record, "generated_at": simulated_today}
+            )
+
+        logger.info(f"Historical CatBoost forecast for {metric_code} as of {simulated_today}: {len(forecasts)} records")
+        return forecasts
+
+    except ImportError as e:
+        logger.error(f"CatBoost not installed: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Historical CatBoost failed: {e}")
+        raise
+
+
+def _create_catboost_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create features for CatBoost model with native categorical support."""
+    df = df.copy()
+
+    df['day_of_week'] = df['ds'].dt.dayofweek.astype(str)  # Categorical for CatBoost
+    df['month'] = df['ds'].dt.month.astype(str)  # Categorical for CatBoost
+    df['day_of_month'] = df['ds'].dt.day
+    df['week_of_year'] = df['ds'].dt.isocalendar().week.astype(int)
+    df['is_weekend'] = (df['ds'].dt.dayofweek >= 5).astype(int)
+
+    for lag in [7, 14, 21, 28]:
+        df[f'lag_{lag}'] = df['y'].shift(lag)
+
+    for window in [7, 14, 28]:
+        df[f'rolling_mean_{window}'] = df['y'].rolling(window=window, min_periods=1).mean()
+        df[f'rolling_std_{window}'] = df['y'].rolling(window=window, min_periods=1).std().fillna(0)
+
+    if len(df) > 365:
+        df['lag_365'] = df['y'].shift(365)
+
+    return df
 
 
 async def _get_reconstructed_otb(

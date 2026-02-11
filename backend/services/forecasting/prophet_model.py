@@ -35,31 +35,75 @@ async def run_prophet_forecast(
     try:
         from prophet import Prophet
 
-        # Get historical data from newbook_bookings_stats (forecast_data database)
+        # Get historical data
         training_from = forecast_from - timedelta(days=training_days)
 
-        # Map metric_code to the correct column in newbook_bookings_stats
-        metric_column_map = {
-            'hotel_occupancy_pct': 'total_occupancy_pct',
-            'hotel_room_nights': 'booking_count',
-            'hotel_guests': 'guests_count',
-        }
+        # Revenue metrics use earned_revenue_data joined with gl_accounts
+        revenue_metrics = ['net_accom', 'net_dry', 'net_wet', 'total_rev']
+        if metric_code in revenue_metrics:
+            revenue_departments = {
+                'net_accom': 'accommodation',
+                'net_dry': 'dry',
+                'net_wet': 'wet',
+                'total_rev': None,  # All departments
+            }
+            department = revenue_departments.get(metric_code)
+            if department is None and metric_code != 'total_rev':
+                logger.warning(f"Unknown revenue metric for Prophet: {metric_code}")
+                return []
 
-        column_name = metric_column_map.get(metric_code)
-        if not column_name:
-            logger.warning(f"Unknown metric_code for Prophet: {metric_code}")
-            return []
+            if metric_code == 'total_rev':
+                # Total revenue across all departments
+                result = db.execute(
+                    text("""
+                    SELECT date, SUM(amount_net) as actual_value
+                    FROM newbook_earned_revenue_data
+                    WHERE date BETWEEN :from_date AND :to_date
+                    GROUP BY date
+                    HAVING SUM(amount_net) IS NOT NULL
+                    ORDER BY date
+                    """),
+                    {"from_date": training_from, "to_date": forecast_from - timedelta(days=1)}
+                )
+            else:
+                # Revenue by department
+                result = db.execute(
+                    text("""
+                    SELECT r.date, SUM(r.amount_net) as actual_value
+                    FROM newbook_earned_revenue_data r
+                    JOIN newbook_gl_accounts g ON r.gl_account_id = g.gl_account_id
+                    WHERE r.date BETWEEN :from_date AND :to_date
+                        AND g.department = :department
+                    GROUP BY r.date
+                    HAVING SUM(r.amount_net) IS NOT NULL
+                    ORDER BY r.date
+                    """),
+                    {"from_date": training_from, "to_date": forecast_from - timedelta(days=1), "department": department}
+                )
+        else:
+            # Hotel metrics use newbook_bookings_stats table
+            metric_column_map = {
+                'hotel_occupancy_pct': 'total_occupancy_pct',
+                'hotel_room_nights': 'booking_count',
+                'hotel_guests': 'guests_count',
+            }
 
-        result = db.execute(
-            text(f"""
-            SELECT date, {column_name} as actual_value
-            FROM newbook_bookings_stats
-            WHERE date BETWEEN :from_date AND :to_date
-                AND {column_name} IS NOT NULL
-            ORDER BY date
-            """),
-            {"from_date": training_from, "to_date": forecast_from - timedelta(days=1)}
-        )
+            column_name = metric_column_map.get(metric_code)
+            if not column_name:
+                logger.warning(f"Unknown metric_code for Prophet: {metric_code}")
+                return []
+
+            result = db.execute(
+                text(f"""
+                SELECT date, {column_name} as actual_value
+                FROM newbook_bookings_stats
+                WHERE date BETWEEN :from_date AND :to_date
+                    AND {column_name} IS NOT NULL
+                ORDER BY date
+                """),
+                {"from_date": training_from, "to_date": forecast_from - timedelta(days=1)}
+            )
+
         rows = result.fetchall()
 
         if len(rows) < 30:

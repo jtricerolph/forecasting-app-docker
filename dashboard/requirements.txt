@@ -1,8 +1,0 @@
-streamlit==1.31.0
-plotly==5.18.0
-pandas==2.2.0
-numpy==1.26.3
-httpx==0.26.0
-python-dotenv==1.0.0
-openpyxl==3.1.2
-extra-streamlit-components==0.1.71

@@ -37,6 +37,10 @@ async def get_accuracy_summary(
             AVG(ABS(xgboost_error)) as xgboost_mae,
             SQRT(AVG(xgboost_error * xgboost_error)) as xgboost_rmse,
             AVG(ABS(xgboost_pct_error)) as xgboost_mape,
+            -- CatBoost metrics
+            AVG(ABS(catboost_error)) as catboost_mae,
+            SQRT(AVG(catboost_error * catboost_error)) as catboost_rmse,
+            AVG(ABS(catboost_pct_error)) as catboost_mape,
             -- Pickup metrics
             AVG(ABS(pickup_error)) as pickup_mae,
             SQRT(AVG(pickup_error * pickup_error)) as pickup_rmse,
@@ -44,6 +48,7 @@ async def get_accuracy_summary(
             -- Best model distribution
             SUM(CASE WHEN best_model = 'prophet' THEN 1 ELSE 0 END) as prophet_wins,
             SUM(CASE WHEN best_model = 'xgboost' THEN 1 ELSE 0 END) as xgboost_wins,
+            SUM(CASE WHEN best_model = 'catboost' THEN 1 ELSE 0 END) as catboost_wins,
             SUM(CASE WHEN best_model = 'pickup' THEN 1 ELSE 0 END) as pickup_wins
         FROM actual_vs_forecast
         WHERE date BETWEEN :from_date AND :to_date
@@ -71,6 +76,12 @@ async def get_accuracy_summary(
                 "mape": round(float(row.xgboost_mape), 2) if row.xgboost_mape else None,
                 "wins": row.xgboost_wins
             },
+            "catboost": {
+                "mae": round(float(row.catboost_mae), 2) if row.catboost_mae else None,
+                "rmse": round(float(row.catboost_rmse), 2) if row.catboost_rmse else None,
+                "mape": round(float(row.catboost_mape), 2) if row.catboost_mape else None,
+                "wins": row.catboost_wins
+            },
             "pickup": {
                 "mae": round(float(row.pickup_mae), 2) if row.pickup_mae else None,
                 "rmse": round(float(row.pickup_rmse), 2) if row.pickup_rmse else None,
@@ -82,9 +93,105 @@ async def get_accuracy_summary(
     ]
 
 
+@router.get("/model-weights")
+async def get_model_weights(
+    metric_code: Optional[str] = Query(None, description="Metric code (if None, returns all metrics)"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get MAPE-based model weights used for blending.
+    Shows the actual MAPE scores from backtest data and calculated weights.
+    This is what the blended_tuned_weighted service uses for weighting.
+    """
+    # Map metric codes to forecast_snapshots metric codes
+    metric_map = {
+        'hotel_occupancy_pct': 'occupancy',
+        'hotel_room_nights': 'rooms',
+        'hotel_guests': 'guests',
+        'hotel_arr': 'arr',
+        'ave_guest_rate': 'ave_guest_rate',
+        'net_accom': 'net_accom',
+        'net_dry': 'net_dry',
+        'net_wet': 'net_wet',
+        'total_rev': 'total_rev',
+    }
+
+    # Pace metrics use pickup model
+    pace_metrics = ['hotel_occupancy_pct', 'hotel_room_nights']
+
+    # If specific metric requested, process just that one
+    metrics_to_process = [metric_code] if metric_code else list(metric_map.keys())
+
+    results = []
+    for metric in metrics_to_process:
+        snapshot_metric = metric_map.get(metric, metric)
+        is_pace_metric = metric in pace_metrics
+
+        # Query MAPE from forecast_snapshots
+        models_to_query = ['prophet', 'xgboost', 'catboost']
+        if is_pace_metric:
+            models_to_query.append('pickup')
+
+        mape_scores = {}
+        sample_counts = {}
+        for model in models_to_query:
+            query = text("""
+                SELECT
+                    AVG(ABS((forecast_value - actual_value) / NULLIF(actual_value, 0)) * 100) as mape,
+                    COUNT(*) as sample_count
+                FROM forecast_snapshots
+                WHERE actual_value IS NOT NULL
+                    AND actual_value != 0
+                    AND forecast_value IS NOT NULL
+                    AND metric_code = :metric_code
+                    AND model = :model
+            """)
+            result = await db.execute(query, {"metric_code": snapshot_metric, "model": model})
+            row = result.fetchone()
+
+            if row and row.mape is not None:
+                mape_scores[model] = float(row.mape)
+                sample_counts[model] = int(row.sample_count)
+            else:
+                mape_scores[model] = None
+                sample_counts[model] = 0
+
+        # Calculate inverse-MAPE weights (same logic as blended_tuned_weighted)
+        valid_mapes = {k: v for k, v in mape_scores.items() if v is not None}
+
+        if valid_mapes:
+            # Calculate weights: lower MAPE = higher weight
+            weights = {model: 1.0 / max(mape, 0.1) for model, mape in valid_mapes.items()}
+            weight_sum = sum(weights.values())
+            normalized_weights = {k: v / weight_sum for k, v in weights.items()}
+        else:
+            # Fall back to equal weights
+            normalized_weights = {model: 1.0 / len(models_to_query) for model in models_to_query}
+
+        # Build response
+        model_data = {}
+        for model in models_to_query:
+            model_data[model] = {
+                "mape": round(mape_scores.get(model), 2) if mape_scores.get(model) is not None else None,
+                "weight": round(normalized_weights.get(model, 0), 4),
+                "sample_count": sample_counts.get(model, 0)
+            }
+
+        results.append({
+            "metric_code": metric,
+            "snapshot_metric": snapshot_metric,
+            "is_pace_metric": is_pace_metric,
+            "models": model_data,
+            "total_samples": sum(sample_counts.values())
+        })
+
+    return results
+
+
 @router.get("/by-model")
 async def get_accuracy_by_model(
-    model: str = Query(..., description="Model: prophet, xgboost, pickup"),
+    model: str = Query(..., description="Model: prophet, xgboost, catboost, pickup"),
     from_date: date = Query(...),
     to_date: date = Query(...),
     metric_type: Optional[str] = Query(None),
@@ -97,6 +204,7 @@ async def get_accuracy_by_model(
     column_map = {
         "prophet": ("prophet_forecast", "prophet_error", "prophet_pct_error"),
         "xgboost": ("xgboost_forecast", "xgboost_error", "xgboost_pct_error"),
+        "catboost": ("catboost_forecast", "catboost_error", "catboost_pct_error"),
         "pickup": ("pickup_forecast", "pickup_error", "pickup_pct_error")
     }
 

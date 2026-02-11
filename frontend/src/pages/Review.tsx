@@ -10,19 +10,37 @@ import {
 } from '../utils/theme'
 import Plot from 'react-plotly.js'
 
-type ReportPage = 'occupancy' | 'bookings' | 'rates' | 'ave_rate' | 'revenue'
+type ReportPage = 'occupancy' | 'bookings' | 'rates' | 'ave_rate' | 'revenue' | 'pickup_3d' | 'restaurant_bookings' | 'restaurant_covers'
+
+interface MenuGroup {
+  group: string
+  items: { id: ReportPage; label: string }[]
+}
 
 const Review: React.FC = () => {
   const { reportId } = useParams<{ reportId?: string }>()
   const navigate = useNavigate()
   const activePage = (reportId as ReportPage) || 'occupancy'
 
-  const menuItems: { id: ReportPage; label: string }[] = [
-    { id: 'occupancy', label: 'Occupancy' },
-    { id: 'bookings', label: 'Bookings' },
-    { id: 'rates', label: 'Rate Totals' },
-    { id: 'ave_rate', label: 'Ave Rate' },
-    { id: 'revenue', label: 'Revenue' },
+  const menuGroups: MenuGroup[] = [
+    {
+      group: 'Hotel',
+      items: [
+        { id: 'occupancy', label: 'Occupancy' },
+        { id: 'bookings', label: 'Bookings' },
+        { id: 'rates', label: 'Rate Totals' },
+        { id: 'ave_rate', label: 'Ave Rate' },
+        { id: 'revenue', label: 'Revenue' },
+        { id: 'pickup_3d', label: '3D Pickup' },
+      ]
+    },
+    {
+      group: 'Restaurant',
+      items: [
+        { id: 'restaurant_bookings', label: 'Bookings' },
+        { id: 'restaurant_covers', label: 'Covers' },
+      ]
+    }
   ]
 
   const handlePageChange = (id: ReportPage) => {
@@ -34,17 +52,22 @@ const Review: React.FC = () => {
       <div style={styles.sidebar}>
         <h3 style={styles.sidebarTitle}>History</h3>
         <nav style={styles.nav}>
-          {menuItems.map((item) => (
-            <button
-              key={item.id}
-              onClick={() => handlePageChange(item.id)}
-              style={{
-                ...styles.navItem,
-                ...(activePage === item.id ? styles.navItemActive : {}),
-              }}
-            >
-              {item.label}
-            </button>
+          {menuGroups.map((group) => (
+            <div key={group.group} style={styles.navGroup}>
+              <div style={styles.navGroupTitle}>{group.group}</div>
+              {group.items.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => handlePageChange(item.id)}
+                  style={{
+                    ...styles.navItem,
+                    ...(activePage === item.id ? styles.navItemActive : {}),
+                  }}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
           ))}
         </nav>
       </div>
@@ -55,6 +78,9 @@ const Review: React.FC = () => {
         {activePage === 'rates' && <GuestRatesReport />}
         {activePage === 'ave_rate' && <AverageRatesReport />}
         {activePage === 'revenue' && <RevenueReport />}
+        {activePage === 'pickup_3d' && <PickupVisualization />}
+        {activePage === 'restaurant_bookings' && <RestaurantBookingsReport />}
+        {activePage === 'restaurant_covers' && <RestaurantCoversReport />}
       </main>
     </div>
   )
@@ -69,24 +95,15 @@ const formatDate = (date: Date): string => {
 }
 
 const parseDate = (dateStr: string): Date => {
-  return new Date(dateStr + 'T00:00:00')
+  // Parse as UTC to avoid DST/timezone issues
+  const [year, month, day] = dateStr.split('-').map(Number)
+  return new Date(Date.UTC(year, month - 1, day))
 }
 
 const getStartOfWeek = (date: Date): Date => {
-  const d = new Date(date)
-  const day = d.getDay()
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1) // Monday
-  d.setDate(diff)
-  return d
-}
-
-const getDayOfWeekOffset = (date: Date, targetDayOfWeek: number): number => {
-  const dayOfWeek = date.getDay()
-  let offset = targetDayOfWeek - dayOfWeek
-  // Round to nearest: prefer smallest adjustment
-  if (offset > 3) offset -= 7   // If forward 4+ days, go back instead
-  if (offset < -3) offset += 7  // If back 4+ days, go forward instead
-  return offset
+  const day = date.getUTCDay()
+  const diff = date.getUTCDate() - day + (day === 0 ? -6 : 1) // Monday
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), diff))
 }
 
 // Get comparison start date that aligns with same day of week
@@ -95,34 +112,42 @@ const getComparisonStartDate = (
   comparisonType: ComparisonType,
   consolidation: ConsolidationType
 ): Date => {
-  const dayOfWeek = startDate.getDay()
-
   if (comparisonType === 'previous_period') {
     // Calculate the period length and go back that many days
     // This is handled in the component by subtracting the period length
     return startDate
   } else {
-    // Previous year - align to same day of week
-    const lastYear = new Date(startDate)
-    lastYear.setFullYear(lastYear.getFullYear() - 1)
-
+    // Previous year - align to same day of week using 364-day offset (52 weeks)
+    // This ensures perfect DOW alignment regardless of leap years
+    // Use UTC to avoid DST/timezone issues
     if (consolidation === 'day') {
-      // For daily, align to same day of week
-      const offset = getDayOfWeekOffset(lastYear, dayOfWeek)
-      lastYear.setDate(lastYear.getDate() + offset)
+      // For daily, go back exactly 364 days (52 weeks) to match DOW
+      const priorDate = new Date(Date.UTC(
+        startDate.getUTCFullYear(),
+        startDate.getUTCMonth(),
+        startDate.getUTCDate() - 364
+      ))
+      return priorDate
     } else if (consolidation === 'week') {
-      // For weekly, get start of same week number approximately
-      const weekOfYear = Math.floor((startDate.getTime() - new Date(startDate.getFullYear(), 0, 1).getTime()) / (7 * 24 * 60 * 60 * 1000))
-      const startOfYear = new Date(lastYear.getFullYear(), 0, 1)
-      const weekStart = getStartOfWeek(startOfYear)
-      weekStart.setDate(weekStart.getDate() + weekOfYear * 7)
-      return weekStart
+      // For weekly, go back 52 weeks to align week boundaries
+      const priorDate = new Date(Date.UTC(
+        startDate.getUTCFullYear(),
+        startDate.getUTCMonth(),
+        startDate.getUTCDate() - 364
+      ))
+      return getStartOfWeek(priorDate)
     } else if (consolidation === 'month') {
-      // For monthly, use same month last year
-      return new Date(lastYear.getFullYear(), startDate.getMonth(), 1)
+      // For monthly, use same month last year (DOW doesn't matter for monthly)
+      return new Date(Date.UTC(startDate.getUTCFullYear() - 1, startDate.getUTCMonth(), 1))
     }
 
-    return lastYear
+    // Default fallback: 364-day offset
+    const priorDate = new Date(Date.UTC(
+      startDate.getUTCFullYear(),
+      startDate.getUTCMonth(),
+      startDate.getUTCDate() - 364
+    ))
+    return priorDate
   }
 }
 
@@ -2548,6 +2573,7 @@ const RevenueReport: React.FC = () => {
   const [consolidation, setConsolidation] = useState<ConsolidationType>('day')
   const [comparison, setComparison] = useState<ComparisonType>('previous_year')
   const [showTable, setShowTable] = useState(false)
+  const [showBudget, setShowBudget] = useState(false)
 
   // Generate month options (last 12 months)
   const monthOptions = useMemo(() => getLast12Months(), [])
@@ -2647,6 +2673,34 @@ const RevenueReport: React.FC = () => {
     enabled: !!comparisonDates,
   })
 
+  // Fetch budget data for comparison
+  const { data: budgetData } = useQuery<{ date: string; budget_type: string; budget_value: number }[]>({
+    queryKey: ['revenue-budget', startDate, endDate],
+    queryFn: async () => {
+      const params = new URLSearchParams({
+        from_date: startDate,
+        to_date: endDate,
+      })
+      const response = await fetch(`/api/budget/daily?${params}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) return []
+      return response.json()
+    },
+    enabled: showBudget,
+  })
+
+  // Organize budget data by date and type
+  const budgetByDate = useMemo(() => {
+    if (!budgetData) return {}
+    const byDate: Record<string, Record<string, number>> = {}
+    budgetData.forEach(d => {
+      if (!byDate[d.date]) byDate[d.date] = {}
+      byDate[d.date][d.budget_type] = d.budget_value
+    })
+    return byDate
+  }, [budgetData])
+
   const chartData = useMemo(() => {
     if (!mainData) return {
       labels: [], mainDates: [], comparisonDates: [],
@@ -2720,12 +2774,24 @@ const RevenueReport: React.FC = () => {
       })
     }
 
+    // Build budget series from budgetByDate
+    let budgetAccomSeries: (number | null)[] = []
+    let budgetDrySeries: (number | null)[] = []
+    let budgetWetSeries: (number | null)[] = []
+
+    if (showBudget && Object.keys(budgetByDate).length > 0) {
+      budgetAccomSeries = mainData.map((d) => budgetByDate[d.date]?.net_accom ?? null)
+      budgetDrySeries = mainData.map((d) => budgetByDate[d.date]?.net_dry ?? null)
+      budgetWetSeries = mainData.map((d) => budgetByDate[d.date]?.net_wet ?? null)
+    }
+
     return {
       labels, mainDates, comparisonDates: comparisonDatesArr,
       mainAccomSeries, mainDrySeries, mainWetSeries,
-      compAccomSeries, compDrySeries, compWetSeries
+      compAccomSeries, compDrySeries, compWetSeries,
+      budgetAccomSeries, budgetDrySeries, budgetWetSeries
     }
-  }, [mainData, comparisonData, consolidation, comparison])
+  }, [mainData, comparisonData, consolidation, comparison, showBudget, budgetByDate])
 
   const isLoading = mainLoading || (comparison !== 'none' && comparisonLoading)
 
@@ -2810,6 +2876,21 @@ const RevenueReport: React.FC = () => {
               }}
             >
               Prev Year
+            </button>
+          </div>
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Budget</label>
+          <div style={styles.buttonGroup}>
+            <button
+              onClick={() => setShowBudget(!showBudget)}
+              style={{
+                ...styles.toggleButton,
+                ...(showBudget ? styles.toggleButtonActive : {}),
+              }}
+            >
+              {showBudget ? 'Hide Budget' : 'Show Budget'}
             </button>
           </div>
         </div>
@@ -2943,6 +3024,40 @@ const RevenueReport: React.FC = () => {
                 marker: { size: 6 },
                 hovertemplate: '<b>%{customdata}</b><br>Accommodation: £%{y:,.2f}<extra></extra>',
               },
+              // Budget traces - dashed purple
+              ...(showBudget && chartData.budgetWetSeries && chartData.budgetWetSeries.some(v => v !== null)
+                ? [{
+                    x: chartData.labels,
+                    y: chartData.budgetWetSeries,
+                    type: 'scatter' as const,
+                    mode: 'lines' as const,
+                    name: 'Budget Wet',
+                    line: { color: '#81c784', width: 2, dash: 'dot' as const },
+                    hovertemplate: 'Budget Wet: £%{y:,.2f}<extra></extra>',
+                  }]
+                : []),
+              ...(showBudget && chartData.budgetDrySeries && chartData.budgetDrySeries.some(v => v !== null)
+                ? [{
+                    x: chartData.labels,
+                    y: chartData.budgetDrySeries,
+                    type: 'scatter' as const,
+                    mode: 'lines' as const,
+                    name: 'Budget Dry',
+                    line: { color: '#64b5f6', width: 2, dash: 'dot' as const },
+                    hovertemplate: 'Budget Dry: £%{y:,.2f}<extra></extra>',
+                  }]
+                : []),
+              ...(showBudget && chartData.budgetAccomSeries && chartData.budgetAccomSeries.some(v => v !== null)
+                ? [{
+                    x: chartData.labels,
+                    y: chartData.budgetAccomSeries,
+                    type: 'scatter' as const,
+                    mode: 'lines' as const,
+                    name: 'Budget Accom',
+                    line: { color: '#ba68c8', width: 2, dash: 'dot' as const },
+                    hovertemplate: 'Budget Accom: £%{y:,.2f}<extra></extra>',
+                  }]
+                : []),
             ]}
             layout={{
               autosize: true,
@@ -3120,6 +3235,957 @@ const RevenueReport: React.FC = () => {
 }
 
 // ============================================
+// 3D PICKUP VISUALIZATION
+// ============================================
+
+// ============================================
+// RESTAURANT BOOKINGS REPORT
+// ============================================
+
+interface RestaurantBookingsDataPoint {
+  date: string
+  total_bookings: number
+  breakfast_bookings: number
+  lunch_bookings: number
+  afternoon_bookings: number
+  dinner_bookings: number
+  other_bookings: number
+}
+
+const RestaurantBookingsReport: React.FC = () => {
+  const today = new Date()
+  const defaultEnd = new Date(today)
+  defaultEnd.setDate(today.getDate() - 1)
+  const defaultStart = new Date(defaultEnd)
+  defaultStart.setMonth(defaultEnd.getMonth() - 1)
+
+  const [startDate, setStartDate] = useState(formatDate(defaultStart))
+  const [endDate, setEndDate] = useState(formatDate(defaultEnd))
+  const [consolidation, setConsolidation] = useState<ConsolidationType>('day')
+  const [comparison, setComparison] = useState<ComparisonType>('previous_year')
+  const [servicePeriod, setServicePeriod] = useState<'all' | 'breakfast' | 'lunch' | 'afternoon' | 'dinner'>('all')
+
+  const handleQuickSelect = (type: QuickSelectType) => {
+    const end = new Date()
+    end.setDate(end.getDate() - 1)
+    const start = new Date(end)
+
+    switch (type) {
+      case '7days': start.setDate(end.getDate() - 6); break
+      case '14days': start.setDate(end.getDate() - 13); break
+      case '1month': start.setMonth(end.getMonth() - 1); break
+      case '3months': start.setMonth(end.getMonth() - 3); break
+      case '6months': start.setMonth(end.getMonth() - 6); break
+      case '1year': start.setFullYear(end.getFullYear() - 1); break
+    }
+
+    setStartDate(formatDate(start))
+    setEndDate(formatDate(end))
+  }
+
+  const comparisonDates = useMemo(() => {
+    if (comparison === 'none') return null
+
+    const start = parseDate(startDate)
+    const end = parseDate(endDate)
+    const periodDays = Math.ceil((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1
+
+    if (comparison === 'previous_period') {
+      const compEnd = new Date(start)
+      compEnd.setDate(start.getDate() - 1)
+      const compStart = new Date(compEnd)
+      compStart.setDate(compEnd.getDate() - periodDays + 1)
+      return { start: formatDate(compStart), end: formatDate(compEnd) }
+    } else {
+      const compStart = getComparisonStartDate(start, comparison, consolidation)
+      const compEnd = new Date(compStart)
+      compEnd.setDate(compStart.getDate() + periodDays - 1)
+      return { start: formatDate(compStart), end: formatDate(compEnd) }
+    }
+  }, [startDate, endDate, comparison, consolidation])
+
+  const { data: mainData, isLoading: mainLoading } = useQuery<RestaurantBookingsDataPoint[]>({
+    queryKey: ['restaurant-bookings', startDate, endDate, consolidation],
+    queryFn: async () => {
+      const params = new URLSearchParams({ start_date: startDate, end_date: endDate, consolidation })
+      const response = await fetch(`/api/reports/restaurant-bookings?${params}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch restaurant bookings data')
+      return response.json()
+    },
+  })
+
+  const { data: comparisonData } = useQuery<RestaurantBookingsDataPoint[]>({
+    queryKey: ['restaurant-bookings-comparison', comparisonDates?.start, comparisonDates?.end, consolidation],
+    queryFn: async () => {
+      if (!comparisonDates) return []
+      const params = new URLSearchParams({ start_date: comparisonDates.start, end_date: comparisonDates.end, consolidation })
+      const response = await fetch(`/api/reports/restaurant-bookings?${params}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch comparison data')
+      return response.json()
+    },
+    enabled: !!comparisonDates,
+  })
+
+  const chartData = useMemo(() => {
+    if (!mainData) return { labels: [], traces: [] }
+
+    const labels = mainData.map(d => d.date)
+
+    const traces: any[] = []
+
+    // Add period-specific traces based on filter
+    if (servicePeriod === 'all' || servicePeriod === 'breakfast') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.breakfast_bookings),
+        type: 'bar',
+        name: 'Breakfast',
+        marker: { color: '#FF6B6B' },
+      })
+    }
+    if (servicePeriod === 'all' || servicePeriod === 'lunch') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.lunch_bookings),
+        type: 'bar',
+        name: 'Lunch',
+        marker: { color: '#4ECDC4' },
+      })
+    }
+    if (servicePeriod === 'all' || servicePeriod === 'afternoon') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.afternoon_bookings),
+        type: 'bar',
+        name: 'Afternoon',
+        marker: { color: '#45B7D1' },
+      })
+    }
+    if (servicePeriod === 'all' || servicePeriod === 'dinner') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.dinner_bookings),
+        type: 'bar',
+        name: 'Dinner',
+        marker: { color: '#96CEB4' },
+      })
+    }
+
+    if (comparisonData && comparisonData.length > 0) {
+      // Get comparison value based on selected period
+      const getComparisonValue = (d: RestaurantBookingsDataPoint) => {
+        if (servicePeriod === 'breakfast') return d.breakfast_bookings
+        if (servicePeriod === 'lunch') return d.lunch_bookings
+        if (servicePeriod === 'afternoon') return d.afternoon_bookings
+        if (servicePeriod === 'dinner') return d.dinner_bookings
+        return d.total_bookings
+      }
+
+      traces.push({
+        x: labels,
+        y: comparisonData.map(getComparisonValue),
+        type: 'scatter',
+        mode: 'lines+markers',
+        name: servicePeriod === 'all' ? 'Comparison Total' : `Comparison ${servicePeriod.charAt(0).toUpperCase() + servicePeriod.slice(1)}`,
+        line: { color: colors.textMuted, dash: 'dot', width: 2 },
+        marker: { size: 6 },
+      })
+    }
+
+    return { labels, traces }
+  }, [mainData, comparisonData, servicePeriod])
+
+  const totalBookings = mainData?.reduce((sum, d) => sum + d.total_bookings, 0) || 0
+
+  return (
+    <div style={styles.section}>
+      <div style={styles.sectionHeader}>
+        <h2 style={styles.sectionTitle}>Restaurant Bookings</h2>
+      </div>
+
+      <div style={styles.controlsGrid}>
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Start Date</label>
+          <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={styles.dateInput} />
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>End Date</label>
+          <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} style={styles.dateInput} />
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Consolidation</label>
+          <select value={consolidation} onChange={(e) => setConsolidation(e.target.value as ConsolidationType)} style={styles.monthSelect}>
+            <option value="day">Day</option>
+            <option value="week">Week</option>
+            <option value="month">Month</option>
+          </select>
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Service Period</label>
+          <select value={servicePeriod} onChange={(e) => setServicePeriod(e.target.value as any)} style={styles.monthSelect}>
+            <option value="all">All Periods</option>
+            <option value="breakfast">Breakfast</option>
+            <option value="lunch">Lunch</option>
+            <option value="afternoon">Afternoon</option>
+            <option value="dinner">Dinner</option>
+          </select>
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Comparison</label>
+          <select value={comparison} onChange={(e) => setComparison(e.target.value as ComparisonType)} style={styles.monthSelect}>
+            <option value="none">None</option>
+            <option value="previous_period">Previous Period</option>
+            <option value="previous_year">Previous Year</option>
+          </select>
+        </div>
+      </div>
+
+      <div style={styles.quickSelect}>
+        <span style={styles.quickSelectLabel}>Quick select:</span>
+        {(['7days', '14days', '1month', '3months', '6months', '1year'] as QuickSelectType[]).map((type) => (
+          <button key={type} onClick={() => handleQuickSelect(type)} style={styles.quickSelectButton}>
+            {type === '7days' ? '7 days' : type === '14days' ? '14 days' : type === '1month' ? '1 month' : type === '3months' ? '3 months' : type === '6months' ? '6 months' : '1 year'}
+          </button>
+        ))}
+      </div>
+
+      {mainLoading ? (
+        <div style={styles.loading}>Loading...</div>
+      ) : (
+        <>
+          <div style={styles.summaryGrid}>
+            <div style={styles.summaryCard}>
+              <div style={styles.summaryLabel}>Total Bookings</div>
+              <div style={styles.summaryValue}>{totalBookings.toLocaleString()}</div>
+            </div>
+          </div>
+
+          <div style={styles.chartContainer}>
+            <Plot
+              data={chartData.traces}
+              layout={{
+                barmode: 'stack',
+                title: { text: 'Restaurant Bookings by Period' },
+                xaxis: { title: { text: 'Date' } },
+                yaxis: { title: { text: 'Bookings' } },
+                plot_bgcolor: colors.background,
+                paper_bgcolor: colors.background,
+                font: { color: colors.text },
+                hovermode: 'closest',
+                showlegend: true,
+                legend: { orientation: 'h', y: -0.2 },
+              }}
+              config={{ responsive: true }}
+              style={{ width: '100%', height: '500px' }}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+
+// ============================================
+// RESTAURANT COVERS REPORT
+// ============================================
+
+interface RestaurantCoversDataPoint {
+  date: string
+  total_covers: number
+  breakfast_covers: number
+  lunch_covers: number
+  afternoon_covers: number
+  dinner_covers: number
+  other_covers: number
+  hotel_guest_covers: number
+  non_hotel_guest_covers: number
+}
+
+const RestaurantCoversReport: React.FC = () => {
+  const today = new Date()
+  const defaultEnd = new Date(today)
+  defaultEnd.setDate(today.getDate() - 1)
+  const defaultStart = new Date(defaultEnd)
+  defaultStart.setMonth(defaultEnd.getMonth() - 1)
+
+  const [startDate, setStartDate] = useState(formatDate(defaultStart))
+  const [endDate, setEndDate] = useState(formatDate(defaultEnd))
+  const [consolidation, setConsolidation] = useState<ConsolidationType>('day')
+  const [comparison, setComparison] = useState<ComparisonType>('previous_year')
+  const [servicePeriod, setServicePeriod] = useState<'all' | 'breakfast' | 'lunch' | 'afternoon' | 'dinner'>('all')
+
+  const handleQuickSelect = (type: QuickSelectType) => {
+    const end = new Date()
+    end.setDate(end.getDate() - 1)
+    const start = new Date(end)
+
+    switch (type) {
+      case '7days': start.setDate(end.getDate() - 6); break
+      case '14days': start.setDate(end.getDate() - 13); break
+      case '1month': start.setMonth(end.getMonth() - 1); break
+      case '3months': start.setMonth(end.getMonth() - 3); break
+      case '6months': start.setMonth(end.getMonth() - 6); break
+      case '1year': start.setFullYear(end.getFullYear() - 1); break
+    }
+
+    setStartDate(formatDate(start))
+    setEndDate(formatDate(end))
+  }
+
+  const comparisonDates = useMemo(() => {
+    if (comparison === 'none') return null
+
+    const start = parseDate(startDate)
+    const end = parseDate(endDate)
+    const periodDays = Math.ceil((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1
+
+    if (comparison === 'previous_period') {
+      const compEnd = new Date(start)
+      compEnd.setDate(start.getDate() - 1)
+      const compStart = new Date(compEnd)
+      compStart.setDate(compEnd.getDate() - periodDays + 1)
+      return { start: formatDate(compStart), end: formatDate(compEnd) }
+    } else {
+      const compStart = getComparisonStartDate(start, comparison, consolidation)
+      const compEnd = new Date(compStart)
+      compEnd.setDate(compStart.getDate() + periodDays - 1)
+      return { start: formatDate(compStart), end: formatDate(compEnd) }
+    }
+  }, [startDate, endDate, comparison, consolidation])
+
+  const { data: mainData, isLoading: mainLoading } = useQuery<RestaurantCoversDataPoint[]>({
+    queryKey: ['restaurant-covers', startDate, endDate, consolidation],
+    queryFn: async () => {
+      const params = new URLSearchParams({ start_date: startDate, end_date: endDate, consolidation })
+      const response = await fetch(`/api/reports/restaurant-covers?${params}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch restaurant covers data')
+      return response.json()
+    },
+  })
+
+  const { data: comparisonData } = useQuery<RestaurantCoversDataPoint[]>({
+    queryKey: ['restaurant-covers-comparison', comparisonDates?.start, comparisonDates?.end, consolidation],
+    queryFn: async () => {
+      if (!comparisonDates) return []
+      const params = new URLSearchParams({ start_date: comparisonDates.start, end_date: comparisonDates.end, consolidation })
+      const response = await fetch(`/api/reports/restaurant-covers?${params}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch comparison data')
+      return response.json()
+    },
+    enabled: !!comparisonDates,
+  })
+
+  const chartData = useMemo(() => {
+    if (!mainData) return { labels: [], traces: [] }
+
+    const labels = mainData.map(d => d.date)
+
+    const traces: any[] = []
+
+    // Add period-specific traces based on filter
+    if (servicePeriod === 'all' || servicePeriod === 'breakfast') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.breakfast_covers),
+        type: 'bar',
+        name: 'Breakfast',
+        marker: { color: '#FF6B6B' },
+      })
+    }
+    if (servicePeriod === 'all' || servicePeriod === 'lunch') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.lunch_covers),
+        type: 'bar',
+        name: 'Lunch',
+        marker: { color: '#4ECDC4' },
+      })
+    }
+    if (servicePeriod === 'all' || servicePeriod === 'afternoon') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.afternoon_covers),
+        type: 'bar',
+        name: 'Afternoon',
+        marker: { color: '#45B7D1' },
+      })
+    }
+    if (servicePeriod === 'all' || servicePeriod === 'dinner') {
+      traces.push({
+        x: labels,
+        y: mainData.map(d => d.dinner_covers),
+        type: 'bar',
+        name: 'Dinner',
+        marker: { color: '#96CEB4' },
+      })
+    }
+
+    if (comparisonData && comparisonData.length > 0) {
+      // Get comparison value based on selected period
+      const getComparisonValue = (d: RestaurantCoversDataPoint) => {
+        if (servicePeriod === 'breakfast') return d.breakfast_covers
+        if (servicePeriod === 'lunch') return d.lunch_covers
+        if (servicePeriod === 'afternoon') return d.afternoon_covers
+        if (servicePeriod === 'dinner') return d.dinner_covers
+        return d.total_covers
+      }
+
+      traces.push({
+        x: labels,
+        y: comparisonData.map(getComparisonValue),
+        type: 'scatter',
+        mode: 'lines+markers',
+        name: servicePeriod === 'all' ? 'Comparison Total' : `Comparison ${servicePeriod.charAt(0).toUpperCase() + servicePeriod.slice(1)}`,
+        line: { color: colors.textMuted, dash: 'dot', width: 2 },
+        marker: { size: 6 },
+      })
+    }
+
+    return { labels, traces }
+  }, [mainData, comparisonData, servicePeriod])
+
+  const totalCovers = mainData?.reduce((sum, d) => sum + d.total_covers, 0) || 0
+  const hotelGuestCovers = mainData?.reduce((sum, d) => sum + d.hotel_guest_covers, 0) || 0
+  const nonHotelGuestCovers = mainData?.reduce((sum, d) => sum + d.non_hotel_guest_covers, 0) || 0
+
+  return (
+    <div style={styles.section}>
+      <div style={styles.sectionHeader}>
+        <h2 style={styles.sectionTitle}>Restaurant Covers</h2>
+      </div>
+
+      <div style={styles.controlsGrid}>
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Start Date</label>
+          <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={styles.dateInput} />
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>End Date</label>
+          <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} style={styles.dateInput} />
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Consolidation</label>
+          <select value={consolidation} onChange={(e) => setConsolidation(e.target.value as ConsolidationType)} style={styles.monthSelect}>
+            <option value="day">Day</option>
+            <option value="week">Week</option>
+            <option value="month">Month</option>
+          </select>
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Service Period</label>
+          <select value={servicePeriod} onChange={(e) => setServicePeriod(e.target.value as any)} style={styles.monthSelect}>
+            <option value="all">All Periods</option>
+            <option value="breakfast">Breakfast</option>
+            <option value="lunch">Lunch</option>
+            <option value="afternoon">Afternoon</option>
+            <option value="dinner">Dinner</option>
+          </select>
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Comparison</label>
+          <select value={comparison} onChange={(e) => setComparison(e.target.value as ComparisonType)} style={styles.monthSelect}>
+            <option value="none">None</option>
+            <option value="previous_period">Previous Period</option>
+            <option value="previous_year">Previous Year</option>
+          </select>
+        </div>
+      </div>
+
+      <div style={styles.quickSelect}>
+        <span style={styles.quickSelectLabel}>Quick select:</span>
+        {(['7days', '14days', '1month', '3months', '6months', '1year'] as QuickSelectType[]).map((type) => (
+          <button key={type} onClick={() => handleQuickSelect(type)} style={styles.quickSelectButton}>
+            {type === '7days' ? '7 days' : type === '14days' ? '14 days' : type === '1month' ? '1 month' : type === '3months' ? '3 months' : type === '6months' ? '6 months' : '1 year'}
+          </button>
+        ))}
+      </div>
+
+      {mainLoading ? (
+        <div style={styles.loading}>Loading...</div>
+      ) : (
+        <>
+          <div style={styles.summaryGrid}>
+            <div style={styles.summaryCard}>
+              <div style={styles.summaryLabel}>Total Covers</div>
+              <div style={styles.summaryValue}>{totalCovers.toLocaleString()}</div>
+            </div>
+            <div style={styles.summaryCard}>
+              <div style={styles.summaryLabel}>Hotel Guests</div>
+              <div style={styles.summaryValue}>{hotelGuestCovers.toLocaleString()}</div>
+            </div>
+            <div style={styles.summaryCard}>
+              <div style={styles.summaryLabel}>Non-Hotel Guests</div>
+              <div style={styles.summaryValue}>{nonHotelGuestCovers.toLocaleString()}</div>
+            </div>
+          </div>
+
+          <div style={styles.chartContainer}>
+            <Plot
+              data={chartData.traces}
+              layout={{
+                barmode: 'stack',
+                title: { text: 'Restaurant Covers by Period' },
+                xaxis: { title: { text: 'Date' } },
+                yaxis: { title: { text: 'Covers' } },
+                plot_bgcolor: colors.background,
+                paper_bgcolor: colors.background,
+                font: { color: colors.text },
+                hovermode: 'closest',
+                showlegend: true,
+                legend: { orientation: 'h', y: -0.2 },
+              }}
+              config={{ responsive: true }}
+              style={{ width: '100%', height: '500px' }}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+
+// ============================================
+// PICKUP 3D VISUALIZATION
+// ============================================
+
+interface Pickup3DData {
+  start_date: string
+  end_date: string
+  metric: string
+  consolidation: string
+  arrival_dates: string[]
+  lead_times: number[]
+  surface_data: (number | null)[][]
+  final_values: (number | null)[]
+}
+
+type Pickup3DConsolidationType = 'day' | 'week'
+
+const PickupVisualization: React.FC = () => {
+  const today = new Date()
+  const defaultEnd = new Date(today)
+  defaultEnd.setDate(today.getDate() - 1) // Yesterday
+  const defaultStart = new Date(defaultEnd)
+  defaultStart.setMonth(defaultEnd.getMonth() - 1) // 1 month ago
+
+  const [startDate, setStartDate] = useState(formatDate(defaultStart))
+  const [endDate, setEndDate] = useState(formatDate(defaultEnd))
+  const [metric, setMetric] = useState<'rooms' | 'occupancy'>('rooms')
+  const [consolidation, setConsolidation] = useState<Pickup3DConsolidationType>('day')
+
+  // Generate month options (last 12 months)
+  const monthOptions = useMemo(() => getLast12Months(), [])
+
+  const handleMonthSelect = (monthIndex: string) => {
+    if (monthIndex === '') return
+    const idx = parseInt(monthIndex, 10)
+    const month = monthOptions[idx]
+    if (month) {
+      setStartDate(month.start)
+      setEndDate(month.end)
+    }
+  }
+
+  // Quick select handlers
+  const handleQuickSelect = (type: QuickSelectType) => {
+    const end = new Date()
+    end.setDate(end.getDate() - 1) // Yesterday
+    const start = new Date(end)
+
+    switch (type) {
+      case '7days':
+        start.setDate(end.getDate() - 6)
+        break
+      case '14days':
+        start.setDate(end.getDate() - 13)
+        break
+      case '1month':
+        start.setMonth(end.getMonth() - 1)
+        break
+      case '3months':
+        start.setMonth(end.getMonth() - 3)
+        break
+      case '6months':
+        start.setMonth(end.getMonth() - 6)
+        break
+      case '1year':
+        start.setFullYear(end.getFullYear() - 1)
+        break
+    }
+
+    setStartDate(formatDate(start))
+    setEndDate(formatDate(end))
+  }
+
+  const { data: pickupData, isLoading, error } = useQuery<Pickup3DData>({
+    queryKey: ['pickup-3d', startDate, endDate, metric, consolidation],
+    queryFn: async () => {
+      const params = new URLSearchParams({
+        start_date: startDate,
+        end_date: endDate,
+        metric: metric,
+        consolidation: consolidation,
+      })
+      const response = await fetch(`/api/reports/pickup-3d?${params}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+      })
+      if (!response.ok) throw new Error('Failed to fetch pickup data')
+      return response.json()
+    },
+  })
+
+  // Prepare Plotly data
+  const plotData = useMemo(() => {
+    if (!pickupData || !pickupData.surface_data?.length) return null
+
+    const { arrival_dates, lead_times, surface_data, final_values } = pickupData
+
+    // X-axis: Format dates based on consolidation
+    const xLabels = arrival_dates.map(d => {
+      const date = new Date(d)
+      if (consolidation === 'week') {
+        return `${date.getMonth() + 1}/${date.getDate()}`
+      }
+      // For daily, show day number or short date depending on range
+      if (arrival_dates.length <= 31) {
+        return date.getDate().toString()
+      }
+      return `${date.getMonth() + 1}/${date.getDate()}`
+    })
+
+    // Y-axis: Lead times (days out)
+    const yLabels = lead_times.map(lt => lt.toString())
+
+    // Z data is already [lead_time][arrival_date]
+    const z = surface_data
+
+    return {
+      z,
+      x: xLabels,
+      y: yLabels,
+      finalValues: final_values,
+      arrivalDates: arrival_dates,
+    }
+  }, [pickupData, consolidation])
+
+  const metricLabel = metric === 'rooms' ? 'Room Nights' : 'Occupancy %'
+
+  // Format date range for title
+  const formatDateRange = () => {
+    const start = parseDate(startDate)
+    const end = parseDate(endDate)
+    const startStr = start.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
+    const endStr = end.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
+    return `${startStr} - ${endStr}`
+  }
+
+  return (
+    <div style={styles.section}>
+      <div style={styles.sectionHeader}>
+        <h2 style={styles.sectionTitle}>3D Pickup Visualization</h2>
+        <p style={styles.hint}>
+          Visualize how bookings accumulated over time for each arrival date
+        </p>
+      </div>
+
+      {/* Controls Row 1: Date Range */}
+      <div style={styles.controlsGrid}>
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Date Range</label>
+          <div style={styles.dateInputs}>
+            <input
+              type="date"
+              value={startDate}
+              onChange={(e) => setStartDate(e.target.value)}
+              style={styles.dateInput}
+            />
+            <span style={styles.dateSeparator}>to</span>
+            <input
+              type="date"
+              value={endDate}
+              onChange={(e) => setEndDate(e.target.value)}
+              style={styles.dateInput}
+            />
+          </div>
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Consolidation</label>
+          <div style={styles.buttonGroup}>
+            <button
+              onClick={() => setConsolidation('day')}
+              style={{
+                ...styles.toggleButton,
+                ...(consolidation === 'day' ? styles.toggleButtonActive : {}),
+              }}
+            >
+              Daily
+            </button>
+            <button
+              onClick={() => setConsolidation('week')}
+              style={{
+                ...styles.toggleButton,
+                ...(consolidation === 'week' ? styles.toggleButtonActive : {}),
+              }}
+            >
+              Weekly
+            </button>
+          </div>
+        </div>
+
+        <div style={styles.controlGroup}>
+          <label style={styles.controlLabel}>Metric</label>
+          <div style={styles.buttonGroup}>
+            <button
+              onClick={() => setMetric('rooms')}
+              style={{
+                ...styles.toggleButton,
+                ...(metric === 'rooms' ? styles.toggleButtonActive : {}),
+              }}
+            >
+              Room Nights
+            </button>
+            <button
+              onClick={() => setMetric('occupancy')}
+              style={{
+                ...styles.toggleButton,
+                ...(metric === 'occupancy' ? styles.toggleButtonActive : {}),
+              }}
+            >
+              Occupancy %
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Quick Select Row */}
+      <div style={styles.quickSelect}>
+        <span style={styles.quickSelectLabel}>Quick:</span>
+        {(['7days', '14days', '1month', '3months', '6months', '1year'] as QuickSelectType[]).map((type) => (
+          <button
+            key={type}
+            onClick={() => handleQuickSelect(type)}
+            style={styles.quickSelectButton}
+          >
+            {type === '7days' ? '7d' :
+             type === '14days' ? '14d' :
+             type === '1month' ? '1m' :
+             type === '3months' ? '3m' :
+             type === '6months' ? '6m' : '1y'}
+          </button>
+        ))}
+        <select
+          onChange={(e) => handleMonthSelect(e.target.value)}
+          value=""
+          style={styles.monthSelect}
+        >
+          <option value="">Select Month...</option>
+          {monthOptions.map((month, idx) => (
+            <option key={idx} value={idx}>{month.label}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* 3D Chart */}
+      <div style={pickup3dStyles.chartContainer}>
+        {isLoading ? (
+          <div style={styles.loading}>Loading pickup data...</div>
+        ) : error ? (
+          <div style={pickup3dStyles.error}>Error loading data. Please try again.</div>
+        ) : !plotData ? (
+          <div style={styles.emptyState}>
+            No pickup data available for this date range.
+          </div>
+        ) : (
+          <Plot
+            data={[
+              // Pickup surface
+              {
+                type: 'surface' as const,
+                z: plotData.z,
+                x: plotData.x,
+                y: plotData.y,
+                colorscale: [
+                  [0, '#fff5f0'],
+                  [0.2, '#fee0d2'],
+                  [0.4, '#fc9272'],
+                  [0.6, '#ef3b2c'],
+                  [0.8, '#cb181d'],
+                  [1, '#67000d']
+                ],
+                opacity: 0.92,
+                name: 'Bookings',
+                showscale: true,
+                colorbar: {
+                  title: { text: metricLabel },
+                  titleside: 'right' as const,
+                  thickness: 15,
+                  len: 0.6,
+                },
+                hovertemplate:
+                  'Date: %{x}<br>' +
+                  'Lead Time: %{y} days<br>' +
+                  `${metricLabel}: %{z:.1f}<extra></extra>`,
+              } as Partial<Plotly.PlotData>,
+              // Final values line (d0 - arrival day)
+              ...(plotData.finalValues.some(v => v !== null && v > 0) ? [{
+                type: 'scatter3d' as const,
+                mode: 'lines+markers' as const,
+                x: plotData.x,
+                y: plotData.x.map(() => '0'), // All at lead time 0
+                z: plotData.finalValues,
+                line: {
+                  color: 'rgba(233, 69, 96, 1)',
+                  width: 6,
+                },
+                marker: {
+                  size: 5,
+                  color: 'rgba(233, 69, 96, 1)',
+                },
+                name: 'Final (Day of Arrival)',
+                hovertemplate:
+                  'Date: %{x}<br>' +
+                  `Final ${metricLabel}: %{z:.1f}<extra></extra>`,
+              } as Partial<Plotly.PlotData>] : []),
+            ]}
+            layout={{
+              title: {
+                text: `${metricLabel} Pickup - ${formatDateRange()}`,
+                font: { size: 16 },
+              },
+              scene: {
+                xaxis: {
+                  title: { text: consolidation === 'week' ? 'Week Starting' : 'Arrival Date' },
+                  tickfont: { size: 10 },
+                },
+                yaxis: {
+                  title: { text: 'Lead Time (Days Out)' },
+                  tickfont: { size: 10 },
+                  autorange: 'reversed' as const, // 0 at front, higher values at back
+                },
+                zaxis: {
+                  title: { text: metricLabel },
+                  tickfont: { size: 10 },
+                },
+                camera: {
+                  eye: { x: 1.8, y: -1.8, z: 1.0 },
+                },
+              },
+              margin: { l: 0, r: 0, t: 50, b: 0 },
+              paper_bgcolor: 'transparent',
+              font: { family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' },
+            }}
+            style={{ width: '100%', height: '550px' }}
+            config={{
+              displayModeBar: true,
+              displaylogo: false,
+              modeBarButtonsToRemove: ['toImage', 'sendDataToCloud'],
+            }}
+          />
+        )}
+      </div>
+
+      {/* Explanation */}
+      <div style={pickup3dStyles.explanation}>
+        <h4 style={pickup3dStyles.explanationTitle}>How to Read This Chart</h4>
+        <ul style={pickup3dStyles.explanationList}>
+          <li><strong>X-axis ({consolidation === 'week' ? 'Week Starting' : 'Arrival Date'}):</strong> Each {consolidation === 'week' ? 'week' : 'day'} in the selected range</li>
+          <li><strong>Y-axis (Lead Time):</strong> Days before arrival when bookings were recorded (0 = arrival day, 30 = 30 days before)</li>
+          <li><strong>Z-axis (Height/Color):</strong> {metric === 'rooms' ? 'Number of rooms booked' : 'Occupancy percentage'}</li>
+          <li><strong>Surface shape:</strong> The surface rises as you move toward lead time 0 (front), showing how bookings accumulated over time</li>
+          <li><strong>Red line at the front:</strong> Final values on the day of arrival</li>
+        </ul>
+        <p style={pickup3dStyles.explanationNote}>
+          Tip: Click and drag to rotate the view. Use scroll to zoom. Double-click to reset.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+const pickup3dStyles: Record<string, React.CSSProperties> = {
+  controls: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: spacing.md,
+    marginBottom: spacing.lg,
+    alignItems: 'flex-end',
+  },
+  controlGroup: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: spacing.xs,
+  },
+  select: {
+    padding: `${spacing.sm} ${spacing.md}`,
+    borderRadius: radius.md,
+    border: `1px solid ${colors.border}`,
+    fontSize: typography.sm,
+    background: colors.surface,
+    color: colors.text,
+    cursor: 'pointer',
+    minWidth: '120px',
+  },
+  chartContainer: {
+    marginBottom: spacing.lg,
+    minHeight: '550px',
+    background: colors.background,
+    borderRadius: radius.lg,
+    overflow: 'hidden',
+  },
+  error: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: '550px',
+    color: colors.error,
+  },
+  explanation: {
+    padding: spacing.md,
+    background: colors.background,
+    borderRadius: radius.md,
+    marginTop: spacing.md,
+  },
+  explanationTitle: {
+    margin: `0 0 ${spacing.sm} 0`,
+    fontSize: typography.base,
+    fontWeight: typography.semibold,
+    color: colors.text,
+  },
+  explanationList: {
+    margin: 0,
+    paddingLeft: spacing.lg,
+    color: colors.textSecondary,
+    fontSize: typography.sm,
+    lineHeight: 1.6,
+  },
+  explanationNote: {
+    margin: `${spacing.sm} 0 0 0`,
+    fontSize: typography.xs,
+    color: colors.textMuted,
+    fontStyle: 'italic',
+  },
+}
+
+// ============================================
 // STYLES
 // ============================================
 
@@ -3149,7 +4215,21 @@ const styles: Record<string, React.CSSProperties> = {
   nav: {
     display: 'flex',
     flexDirection: 'column',
+    gap: spacing.md,
+  },
+  navGroup: {
+    display: 'flex',
+    flexDirection: 'column',
     gap: '4px',
+  },
+  navGroupTitle: {
+    padding: `${spacing.xs} ${spacing.sm}`,
+    fontSize: typography.xs,
+    fontWeight: typography.semibold,
+    color: colors.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
+    marginTop: spacing.xs,
   },
   navItem: {
     padding: `${spacing.sm} ${spacing.md}`,

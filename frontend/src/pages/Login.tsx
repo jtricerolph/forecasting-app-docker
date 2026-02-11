@@ -4,7 +4,7 @@ import { authApi } from '../utils/api'
 import { colors, spacing, radius, shadows, typography, components, buttonStyle, mergeStyles } from '../utils/theme'
 
 interface LoginProps {
-  onLogin: (token: string, user: { id: number; username: string; display_name: string }) => void
+  onLogin: (token: string, user: { id: number; username: string; display_name: string; role?: string }) => void
 }
 
 const Login: React.FC<LoginProps> = ({ onLogin }) => {
@@ -24,8 +24,9 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
       localStorage.setItem('token', loginResponse.access_token)
 
       const user = await authApi.getMe()
-      onLogin(loginResponse.access_token, { id: user.id, username: user.username, display_name: user.display_name })
-      navigate('/')
+      const role = user.role || 'admin'
+      onLogin(loginResponse.access_token, { id: user.id, username: user.username, display_name: user.display_name, role })
+      navigate(role === 'staff' ? '/staff' : '/')
     } catch {
       setError('Invalid username or password')
     } finally {
@@ -36,7 +37,7 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
   return (
     <div style={styles.container}>
       <div style={styles.card}>
-        <h1 style={components.title}>Forecasting</h1>
+        <h1 style={components.title}>Finance</h1>
         <p style={mergeStyles(components.subtitle, { marginBottom: spacing.xl, textAlign: 'center' })}>
           Sign in to continue
         </p>

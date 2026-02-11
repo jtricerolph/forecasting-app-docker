@@ -1,163 +1,177 @@
-# System Usage Tracking - New UI vs Old Dashboard
+# System Database & API Reference
 
-This document tracks which database tables, backend endpoints, and features are used by the new React UI vs the old Streamlit dashboard. Use this to identify redundant code for cleanup.
+This document tracks the database tables and backend endpoints used by the forecasting application.
 
 ---
 
 # DATABASE TABLES
 
-## Tables Used by NEW UI (React Frontend)
+## Database: `forecast_data`
 
-| Table | Used For | Status |
-|-------|----------|--------|
-| `users` | User authentication and management | Active |
-| `system_config` | Newbook/Resos API settings, GL codes, sync settings | Active |
-| `newbook_room_categories` | Room type selection for occupancy (NEW) | Active |
-| `newbook_gl_accounts` | GL account fetch, grouping, and revenue department mapping (NEW fields: gl_group_id, gl_group_name, department) | Active |
+### Core Tables
 
-## Tables Used by OLD Dashboard (Streamlit)
+| Table | Used For |
+|-------|----------|
+| `users` | User authentication and management |
+| `system_config` | Newbook/Resos API settings, GL codes, sync settings |
+| `newbook_room_categories` | Room type selection for occupancy calculations |
+| `newbook_gl_accounts` | GL account fetch, grouping, and revenue department mapping |
 
-| Table | Used For | Status |
-|-------|----------|--------|
-| `users` | User authentication | Keep |
-| `system_config` | All settings storage | Keep |
-| `newbook_bookings` | Hotel booking data | Keep (data sync) |
-| `newbook_booking_nights` | Per-night tariff breakdown | Keep (data sync) |
-| `newbook_occupancy_report` | Occupancy report data | Keep (data sync) |
-| `newbook_earned_revenue` | Revenue by GL account | Keep (data sync) |
-| `newbook_gl_accounts` | GL account cache | Keep |
-| `resos_bookings` | Restaurant booking data | Keep (data sync) |
-| `daily_occupancy` | Aggregated hotel stats | Keep (forecasting) |
-| `daily_covers` | Aggregated restaurant stats | Keep (forecasting) |
-| `daily_revenue` | Revenue by GL account | Keep (forecasting) |
-| `daily_metrics` | Unified daily actuals | Keep (forecasting) |
-| `forecasts` | Generated predictions | Keep (forecasting) |
-| `forecast_runs` | Forecast metadata | Keep (forecasting) |
-| `forecast_history` | Full audit trail | Keep (forecasting) |
-| `pickup_snapshots` | OTB snapshots for pickup model | Keep (forecasting) |
-| `monthly_budgets` | FD budget targets | Keep (budgeting) |
-| `daily_budgets` | Distributed budget | Keep (budgeting) |
-| `sync_log` | Sync history | Keep (monitoring) |
-| `aggregation_queue` | Pending aggregations | Keep (processing) |
-| `room_categories` | Auto-populated from booking data | Review - may be redundant |
+### Newbook Data Tables
 
-## Tables to Potentially Remove
+| Table | Used For |
+|-------|----------|
+| `newbook_bookings_data` | Historical hotel booking data |
+| `newbook_earned_revenue_data` | Historical revenue by GL account |
+| `newbook_net_revenue_data` | Aggregated revenue by department |
+| `newbook_occupancy_report_data` | Official capacity & occupancy from Newbook |
+| `newbook_bookings_stats` | Aggregated daily booking statistics |
+| `newbook_booking_pace` | Lead-time snapshots for forecasting |
+| `newbook_booking_pace_v2` | Enhanced pace snapshots with additional metrics |
+| `newbook_current_rates` | Rack rates from Newbook API (snapshot model, 720-day horizon) |
 
-| Table | Reason |
-|-------|--------|
-| `room_categories` | Replaced by `newbook_room_categories` which has `is_included` flag |
+### Forecasting Tables
 
-## Table Migration Notes
+| Table | Used For |
+|-------|----------|
+| `forecast_metrics` | Metric configuration for forecasting models |
+| `daily_metrics` | Actual values storage (populated from stats) |
+| `forecasts` | Generated predictions from all models |
+| `actual_vs_forecast` | Comparison of actuals vs predictions |
+| `forecast_snapshots` | Tracking forecast evolution over time |
+| `weekly_forecast_snapshots` | Weekly point-in-time forecast snapshots |
+| `daily_budgets` | Budget targets |
 
-- The `newbook_room_categories` table was added to support user selection of which room types to include in occupancy calculations
-- The old `room_categories` table was auto-populated from booking data but had no selection capability
-- Consider migrating any useful data from `room_categories` to `newbook_room_categories` before removal
-- The `newbook_gl_accounts` table was extended with `gl_group_id`, `gl_group_name`, and `department` fields for revenue mapping
-- Run `db/add_gl_account_fields.sql` on existing databases to add the new columns
+### Model-Specific Tables
+
+| Table | Used For |
+|-------|----------|
+| `prophet_decomposition` | Prophet trend/seasonality breakdown |
+| `xgboost_explanations` | XGBoost SHAP values |
+| `pickup_explanations` | Pickup model reasoning |
+
+### Competitor Rate Tables
+
+| Table | Used For |
+|-------|----------|
+| `booking_com_hotels` | Tracked competitor hotels (own/competitor/market tiers) |
+| `booking_com_rates` | Scraped competitor rates from Booking.com |
+| `booking_scrape_log` | Scrape batch history and status tracking |
+| `booking_scrape_queue` | Priority-based scrape queue (high/medium/low) |
+| `booking_scrape_config` | Scraper configuration (location, pages, adults) |
+| `rate_parity_alerts` | Rate parity discrepancy alerts |
+
+### System Tables
+
+| Table | Used For |
+|-------|----------|
+| `sync_log` | Sync operation history |
 
 ---
 
 # BACKEND ENDPOINTS
 
-## Endpoints Used by NEW UI (React Frontend)
+## Authentication (`/auth/`)
 
-### Authentication (`/api/auth/`)
-| Endpoint | Method | Used For | File |
-|----------|--------|----------|------|
-| `/api/auth/login` | POST | User login | `backend/api/auth.py` |
-| `/api/auth/me` | GET | Get current user | `backend/api/auth.py` |
-| `/api/auth/users` | GET | List all users | `backend/api/auth.py` |
-| `/api/auth/users` | POST | Create new user | `backend/api/auth.py` |
-| `/api/auth/users/{id}` | DELETE | Delete user | `backend/api/auth.py` |
+| Endpoint | Method | Used For |
+|----------|--------|----------|
+| `/auth/login` | POST | User login |
+| `/auth/me` | GET | Get current user |
+| `/auth/users` | GET | List all users |
+| `/auth/users` | POST | Create new user |
+| `/auth/users/{id}` | DELETE | Delete user |
 
-### Config/Settings (`/api/config/`)
-| Endpoint | Method | Used For | File |
-|----------|--------|----------|------|
-| `/api/config/settings/newbook` | GET | Get Newbook API settings | `backend/api/config.py` |
-| `/api/config/settings/newbook` | POST | Save Newbook API settings | `backend/api/config.py` |
-| `/api/config/settings/newbook/test` | POST | Test Newbook connection | `backend/api/config.py` |
-| `/api/config/room-categories` | GET | List room categories | `backend/api/config.py` |
-| `/api/config/room-categories/fetch` | POST | Fetch room categories from Newbook | `backend/api/config.py` |
-| `/api/config/room-categories/bulk-update` | PATCH | Update room category is_included | `backend/api/config.py` |
-| `/api/config/gl-accounts` | GET | List GL accounts | `backend/api/config.py` |
-| `/api/config/gl-accounts/fetch` | POST | Fetch GL accounts from Newbook | `backend/api/config.py` |
-| `/api/config/gl-accounts/department` | PATCH | Update GL department mappings | `backend/api/config.py` |
+## Config/Settings (`/config/`)
 
-## Endpoints Used by OLD Dashboard (Streamlit)
+| Endpoint | Method | Used For |
+|----------|--------|----------|
+| `/config/settings/newbook` | GET | Get Newbook API settings |
+| `/config/settings/newbook` | POST | Save Newbook API settings |
+| `/config/settings/newbook/test` | POST | Test Newbook connection |
+| `/config/room-categories` | GET | List room categories |
+| `/config/room-categories/fetch` | POST | Fetch room categories from Newbook |
+| `/config/room-categories/bulk-update` | PATCH | Update room category inclusion |
+| `/config/gl-accounts` | GET | List GL accounts |
+| `/config/gl-accounts/fetch` | POST | Fetch GL accounts from Newbook |
+| `/config/gl-accounts/department` | PATCH | Update GL department mappings |
 
-### Sync Endpoints (`/api/sync/`)
-| Endpoint | Method | Used For | Status |
-|----------|--------|----------|--------|
-| `/api/sync/newbook/bookings` | POST | Sync hotel bookings | Keep (data sync) |
-| `/api/sync/newbook/occupancy` | POST | Sync occupancy report | Keep (data sync) |
-| `/api/sync/newbook/revenue` | POST | Sync earned revenue | Keep (data sync) |
-| `/api/sync/resos/bookings` | POST | Sync restaurant bookings | Keep (data sync) |
-| `/api/sync/aggregate` | POST | Run aggregation | Keep (processing) |
+## Sync (`/sync/`)
 
-### Dashboard Data Endpoints
-| Endpoint | Method | Used For | Status |
-|----------|--------|----------|--------|
-| `/api/dashboard/occupancy` | GET | Get occupancy data | Review |
-| `/api/dashboard/revenue` | GET | Get revenue data | Review |
-| `/api/dashboard/forecasts` | GET | Get forecast data | Review |
-| `/api/budgets/*` | Various | Budget management | Review |
+| Endpoint | Method | Used For |
+|----------|--------|----------|
+| `/sync/newbook/bookings` | POST | Sync hotel bookings |
+| `/sync/newbook/occupancy` | POST | Sync occupancy report |
+| `/sync/newbook/revenue` | POST | Sync earned revenue |
+| `/sync/resos/bookings` | POST | Sync restaurant bookings |
 
-## Endpoints to Potentially Remove
+## Forecast (`/forecast/`)
 
-| Endpoint | Reason |
-|----------|--------|
-| TBD | Review after new UI is complete |
+| Endpoint | Method | Used For |
+|----------|--------|----------|
+| `/forecast/generate` | POST | Generate forecasts |
+| `/forecast/data` | GET | Get forecast data |
 
----
+## Bookability (`/bookability/`)
 
-# BACKEND SERVICES & FEATURES
+| Endpoint | Method | Used For |
+|----------|--------|----------|
+| `/bookability/rate-matrix` | GET | Rate matrix with tariff availability |
+| `/bookability/rate-matrix/summary` | GET | Summary stats (unbookable counts) |
+| `/bookability/rate-history/{cat}/{date}` | GET | Rate change history |
+| `/bookability/rate-changes` | GET | Recent rate changes |
+| `/bookability/refresh-rates` | POST | Full rate refresh (background) |
+| `/bookability/refresh-date/{date}` | POST | Single-date refresh (background) |
 
-## Services Used by NEW UI
+## Competitor Rates (`/competitor-rates/`)
 
-| Service/Feature | File | Description |
-|-----------------|------|-------------|
-| User authentication | `backend/api/auth.py` | JWT-based auth |
-| Config management | `backend/api/config.py` | System settings CRUD |
-| Newbook API client | `backend/api/config.py` | Direct API calls for settings |
+| Endpoint | Method | Used For |
+|----------|--------|----------|
+| `/competitor-rates/status` | GET | Scraper status |
+| `/competitor-rates/config/location` | POST | Configure scrape location |
+| `/competitor-rates/config/enable` | POST | Enable/disable scraper |
+| `/competitor-rates/config/unpause` | POST | Unpause after block |
+| `/competitor-rates/scrape` | POST | Trigger manual scrape |
+| `/competitor-rates/hotels` | GET | List tracked hotels |
+| `/competitor-rates/hotels/{id}/tier` | PUT | Update hotel tier |
+| `/competitor-rates/matrix` | GET | Competitor rate matrix |
+| `/competitor-rates/parity` | GET | Rate parity comparison |
+| `/competitor-rates/parity/alerts` | GET | Parity alerts |
+| `/competitor-rates/queue-status` | GET | Scrape queue status |
+| `/competitor-rates/schedule-info` | GET | Schedule information |
+| `/competitor-rates/scrape-coverage` | GET | 365-day coverage view |
+| `/competitor-rates/booking-availability` | GET | Own hotel Booking.com availability |
+| `/competitor-rates/scrape-history` | GET | Scrape batch history |
 
-## Services Used by OLD Dashboard
+## Reports (`/reports/`)
 
-| Service/Feature | File | Description | Status |
-|-----------------|------|-------------|--------|
-| Newbook sync service | `backend/services/newbook_sync.py` | Full booking/revenue sync | Keep |
-| Resos sync service | `backend/services/resos_sync.py` | Restaurant booking sync | Keep |
-| Aggregation service | `backend/services/aggregation.py` | Daily metric aggregation | Keep |
-| Forecast engine | `backend/services/forecast.py` | ML forecasting | Keep |
-| Budget service | `backend/services/budget.py` | Budget distribution | Keep |
+| Endpoint | Method | Used For |
+|----------|--------|----------|
+| `/reports/*` | Various | Report generation |
 
-## Services to Potentially Remove
+## Other Endpoints
 
-| Service | Reason |
-|---------|--------|
-| TBD | Review after new UI is complete |
-
----
-
-# FRONTEND PAGES/COMPONENTS
-
-## Pages in NEW UI (React)
-
-| Page/Component | File | Features |
-|----------------|------|----------|
-| Login | `frontend/src/pages/Login.tsx` | User authentication |
-| Settings | `frontend/src/pages/Settings.tsx` | Newbook config, Users, Database browser |
-| Settings > Newbook | `frontend/src/pages/Settings.tsx` | API config, Room categories, GL mapping |
-
-## Pages in OLD Dashboard (Streamlit)
-
-| Page | File | Status |
-|------|------|--------|
-| Dashboard | `dashboard/pages/dashboard.py` | Review - may move to new UI |
-| Forecasts | `dashboard/pages/forecasts.py` | Review - may move to new UI |
-| Budgets | `dashboard/pages/budgets.py` | Review - may move to new UI |
-| Sync Status | `dashboard/pages/sync.py` | Review - may move to new UI |
-| Settings | `dashboard/pages/settings.py` | Being replaced by new UI |
+- `/accuracy/*` - Forecast accuracy metrics
+- `/backtest/*` - Backtesting operations
+- `/budget/*` - Budget management
+- `/explain/*` - Model explanations
+- `/historical/*` - Historical data queries
+- `/resos/*` - Resos mapping
+- `/settings/*` - Special dates configuration
 
 ---
 
-Last updated: 2026-01-31
+# SERVICES
+
+| Service | File | Description |
+|---------|------|-------------|
+| Newbook client | `backend/services/newbook_client.py` | Newbook PMS API (bookings, occupancy, revenue) |
+| Newbook rates client | `backend/services/newbook_rates_client.py` | Newbook Rates API (rack rates, tariff availability) |
+| Booking scraper | `backend/services/booking_scraper.py` | Booking.com rate scraper (queue-based) |
+| Scraper backends | `backend/services/scraper_backends/` | Scraper backend implementations |
+| Resos client | `backend/services/resos_client.py` | Resos API integration |
+| Backup service | `backend/services/backup_service.py` | Database backup/restore |
+| Forecasting | `backend/services/forecasting/` | ML forecasting engines |
+
+---
+
+Last updated: 2025-02-11
