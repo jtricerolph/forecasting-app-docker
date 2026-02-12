@@ -488,3 +488,50 @@ async def get_revenue_forecast(
         current += timedelta(days=1)
 
     return {"data": data}
+
+
+@router.get("/forecast/spend-rates")
+async def get_spend_rates(
+    db: AsyncSession = Depends(get_db),
+    api_key: dict = Depends(get_api_key_auth)
+):
+    """
+    Return spend-per-cover rates for each meal period.
+    Values are gross (inc VAT) from system_config, plus the VAT rate.
+    Kitchen app can divide by VAT rate to get net values.
+    """
+    VAT_RATE = 1.20
+
+    spend_result = await db.execute(
+        text("""
+            SELECT config_key, config_value
+            FROM system_config
+            WHERE config_key LIKE 'resos_%_spend'
+        """)
+    )
+    spend_rows = spend_result.fetchall()
+    spend_settings = {row.config_key: float(row.config_value or 0) for row in spend_rows}
+
+    return {
+        "vat_rate": VAT_RATE,
+        "periods": {
+            "breakfast": {
+                "food_spend_gross": spend_settings.get("resos_breakfast_food_spend", 0),
+                "drinks_spend_gross": spend_settings.get("resos_breakfast_drinks_spend", 0),
+                "food_spend_net": round(spend_settings.get("resos_breakfast_food_spend", 0) / VAT_RATE, 2),
+                "drinks_spend_net": round(spend_settings.get("resos_breakfast_drinks_spend", 0) / VAT_RATE, 2),
+            },
+            "lunch": {
+                "food_spend_gross": spend_settings.get("resos_lunch_food_spend", 0),
+                "drinks_spend_gross": spend_settings.get("resos_lunch_drinks_spend", 0),
+                "food_spend_net": round(spend_settings.get("resos_lunch_food_spend", 0) / VAT_RATE, 2),
+                "drinks_spend_net": round(spend_settings.get("resos_lunch_drinks_spend", 0) / VAT_RATE, 2),
+            },
+            "dinner": {
+                "food_spend_gross": spend_settings.get("resos_dinner_food_spend", 0),
+                "drinks_spend_gross": spend_settings.get("resos_dinner_drinks_spend", 0),
+                "food_spend_net": round(spend_settings.get("resos_dinner_food_spend", 0) / VAT_RATE, 2),
+                "drinks_spend_net": round(spend_settings.get("resos_dinner_drinks_spend", 0) / VAT_RATE, 2),
+            },
+        }
+    }
