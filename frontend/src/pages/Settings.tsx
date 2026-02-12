@@ -1645,6 +1645,7 @@ const CurrentRatesDataSyncSection: React.FC = () => {
   const [syncMessage, setSyncMessage] = useState('')
   const [autoEnabled, setAutoEnabled] = useState(false)
   const [syncTime, setSyncTime] = useState('05:20')
+  const [horizonDays, setHorizonDays] = useState<string>('')  // Empty = full 720-day run
 
   // Fetch sync status
   const { data: status, isLoading: statusLoading, refetch: refetchStatus } = useQuery<CurrentRatesSyncStatus>({
@@ -1701,9 +1702,17 @@ const CurrentRatesDataSyncSection: React.FC = () => {
     setSyncStatus('syncing')
     setSyncMessage('')
     try {
+      const body: Record<string, number> = {}
+      if (horizonDays && parseInt(horizonDays) > 0) {
+        body.horizon_days = parseInt(horizonDays)
+      }
       const response = await fetch('/api/sync/current-rates/sync', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify(body)
       })
       const data = await response.json()
       if (response.ok) {
@@ -1839,9 +1848,29 @@ const CurrentRatesDataSyncSection: React.FC = () => {
             <div style={styles.syncControlBox}>
               <h4 style={styles.syncControlTitle}>Manual Sync</h4>
               <p style={styles.syncControlHint}>
-                Fetch rates for all categories for the next 365 days.
-                Takes ~3 minutes per category due to API rate limits.
+                Fetch rates for all categories. Leave days blank for full 720-day run.
               </p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.sm }}>
+                <span style={{ fontSize: '0.85rem', color: colors.textSecondary }}>Days ahead:</span>
+                <input
+                  type="number"
+                  value={horizonDays}
+                  onChange={(e) => setHorizonDays(e.target.value)}
+                  placeholder="720"
+                  min="1"
+                  max="720"
+                  disabled={syncStatus === 'syncing'}
+                  style={{
+                    width: '80px',
+                    padding: `${spacing.xs} ${spacing.sm}`,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: '4px',
+                    fontSize: '0.85rem',
+                    backgroundColor: colors.surface,
+                    color: colors.text,
+                  }}
+                />
+              </div>
               <div style={{ display: 'flex', gap: spacing.sm }}>
                 <button
                   onClick={handleSync}

@@ -147,21 +147,23 @@ def save_rate_snapshot(db, category_id: str, rate_date: date, rate: Dict) -> str
         return 'verified'
 
 
-async def run_fetch_current_rates():
+async def run_fetch_current_rates(horizon_days: int = 720, start_date: date = None):
     """
     Fetch current rates for all included categories and store in database.
 
-    Fetches rates for the next 720 days for all room categories.
+    Args:
+        horizon_days: Number of days ahead to fetch (default 720 for scheduled, configurable for manual)
+        start_date: Start date for fetch (default today)
 
     OPTIMIZED: Queries all categories in a single API call per date,
     reducing API calls from (categories × days) to just (days).
 
     Uses snapshot model - only stores new rows when rates change.
     """
-    logger.info("Starting current rates fetch")
+    logger.info(f"Starting current rates fetch ({horizon_days} days)")
 
     db = next(iter([SyncSessionLocal()]))
-    today = date.today()
+    today = start_date or date.today()
 
     try:
         # Get VAT rate from config
@@ -220,9 +222,9 @@ async def run_fetch_current_rates():
         async with client:
             # OPTIMIZED: Use get_all_categories_single_night_rates for ALL 720 days
             # This queries all categories in ONE API call per date
-            logger.info(f"Fetching single-night rates for 720 days (all categories per call)")
+            logger.info(f"Fetching single-night rates for {horizon_days} days (all categories per call)")
             all_rates = await client.get_all_categories_single_night_rates(
-                today, today + timedelta(days=720)
+                today, today + timedelta(days=horizon_days)
             )
 
             # Collect dates needing multi-night verification

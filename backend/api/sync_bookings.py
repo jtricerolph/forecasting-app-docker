@@ -1209,16 +1209,23 @@ async def get_current_rates_sync_logs(
     ]
 
 
+class CurrentRatesSyncRequest(BaseModel):
+    horizon_days: Optional[int] = None  # None = full 720-day run
+
+
 @router.post("/current-rates/sync")
 async def trigger_current_rates_sync(
     background_tasks: BackgroundTasks,
+    request: CurrentRatesSyncRequest = CurrentRatesSyncRequest(),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
     """
     Trigger a current rates sync from Newbook API.
-    Fetches rates for all categories for the next 365 days.
+    Optional horizon_days param for manual range (default: 720 days).
     """
+    horizon_days = request.horizon_days or 720
+
     # Auto-clear stuck syncs (running for more than 60 minutes)
     await db.execute(
         text("""
@@ -1252,12 +1259,13 @@ async def trigger_current_rates_sync(
     # Queue background task
     background_tasks.add_task(
         run_current_rates_sync,
-        triggered_by=f"user:{current_user['username']}"
+        triggered_by=f"user:{current_user['username']}",
+        horizon_days=horizon_days
     )
 
     return {
         "status": "started",
-        "message": "Current rates sync started - fetching rates for next 365 days"
+        "message": f"Current rates sync started - fetching rates for next {horizon_days} days"
     }
 
 
@@ -1342,7 +1350,7 @@ async def cancel_current_rates_sync(
         }
 
 
-def run_current_rates_sync(triggered_by: str = "scheduler"):
+def run_current_rates_sync(triggered_by: str = "scheduler", horizon_days: int = 720):
     """
     Background task to sync current rates from Newbook API.
     """
@@ -1352,7 +1360,7 @@ def run_current_rates_sync(triggered_by: str = "scheduler"):
     from database import SyncSessionLocal
     from sqlalchemy import text
 
-    print(f"[SYNC-CURRENT-RATES] Starting sync", flush=True)
+    print(f"[SYNC-CURRENT-RATES] Starting sync ({horizon_days} days)", flush=True)
     sys.stdout.flush()
 
     db = SyncSessionLocal()
@@ -1375,8 +1383,8 @@ def run_current_rates_sync(triggered_by: str = "scheduler"):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_fetch_current_rates())
-            print(f"[SYNC-CURRENT-RATES] Sync completed", flush=True)
+            loop.run_until_complete(run_fetch_current_rates(horizon_days=horizon_days))
+            print(f"[SYNC-CURRENT-RATES] Sync completed ({horizon_days} days)", flush=True)
 
             # Count records
             result = db.execute(text("SELECT COUNT(*) as count FROM newbook_current_rates"))
