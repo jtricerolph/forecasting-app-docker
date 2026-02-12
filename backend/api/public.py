@@ -70,19 +70,56 @@ async def get_rooms_forecast(
                 forecast_rooms = otb_rooms + pickup_rooms
                 prior_otb = forecast.get('prior_year_otb', 0) or 0
                 prior_final = forecast.get('prior_year_final', 0) or 0
+
+                # Get guest counts from stats
+                stats_result = await db.execute(
+                    text("""
+                        SELECT booking_count, guests_count FROM newbook_bookings_stats
+                        WHERE date = :target_date
+                    """),
+                    {"target_date": current}
+                )
+                stats_row = stats_result.fetchone()
+                otb_guests = stats_row.guests_count if stats_row and stats_row.guests_count else 0
+
+                # Prior year guests for ratio
+                prior_stats = await db.execute(
+                    text("""
+                        SELECT booking_count, guests_count FROM newbook_bookings_stats
+                        WHERE date = :prior_date
+                    """),
+                    {"prior_date": prior_date}
+                )
+                prior_stats_row = prior_stats.fetchone()
+                prior_guests = prior_stats_row.guests_count if prior_stats_row and prior_stats_row.guests_count else 0
+                prior_rooms_actual = prior_stats_row.booking_count if prior_stats_row and prior_stats_row.booking_count else 0
+
+                # Calculate guests per room ratio (prior year -> current OTB -> default)
+                if prior_rooms_actual > 0:
+                    guests_per_room = prior_guests / prior_rooms_actual
+                elif otb_rooms > 0:
+                    guests_per_room = otb_guests / otb_rooms
+                else:
+                    guests_per_room = 1.8
+
+                pickup_guests = round(pickup_rooms * guests_per_room)
+                forecast_guests = otb_guests + pickup_guests
             else:
                 # Past date - get actuals from stats
                 stats_result = await db.execute(
                     text("""
-                        SELECT occupied_rooms FROM newbook_bookings_stats
+                        SELECT occupied_rooms, guests_count FROM newbook_bookings_stats
                         WHERE date = :target_date
                     """),
                     {"target_date": current}
                 )
                 stats_row = stats_result.fetchone()
                 otb_rooms = stats_row.occupied_rooms if stats_row else 0
+                otb_guests = stats_row.guests_count if stats_row and stats_row.guests_count else 0
                 forecast_rooms = otb_rooms
+                forecast_guests = otb_guests
                 pickup_rooms = 0
+                pickup_guests = 0
 
                 # Prior year stats
                 prior_result = await db.execute(
@@ -105,6 +142,9 @@ async def get_rooms_forecast(
                 "otb_rooms": otb_rooms,
                 "pickup_rooms": pickup_rooms,
                 "forecast_rooms": forecast_rooms,
+                "otb_guests": otb_guests,
+                "pickup_guests": pickup_guests,
+                "forecast_guests": forecast_guests,
                 "occupancy_pct": occupancy_pct,
                 "prior_year_otb": prior_otb,
                 "prior_year_final": prior_final,
@@ -118,6 +158,9 @@ async def get_rooms_forecast(
                 "otb_rooms": 0,
                 "pickup_rooms": 0,
                 "forecast_rooms": 0,
+                "otb_guests": 0,
+                "pickup_guests": 0,
+                "forecast_guests": 0,
                 "occupancy_pct": 0,
                 "prior_year_otb": 0,
                 "prior_year_final": 0,
