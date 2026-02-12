@@ -183,17 +183,26 @@ async def run_fetch_current_rates():
         logger.info(f"Fetching rates for {len(included_categories)} categories")
 
         # Import rates client
+        import base64
         from services.newbook_rates_client import NewbookRatesClient
 
-        # Get credentials from config
+        # Get credentials from config (decrypt encrypted values)
         config_result = db.execute(
             text("""
-                SELECT config_key, config_value
+                SELECT config_key, config_value, COALESCE(is_encrypted, false) as is_encrypted
                 FROM system_config
                 WHERE config_key IN ('newbook_api_key', 'newbook_username', 'newbook_password', 'newbook_region')
             """)
         )
-        config = {row.config_key: row.config_value for row in config_result.fetchall()}
+        config = {}
+        for row in config_result.fetchall():
+            value = row.config_value
+            if row.is_encrypted and value:
+                try:
+                    value = base64.b64decode(value.encode()).decode()
+                except Exception:
+                    pass  # Use raw value if decryption fails
+            config[row.config_key] = value
 
         if not all(k in config for k in ['newbook_api_key', 'newbook_username', 'newbook_password', 'newbook_region']):
             logger.error("Newbook credentials not configured")
