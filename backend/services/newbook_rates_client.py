@@ -723,6 +723,14 @@ class NewbookRatesClient:
                 if match:
                     min_stay = int(match.group(1))
 
+            # Extract advance booking requirement from message
+            min_advance_days = None
+            if message:
+                import re
+                advance_match = re.search(r'(\d+)\s*days?\s*in\s*advance', message, re.IGNORECASE)
+                if advance_match:
+                    min_advance_days = int(advance_match.group(1))
+
             tariff_info = {
                 'name': tariff.get('tariff_label', 'Unknown'),
                 'description': tariff.get('tariff_short_description', ''),
@@ -732,6 +740,7 @@ class NewbookRatesClient:
                 'message': message,
                 'sort_order': idx,  # Preserve Newbook ordering
                 'min_stay': min_stay,  # Minimum nights required (if any)
+                'min_advance_days': min_advance_days,  # Advance booking requirement (if any)
             }
 
             summary['tariffs'].append(tariff_info)

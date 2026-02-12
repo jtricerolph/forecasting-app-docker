@@ -227,19 +227,37 @@ async def run_fetch_current_rates():
 
             # Collect dates needing multi-night verification
             # Group by min_stay value for efficient batching
+            # Skip tariffs where failure is due to advance booking requirements
+            # (e.g. "must be booked 365 days in advance" - 2-night recheck won't help)
+            import re
             dates_by_nights: Dict[int, set] = {}
+            skipped_advance = 0
             for category_id, rates in all_rates.items():
                 if category_id not in included_categories:
                     continue
                 for rate in rates:
                     tariffs_data = rate.get('tariffs_data', {})
+                    rate_date = rate['date']
+                    days_ahead = (rate_date - today).days if isinstance(rate_date, date) else 0
                     for tariff in tariffs_data.get('tariffs', []):
                         min_stay = tariff.get('min_stay')
                         # If unavailable and has min_stay > 1, we need to verify with multi-night query
                         if min_stay and min_stay > 1 and not tariff.get('success', False):
+                            # Check if tariff has an advance booking requirement that isn't met
+                            message = tariff.get('message', '') or ''
+                            advance_match = re.search(r'(\d+)\s*days?\s*in\s*advance', message, re.IGNORECASE)
+                            if advance_match:
+                                min_advance_days = int(advance_match.group(1))
+                                if days_ahead < min_advance_days:
+                                    # Date is within advance period - recheck won't help
+                                    skipped_advance += 1
+                                    continue
+
                             if min_stay not in dates_by_nights:
                                 dates_by_nights[min_stay] = set()
-                            dates_by_nights[min_stay].add(rate['date'])
+                            dates_by_nights[min_stay].add(rate_date)
+            if skipped_advance > 0:
+                logger.info(f"Skipped {skipped_advance} multi-night checks (advance booking restriction)")
 
             # Convert sets to sorted lists
             dates_by_nights_list = {nights: sorted(list(dates)) for nights, dates in dates_by_nights.items()}
