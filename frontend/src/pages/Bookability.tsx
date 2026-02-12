@@ -134,230 +134,22 @@ const MonthSelector: React.FC<{
   )
 }
 
-const CategorySection: React.FC<{
-  category: CategoryInfo
-  dates: string[]
-  rateData: Record<string, DateRateInfo>
-  onRefreshDate?: (d: string) => void
-  refreshingDate?: string | null
-}> = ({ category, dates, rateData, onRefreshDate, refreshingDate }) => {
-  // Collect all unique tariff names across all dates, preserving Newbook order
-  const allTariffNames = useMemo(() => {
-    const tariffMap = new Map<string, number>() // name -> sort_order
-    for (const dateStr of dates) {
-      const data = rateData[dateStr]
-      if (data?.tariffs) {
-        for (const tariff of data.tariffs) {
-          // Only add if not already present (keep first occurrence's order)
-          if (!tariffMap.has(tariff.name)) {
-            tariffMap.set(tariff.name, tariff.sort_order ?? 999)
-          }
+// Helper to collect unique tariff names across all dates for a category, preserving Newbook order
+const getAllTariffNames = (rateData: Record<string, DateRateInfo>, dates: string[]): string[] => {
+  const tariffMap = new Map<string, number>()
+  for (const dateStr of dates) {
+    const data = rateData[dateStr]
+    if (data?.tariffs) {
+      for (const tariff of data.tariffs) {
+        if (!tariffMap.has(tariff.name)) {
+          tariffMap.set(tariff.name, tariff.sort_order ?? 999)
         }
       }
     }
-    // Sort by Newbook order (sort_order), not alphabetically
-    return Array.from(tariffMap.entries())
-      .sort((a, b) => a[1] - b[1])
-      .map(([name]) => name)
-  }, [dates, rateData])
-
-  if (allTariffNames.length === 0) {
-    return (
-      <div style={styles.categorySection}>
-        <h3 style={styles.categoryTitle}>
-          {category.category_name}
-          <span style={styles.roomCount}>({category.room_count} rooms)</span>
-        </h3>
-        <p style={styles.noData}>No rate data available for this period</p>
-      </div>
-    )
   }
-
-  return (
-    <div style={styles.categorySection}>
-      <h3 style={styles.categoryTitle}>
-        {category.category_name}
-        <span style={styles.roomCount}>({category.room_count} rooms)</span>
-      </h3>
-      <div style={styles.tableContainer}>
-        <table style={styles.table}>
-          <thead>
-            <tr>
-              <th style={mergeStyles(styles.th, styles.stickyCol)}>Tariff</th>
-              {dates.map(dateStr => (
-                <th
-                  key={dateStr}
-                  style={mergeStyles(
-                    styles.th,
-                    styles.dateHeader,
-                    isWeekend(dateStr) ? styles.weekendHeader : {}
-                  )}
-                >
-                  <div style={styles.dateHeaderContent}>
-                    <span style={styles.dayOfWeek}>{formatDayOfWeek(dateStr)}</span>
-                    <span style={styles.dayNum}>{formatDateShort(dateStr)}</span>
-                    {onRefreshDate && (
-                      <button
-                        onClick={() => onRefreshDate(dateStr)}
-                        disabled={refreshingDate !== null}
-                        style={mergeStyles(
-                          styles.scrapeBtn,
-                          refreshingDate === dateStr ? styles.scrapeBtnActive : {}
-                        )}
-                        title={`Refresh ${dateStr}`}
-                      >
-                        {refreshingDate === dateStr ? '...' : '\u21BB'}
-                      </button>
-                    )}
-                  </div>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {/* Occupancy row */}
-            <tr>
-              <td style={mergeStyles(styles.td, styles.stickyCol, styles.occupancyLabel)}>
-                Occupancy
-              </td>
-              {dates.map(dateStr => {
-                const data = rateData[dateStr]
-                const occ = data?.occupancy
-                if (!occ) {
-                  return (
-                    <td
-                      key={dateStr}
-                      style={mergeStyles(
-                        styles.td,
-                        styles.occupancyCell,
-                        isWeekend(dateStr) ? styles.weekendCell : {}
-                      )}
-                    >
-                      -
-                    </td>
-                  )
-                }
-                const bookableRooms = occ.available - occ.maintenance
-                const roomsLeft = bookableRooms - occ.occupied
-                const isFull = roomsLeft <= 0
-                const occPercent = bookableRooms > 0
-                  ? Math.round((occ.occupied / bookableRooms) * 100)
-                  : 100
-                const isHighOccupancy = occPercent >= 80 && !isFull
-                const hasOffline = occ.maintenance > 0
-
-                // Determine occupancy cell style: green=available, amber=>80%, red=full
-                const getOccupancyStyle = () => {
-                  if (isFull) return styles.occupancyFull
-                  if (isHighOccupancy) return styles.occupancyHigh
-                  return styles.occupancyAvailable
-                }
-
-                return (
-                  <td
-                    key={dateStr}
-                    style={mergeStyles(
-                      styles.td,
-                      styles.occupancyCell,
-                      isWeekend(dateStr) ? styles.weekendCell : {},
-                      getOccupancyStyle()
-                    )}
-                    title={`${occ.occupied} of ${bookableRooms} bookable rooms occupied${hasOffline ? ` (${occ.maintenance} offline)` : ''} - ${roomsLeft} left`}
-                  >
-                    <span style={styles.occupancyText}>
-                      {occ.occupied}/{occ.available}
-                      {hasOffline && <span style={styles.maintenanceBadge}>({occ.maintenance})</span>}
-                    </span>
-                  </td>
-                )
-              })}
-            </tr>
-            {allTariffNames.map(tariffName => (
-              <tr key={tariffName}>
-                <td style={mergeStyles(styles.td, styles.stickyCol, styles.tariffNameCell)}>
-                  {tariffName}
-                </td>
-                {dates.map(dateStr => {
-                  const data = rateData[dateStr]
-                  const tariff = data?.tariffs?.find(t => t.name === tariffName)
-                  const occupancy = data?.occupancy
-                  // No rooms available when all bookable rooms are occupied
-                  const noRoomsAvailable = occupancy &&
-                    (occupancy.available - occupancy.maintenance - occupancy.occupied) <= 0
-
-                  if (!tariff) {
-                    return (
-                      <td
-                        key={dateStr}
-                        style={mergeStyles(
-                          styles.td,
-                          styles.tariffCell,
-                          isWeekend(dateStr) ? styles.weekendCell : {},
-                          noRoomsAvailable ? styles.cellNoRooms : styles.cellNoData
-                        )}
-                        title={noRoomsAvailable ? 'No rooms available' : undefined}
-                      >
-                        -
-                      </td>
-                    )
-                  }
-
-                  // Determine cell styling based on availability
-                  // A tariff is considered "available" if:
-                  // - available: true, OR
-                  // - has min_stay > 1 AND multi-night re-query confirmed it's bookable
-                  const isEffectivelyAvailable = tariff.available ||
-                    (tariff.min_stay && tariff.min_stay > 1 && tariff.available_for_min_stay === true)
-
-                  // Only show min_stay badge on confirmed-available tariffs
-                  const minStayBadge = isEffectivelyAvailable && !noRoomsAvailable && tariff.min_stay && tariff.min_stay > 1 ? (
-                    <span style={styles.minStayBadge} title={`Minimum ${tariff.min_stay} nights`}>
-                      {tariff.min_stay}
-                    </span>
-                  ) : null
-
-                  const getCellStyle = () => {
-                    if (noRoomsAvailable) return styles.cellNoRooms
-                    if (isEffectivelyAvailable) return styles.cellAvailable
-                    return styles.cellUnavailable
-                  }
-
-                  // Build tooltip text
-                  const getTooltip = () => {
-                    if (noRoomsAvailable) return `${tariffName}: No rooms available`
-                    if (isEffectivelyAvailable) {
-                      const minStayNote = tariff.min_stay && tariff.min_stay > 1 ? ` (Min ${tariff.min_stay} nights)` : ''
-                      return `${tariffName}: ${formatCurrency(tariff.rate)}${minStayNote}`
-                    }
-                    return `${tariffName}: ${tariff.message || 'Not available'}`
-                  }
-
-                  return (
-                    <td
-                      key={dateStr}
-                      style={mergeStyles(
-                        styles.td,
-                        styles.tariffCell,
-                        isWeekend(dateStr) ? styles.weekendCell : {},
-                        getCellStyle(),
-                        !isEffectivelyAvailable && !noRoomsAvailable ? { textDecoration: 'line-through' } : {}
-                      )}
-                      title={getTooltip()}
-                    >
-                      <span style={styles.cellContent}>
-                        {tariff.rate !== null ? formatCurrency(tariff.rate) : (isEffectivelyAvailable ? 'Y' : 'N')}
-                        {minStayBadge}
-                      </span>
-                    </td>
-                  )
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
+  return Array.from(tariffMap.entries())
+    .sort((a, b) => a[1] - b[1])
+    .map(([name]) => name)
 }
 
 // Helper to format scrape age
@@ -382,105 +174,7 @@ interface BookingAvailabilityData {
   dates: Record<string, { status: string; rate: number | null }>
 }
 
-const BookingComSection: React.FC<{ dates: string[]; fromDate: string; toDate: string }> = ({ dates, fromDate, toDate }) => {
-  const token = localStorage.getItem('token')
-  const { data } = useQuery<BookingAvailabilityData>({
-    queryKey: ['booking-availability', fromDate, toDate],
-    queryFn: async () => {
-      const params = new URLSearchParams({ from_date: fromDate, to_date: toDate })
-      const res = await fetch(`/api/competitor-rates/booking-availability?${params}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (!res.ok) return null
-      return res.json()
-    },
-    enabled: !!token,
-    staleTime: 5 * 60 * 1000,
-  })
-
-  if (!data || !data.has_own_hotel) return null
-
-  return (
-    <div style={styles.categorySection}>
-      <h3 style={styles.categoryTitle}>
-        <span>Booking.com</span>
-        <span style={styles.roomCount}>
-          {data.latest_scrape ? `Scraped ${formatScrapeAge(data.latest_scrape)}` : 'No scrape data'}
-          {' \u00b7 '}
-          <Link to="/competitor-rates" style={{ color: colors.primary, textDecoration: 'none', fontSize: typography.sm }}>
-            View details
-          </Link>
-        </span>
-      </h3>
-      <div style={styles.tableContainer}>
-        <table style={styles.table}>
-          <thead>
-            <tr>
-              <th style={mergeStyles(styles.th, styles.stickyCol)}>Rate</th>
-              {dates.map(dateStr => (
-                <th
-                  key={dateStr}
-                  style={mergeStyles(
-                    styles.th,
-                    styles.dateHeader,
-                    isWeekend(dateStr) ? styles.weekendHeader : {}
-                  )}
-                >
-                  <div style={styles.dateHeaderContent}>
-                    <span style={styles.dayOfWeek}>{formatDayOfWeek(dateStr)}</span>
-                    <span style={styles.dayNum}>{formatDateShort(dateStr)}</span>
-                  </div>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td style={mergeStyles(styles.td, styles.stickyCol, styles.tariffNameCell)}>
-                Best Available
-              </td>
-              {dates.map(dateStr => {
-                const entry = data.dates[dateStr]
-                const isAvailable = entry?.status === 'available'
-                const isSoldOut = entry?.status === 'sold_out'
-
-                const getCellStyle = () => {
-                  if (!entry) return styles.cellNoData
-                  if (isAvailable && entry.rate) return styles.cellAvailable
-                  if (isSoldOut) return styles.bookingCellSoldOut
-                  return styles.cellNoData
-                }
-
-                return (
-                  <td
-                    key={dateStr}
-                    style={mergeStyles(
-                      styles.td,
-                      styles.tariffCell,
-                      isWeekend(dateStr) ? styles.weekendCell : {},
-                      getCellStyle()
-                    )}
-                    title={
-                      !entry ? 'No data'
-                        : isAvailable ? `Booking.com: ${formatCurrency(entry.rate)}`
-                        : isSoldOut ? 'Sold out on Booking.com'
-                        : 'No data'
-                    }
-                  >
-                    {!entry ? '-'
-                      : isAvailable && entry.rate ? formatCurrency(entry.rate)
-                      : isSoldOut ? 'Sold'
-                      : '-'}
-                  </td>
-                )
-              })}
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
-}
+// BookingComSection is now integrated into the unified table below
 
 const LoadingSpinner: React.FC = () => (
   <div style={styles.loading}>
@@ -536,6 +230,21 @@ const Bookability: React.FC = () => {
       }, 3000)
     },
     onError: () => setRefreshingDate(null),
+  })
+
+  // Fetch Booking.com availability data
+  const { data: bookingData } = useQuery<BookingAvailabilityData>({
+    queryKey: ['booking-availability', fromDate, toDate],
+    queryFn: async () => {
+      const params = new URLSearchParams({ from_date: fromDate, to_date: toDate })
+      const res = await fetch(`/api/competitor-rates/booking-availability?${params}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) return null
+      return res.json()
+    },
+    enabled: !!token,
+    staleTime: 5 * 60 * 1000,
   })
 
   // Fetch rate matrix data
@@ -678,20 +387,260 @@ const Bookability: React.FC = () => {
             No room categories configured. Please set up room categories in Settings.
           </div>
         )}
-        {data && data.categories.map((category) => (
-          <CategorySection
-            key={category.category_id}
-            category={category}
-            dates={data.dates}
-            rateData={data.matrix[category.category_id] || {}}
-            onRefreshDate={(d: string) => dateRefreshM.mutate(d)}
-            refreshingDate={refreshingDate}
-          />
-        ))}
+        {data && data.categories.length > 0 && (
+          <div style={styles.unifiedCard}>
+            <div style={styles.tableContainer}>
+              <table style={styles.table}>
+                <thead>
+                  <tr>
+                    <th style={mergeStyles(styles.th, styles.stickyCol, styles.stickyHeader)}>Tariff</th>
+                    {data.dates.map(dateStr => (
+                      <th
+                        key={dateStr}
+                        style={mergeStyles(
+                          styles.th,
+                          styles.dateHeader,
+                          styles.stickyHeader,
+                          isWeekend(dateStr) ? styles.weekendHeader : {}
+                        )}
+                      >
+                        <div style={styles.dateHeaderContent}>
+                          <span style={styles.dayOfWeek}>{formatDayOfWeek(dateStr)}</span>
+                          <span style={styles.dayNum}>{formatDateShort(dateStr)}</span>
+                          <button
+                            onClick={() => dateRefreshM.mutate(dateStr)}
+                            disabled={refreshingDate !== null}
+                            style={mergeStyles(
+                              styles.scrapeBtn,
+                              refreshingDate === dateStr ? styles.scrapeBtnActive : {}
+                            )}
+                            title={`Refresh ${dateStr}`}
+                          >
+                            {refreshingDate === dateStr ? '...' : '\u21BB'}
+                          </button>
+                        </div>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.categories.map(category => {
+                    const rateData = data.matrix[category.category_id] || {}
+                    const tariffNames = getAllTariffNames(rateData, data.dates)
+                    return (
+                      <React.Fragment key={category.category_id}>
+                        {/* Category header row */}
+                        <tr>
+                          <td
+                            colSpan={data.dates.length + 1}
+                            style={styles.categoryHeaderRow}
+                          >
+                            {category.category_name}
+                            <span style={styles.roomCount}> ({category.room_count} rooms)</span>
+                          </td>
+                        </tr>
+                        {/* Occupancy row */}
+                        <tr>
+                          <td style={mergeStyles(styles.td, styles.stickyCol, styles.occupancyLabel)}>
+                            Occupancy
+                          </td>
+                          {data.dates.map(dateStr => {
+                            const dayData = rateData[dateStr]
+                            const occ = dayData?.occupancy
+                            if (!occ) {
+                              return (
+                                <td
+                                  key={dateStr}
+                                  style={mergeStyles(
+                                    styles.td,
+                                    styles.occupancyCell,
+                                    isWeekend(dateStr) ? styles.weekendCell : {}
+                                  )}
+                                >
+                                  -
+                                </td>
+                              )
+                            }
+                            const bookableRooms = occ.available - occ.maintenance
+                            const roomsLeft = bookableRooms - occ.occupied
+                            const isFull = roomsLeft <= 0
+                            const occPercent = bookableRooms > 0
+                              ? Math.round((occ.occupied / bookableRooms) * 100)
+                              : 100
+                            const isHighOcc = occPercent >= 80 && !isFull
+                            const hasOffline = occ.maintenance > 0
+                            const getOccStyle = () => {
+                              if (isFull) return styles.occupancyFull
+                              if (isHighOcc) return styles.occupancyHigh
+                              return styles.occupancyAvailable
+                            }
+                            return (
+                              <td
+                                key={dateStr}
+                                style={mergeStyles(
+                                  styles.td,
+                                  styles.occupancyCell,
+                                  isWeekend(dateStr) ? styles.weekendCell : {},
+                                  getOccStyle()
+                                )}
+                                title={`${occ.occupied} of ${bookableRooms} bookable rooms occupied${hasOffline ? ` (${occ.maintenance} offline)` : ''} - ${roomsLeft} left`}
+                              >
+                                <span style={styles.occupancyText}>
+                                  {occ.occupied}/{occ.available}
+                                  {hasOffline && <span style={styles.maintenanceBadge}>({occ.maintenance})</span>}
+                                </span>
+                              </td>
+                            )
+                          })}
+                        </tr>
+                        {/* Tariff rows */}
+                        {tariffNames.length === 0 ? (
+                          <tr>
+                            <td
+                              colSpan={data.dates.length + 1}
+                              style={{ ...styles.td, color: colors.textMuted, textAlign: 'center' }}
+                            >
+                              No rate data available for this period
+                            </td>
+                          </tr>
+                        ) : (
+                          tariffNames.map(tariffName => (
+                            <tr key={tariffName}>
+                              <td style={mergeStyles(styles.td, styles.stickyCol, styles.tariffNameCell)}>
+                                {tariffName}
+                              </td>
+                              {data.dates.map(dateStr => {
+                                const dayData = rateData[dateStr]
+                                const tariff = dayData?.tariffs?.find(t => t.name === tariffName)
+                                const occupancy = dayData?.occupancy
+                                const noRoomsAvailable = occupancy &&
+                                  (occupancy.available - occupancy.maintenance - occupancy.occupied) <= 0
 
-        {/* Booking.com as a section matching category layout */}
-        {data && data.dates.length > 0 && (
-          <BookingComSection dates={data.dates} fromDate={fromDate} toDate={toDate} />
+                                if (!tariff) {
+                                  return (
+                                    <td
+                                      key={dateStr}
+                                      style={mergeStyles(
+                                        styles.td,
+                                        styles.tariffCell,
+                                        isWeekend(dateStr) ? styles.weekendCell : {},
+                                        noRoomsAvailable ? styles.cellNoRooms : styles.cellNoData
+                                      )}
+                                      title={noRoomsAvailable ? 'No rooms available' : undefined}
+                                    >
+                                      -
+                                    </td>
+                                  )
+                                }
+
+                                const isEffectivelyAvailable = tariff.available ||
+                                  (tariff.min_stay && tariff.min_stay > 1 && tariff.available_for_min_stay === true)
+                                const minStayBadge = isEffectivelyAvailable && !noRoomsAvailable && tariff.min_stay && tariff.min_stay > 1 ? (
+                                  <span style={styles.minStayBadge} title={`Minimum ${tariff.min_stay} nights`}>
+                                    {tariff.min_stay}
+                                  </span>
+                                ) : null
+                                const getCellStyle = () => {
+                                  if (noRoomsAvailable) return styles.cellNoRooms
+                                  if (isEffectivelyAvailable) return styles.cellAvailable
+                                  return styles.cellUnavailable
+                                }
+                                const getTooltip = () => {
+                                  if (noRoomsAvailable) return `${tariffName}: No rooms available`
+                                  if (isEffectivelyAvailable) {
+                                    const minStayNote = tariff.min_stay && tariff.min_stay > 1 ? ` (Min ${tariff.min_stay} nights)` : ''
+                                    return `${tariffName}: ${formatCurrency(tariff.rate)}${minStayNote}`
+                                  }
+                                  return `${tariffName}: ${tariff.message || 'Not available'}`
+                                }
+
+                                return (
+                                  <td
+                                    key={dateStr}
+                                    style={mergeStyles(
+                                      styles.td,
+                                      styles.tariffCell,
+                                      isWeekend(dateStr) ? styles.weekendCell : {},
+                                      getCellStyle(),
+                                      !isEffectivelyAvailable && !noRoomsAvailable ? { textDecoration: 'line-through' } : {}
+                                    )}
+                                    title={getTooltip()}
+                                  >
+                                    <span style={styles.cellContent}>
+                                      {tariff.rate !== null ? formatCurrency(tariff.rate) : (isEffectivelyAvailable ? 'Y' : 'N')}
+                                      {minStayBadge}
+                                    </span>
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          ))
+                        )}
+                      </React.Fragment>
+                    )
+                  })}
+                  {/* Booking.com section */}
+                  {bookingData && bookingData.has_own_hotel && (
+                    <React.Fragment>
+                      <tr>
+                        <td
+                          colSpan={data.dates.length + 1}
+                          style={styles.categoryHeaderRow}
+                        >
+                          Booking.com
+                          <span style={styles.roomCount}>
+                            {' '}{bookingData.latest_scrape ? `Scraped ${formatScrapeAge(bookingData.latest_scrape)}` : 'No scrape data'}
+                            {' \u00b7 '}
+                            <Link to="/competitor-rates" style={{ color: colors.primary, textDecoration: 'none', fontSize: typography.sm }}>
+                              View details
+                            </Link>
+                          </span>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style={mergeStyles(styles.td, styles.stickyCol, styles.tariffNameCell)}>
+                          Best Available
+                        </td>
+                        {data.dates.map(dateStr => {
+                          const entry = bookingData.dates[dateStr]
+                          const isAvailable = entry?.status === 'available'
+                          const isSoldOut = entry?.status === 'sold_out'
+                          const getCellStyle = () => {
+                            if (!entry) return styles.cellNoData
+                            if (isAvailable && entry.rate) return styles.cellAvailable
+                            if (isSoldOut) return styles.bookingCellSoldOut
+                            return styles.cellNoData
+                          }
+                          return (
+                            <td
+                              key={dateStr}
+                              style={mergeStyles(
+                                styles.td,
+                                styles.tariffCell,
+                                isWeekend(dateStr) ? styles.weekendCell : {},
+                                getCellStyle()
+                              )}
+                              title={
+                                !entry ? 'No data'
+                                  : isAvailable ? `Booking.com: ${formatCurrency(entry.rate)}`
+                                  : isSoldOut ? 'Sold out on Booking.com'
+                                  : 'No data'
+                              }
+                            >
+                              {!entry ? '-'
+                                : isAvailable && entry.rate ? formatCurrency(entry.rate)
+                                : isSoldOut ? 'Sold'
+                                : '-'}
+                            </td>
+                          )
+                        })}
+                      </tr>
+                    </React.Fragment>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         )}
       </div>
 
@@ -820,20 +769,27 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     gap: spacing.lg,
   },
-  categorySection: {
+  unifiedCard: {
     background: colors.surface,
     borderRadius: radius.xl,
-    padding: spacing.lg,
+    padding: spacing.md,
     boxShadow: shadows.md,
   },
-  categoryTitle: {
-    fontSize: typography.lg,
-    fontWeight: typography.semibold,
+  categoryHeaderRow: {
+    fontWeight: typography.semibold as any,
+    fontSize: typography.base,
     color: colors.text,
-    marginBottom: spacing.md,
-    display: 'flex',
-    alignItems: 'center',
-    gap: spacing.sm,
+    background: colors.background,
+    padding: `${spacing.sm} ${spacing.md}`,
+    borderTop: `2px solid ${colors.border}`,
+    textAlign: 'left' as const,
+    whiteSpace: 'nowrap' as const,
+  },
+  stickyHeader: {
+    position: 'sticky' as const,
+    top: 0,
+    zIndex: 20,
+    background: colors.surface,
   },
   roomCount: {
     fontSize: typography.sm,
@@ -849,6 +805,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderCollapse: 'collapse',
     fontSize: typography.sm,
     minWidth: '800px',
+    tableLayout: 'fixed' as const,
   },
   th: {
     padding: spacing.sm,
@@ -871,12 +828,13 @@ const styles: Record<string, React.CSSProperties> = {
     background: colors.surface,
     zIndex: 10,
     textAlign: 'left',
-    minWidth: '150px',
-    maxWidth: '200px',
+    width: '160px',
     borderRight: `1px solid ${colors.border}`,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
   },
   dateHeader: {
-    minWidth: '50px',
+    width: '56px',
     padding: `${spacing.xs} ${spacing.xs}`,
   },
   dateHeaderContent: {
