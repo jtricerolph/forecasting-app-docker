@@ -8,17 +8,25 @@ Uses a snapshot model - only inserts new rows when rates change, otherwise updat
 This allows tracking rate history over time.
 
 Schedule: Daily at 5:20 AM (before pace snapshot runs)
+
+Processing: Day-by-day with progressive DB commits. Each date is fully processed
+(single-night fetch + inline multi-night verification) and saved before moving to the next.
+If the job fails partway, all previously processed dates are preserved.
 """
 import json
 import logging
+import re
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 
+import asyncio
 from sqlalchemy import text
 from database import SyncSessionLocal
 
 logger = logging.getLogger(__name__)
+
+COMMIT_BATCH_SIZE = 10  # Commit to DB every N days
 
 
 def rates_changed(old_rate: Optional[Dict], new_rate: Dict) -> bool:
@@ -147,6 +155,30 @@ def save_rate_snapshot(db, category_id: str, rate_date: date, rate: Dict) -> str
         return 'verified'
 
 
+def needs_multi_night_check(tariff: Dict, days_ahead: int) -> Optional[int]:
+    """
+    Check if a tariff needs multi-night verification.
+
+    Returns the min_stay value if a multi-night check is needed, None otherwise.
+    Skips tariffs with advance booking restrictions that aren't met.
+    """
+    min_stay = tariff.get('min_stay')
+    if not min_stay or min_stay <= 1:
+        return None
+    if tariff.get('success', False):
+        return None  # Already available as single-night, no recheck needed
+
+    # Check for advance booking requirement
+    message = tariff.get('message', '') or ''
+    advance_match = re.search(r'(\d+)\s*days?\s*in\s*advance', message, re.IGNORECASE)
+    if advance_match:
+        min_advance_days = int(advance_match.group(1))
+        if days_ahead < min_advance_days:
+            return None  # Within advance period - recheck won't help
+
+    return min_stay
+
+
 async def run_fetch_current_rates(horizon_days: int = 720, start_date: date = None):
     """
     Fetch current rates for all included categories and store in database.
@@ -155,10 +187,15 @@ async def run_fetch_current_rates(horizon_days: int = 720, start_date: date = No
         horizon_days: Number of days ahead to fetch (default 720 for scheduled, configurable for manual)
         start_date: Start date for fetch (default today)
 
-    OPTIMIZED: Queries all categories in a single API call per date,
-    reducing API calls from (categories × days) to just (days).
+    Processing: Day-by-day with progressive commits.
+    For each date:
+      1. Fetch single-night rates (all categories in one API call)
+      2. Check if any tariffs need multi-night verification
+      3. If so, run multi-night check immediately for that date
+      4. Save all rates for that date to DB
+      5. Commit every COMMIT_BATCH_SIZE days
 
-    Uses snapshot model - only stores new rows when rates change.
+    This means if the job fails at day 400, the first 390+ days are already saved.
     """
     logger.info(f"Starting current rates fetch ({horizon_days} days)")
 
@@ -220,97 +257,98 @@ async def run_fetch_current_rates(horizon_days: int = 720, start_date: date = No
         )
 
         async with client:
-            # OPTIMIZED: Use get_all_categories_single_night_rates for ALL 720 days
-            # This queries all categories in ONE API call per date
-            logger.info(f"Fetching single-night rates for {horizon_days} days (all categories per call)")
-            all_rates = await client.get_all_categories_single_night_rates(
-                today, today + timedelta(days=horizon_days)
-            )
-
-            # Collect dates needing multi-night verification
-            # Group by min_stay value for efficient batching
-            # Skip tariffs where failure is due to advance booking requirements
-            # (e.g. "must be booked 365 days in advance" - 2-night recheck won't help)
-            import re
-            dates_by_nights: Dict[int, set] = {}
-            skipped_advance = 0
-            for category_id, rates in all_rates.items():
-                if category_id not in included_categories:
-                    continue
-                for rate in rates:
-                    tariffs_data = rate.get('tariffs_data', {})
-                    rate_date = rate['date']
-                    days_ahead = (rate_date - today).days if isinstance(rate_date, date) else 0
-                    for tariff in tariffs_data.get('tariffs', []):
-                        min_stay = tariff.get('min_stay')
-                        # If unavailable and has min_stay > 1, we need to verify with multi-night query
-                        if min_stay and min_stay > 1 and not tariff.get('success', False):
-                            # Check if tariff has an advance booking requirement that isn't met
-                            message = tariff.get('message', '') or ''
-                            advance_match = re.search(r'(\d+)\s*days?\s*in\s*advance', message, re.IGNORECASE)
-                            if advance_match:
-                                min_advance_days = int(advance_match.group(1))
-                                if days_ahead < min_advance_days:
-                                    # Date is within advance period - recheck won't help
-                                    skipped_advance += 1
-                                    continue
-
-                            if min_stay not in dates_by_nights:
-                                dates_by_nights[min_stay] = set()
-                            dates_by_nights[min_stay].add(rate_date)
-            if skipped_advance > 0:
-                logger.info(f"Skipped {skipped_advance} multi-night checks (advance booking restriction)")
-
-            # Convert sets to sorted lists
-            dates_by_nights_list = {nights: sorted(list(dates)) for nights, dates in dates_by_nights.items()}
-            total_multi_night = sum(len(dates) for dates in dates_by_nights_list.values())
-
-            if total_multi_night > 0:
-                logger.info(f"Running multi-night verification for {total_multi_night} date(s)")
-                for nights, dates in dates_by_nights_list.items():
-                    logger.info(f"  {nights}-night check: {len(dates)} dates")
-
-                # Fetch multi-night availability
-                multi_night_results = await client.get_multi_night_availability(dates_by_nights_list)
-
-                # Update tariffs_data with multi-night availability
-                for category_id, rates in all_rates.items():
-                    if category_id not in included_categories:
-                        continue
-                    for rate in rates:
-                        rate_date = rate['date']
-                        if rate_date in multi_night_results:
-                            cat_availability = multi_night_results[rate_date].get(category_id, {})
-                            tariffs_data = rate.get('tariffs_data', {})
-                            for tariff in tariffs_data.get('tariffs', []):
-                                tariff_name = tariff.get('name', '')
-                                min_stay = tariff.get('min_stay')
-                                if min_stay and min_stay > 1:
-                                    # Update with multi-night availability result
-                                    tariff['available_for_min_stay'] = cat_availability.get(tariff_name, False)
-
-                logger.info(f"Multi-night verification complete")
-            else:
-                logger.info("No multi-night verification needed")
-
-            # Save rates for included categories only
             inserted_total = 0
             verified_total = 0
-            for category_id, rates in all_rates.items():
-                if category_id not in included_categories:
-                    continue  # Skip categories not in our included list
+            multi_night_checks = 0
+            skipped_advance = 0
+            current_date = today
+            day_count = 0
 
-                for rate in rates:
-                    rate_date = rate['date']
-                    result = save_rate_snapshot(db, category_id, rate_date, rate)
-                    if result == 'inserted':
-                        inserted_total += 1
-                    elif result == 'verified':
-                        verified_total += 1
+            while current_date <= today + timedelta(days=horizon_days):
+                day_count += 1
+                days_ahead = (current_date - today).days
 
-            logger.info(f"Complete: {inserted_total} new snapshots, {verified_total} verified unchanged")
+                try:
+                    # Step 1: Fetch single-night rates for all categories on this date
+                    day_rates = await client.fetch_single_date_all_categories(
+                        current_date, guests_adults=2, guests_children=0
+                    )
 
-        db.commit()
+                    # Step 2: Check for multi-night verification needs and run inline
+                    # Collect unique min_stay values needed for this date
+                    nights_needed: Set[int] = set()
+                    for cat_id, rates in day_rates.items():
+                        if cat_id not in included_categories:
+                            continue
+                        for rate in rates:
+                            for tariff in rate.get('tariffs_data', {}).get('tariffs', []):
+                                check = needs_multi_night_check(tariff, days_ahead)
+                                if check:
+                                    nights_needed.add(check)
+                                elif tariff.get('min_stay') and tariff['min_stay'] > 1 and not tariff.get('success', False):
+                                    skipped_advance += 1
+
+                    # Step 3: Run multi-night checks for this date if needed
+                    multi_night_results: Dict[int, Dict[str, Dict[str, bool]]] = {}
+                    for nights in sorted(nights_needed):
+                        try:
+                            result = await client.fetch_multi_night_for_date(
+                                current_date, nights
+                            )
+                            multi_night_results[nights] = result
+                            multi_night_checks += 1
+                            await asyncio.sleep(1.0)  # Rate limiting
+                        except Exception as e:
+                            logger.warning(f"Multi-night check failed for {current_date} ({nights}n): {e}")
+
+                    # Step 4: Update tariffs with multi-night results and save to DB
+                    for cat_id, rates in day_rates.items():
+                        if cat_id not in included_categories:
+                            continue
+                        for rate in rates:
+                            tariffs_data = rate.get('tariffs_data', {})
+                            # Apply multi-night results to tariffs
+                            for tariff in tariffs_data.get('tariffs', []):
+                                min_stay = tariff.get('min_stay')
+                                if min_stay and min_stay > 1 and min_stay in multi_night_results:
+                                    cat_availability = multi_night_results[min_stay].get(cat_id, {})
+                                    tariff_name = tariff.get('name', '')
+                                    tariff['available_for_min_stay'] = cat_availability.get(tariff_name, False)
+
+                            # Save to DB
+                            result = save_rate_snapshot(db, cat_id, current_date, rate)
+                            if result == 'inserted':
+                                inserted_total += 1
+                            elif result == 'verified':
+                                verified_total += 1
+
+                    if day_count % 50 == 0 or nights_needed:
+                        logger.info(
+                            f"Day {day_count}/{horizon_days}: {current_date}"
+                            f" | {inserted_total} new, {verified_total} verified"
+                            f"{f' | {len(nights_needed)} multi-night checks' if nights_needed else ''}"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Failed to fetch rates for {current_date}: {e}")
+
+                # Step 5: Commit periodically
+                if day_count % COMMIT_BATCH_SIZE == 0:
+                    db.commit()
+
+                current_date += timedelta(days=1)
+                await asyncio.sleep(1.0)  # Rate limiting between days
+
+            # Final commit for remaining days
+            db.commit()
+
+            if skipped_advance > 0:
+                logger.info(f"Skipped {skipped_advance} multi-night checks (advance booking restriction)")
+            logger.info(
+                f"Complete: {inserted_total} new snapshots, {verified_total} verified unchanged, "
+                f"{multi_night_checks} multi-night checks"
+            )
+
         logger.info("Current rates fetch completed successfully")
 
     except Exception as e:
@@ -319,5 +357,3 @@ async def run_fetch_current_rates(horizon_days: int = 720, start_date: date = No
         raise
     finally:
         db.close()
-
-

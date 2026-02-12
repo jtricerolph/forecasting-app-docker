@@ -183,6 +183,39 @@ class NewbookRatesClient:
 
         return rates
 
+    async def fetch_single_date_all_categories(
+        self,
+        for_date: date,
+        guests_adults: int = 2,
+        guests_children: int = 0
+    ) -> Dict[str, List[Dict]]:
+        """
+        Fetch single-night rates for ALL categories for one date.
+
+        Returns:
+            Dict of {category_id: [{date, gross_rate, net_rate, tariffs_data}]}
+        """
+        return await self._fetch_all_categories_batch(
+            for_date, guests_adults, guests_children
+        )
+
+    async def fetch_multi_night_for_date(
+        self,
+        for_date: date,
+        nights: int,
+        guests_adults: int = 2,
+        guests_children: int = 0
+    ) -> Dict[str, Dict[str, bool]]:
+        """
+        Fetch multi-night availability for ALL categories for one date.
+
+        Returns:
+            Dict of {category_id: {tariff_name: available}}
+        """
+        return await self._fetch_all_categories_multi_night(
+            for_date, nights, guests_adults, guests_children
+        )
+
     async def get_all_categories_single_night_rates(
         self,
         from_date: date,

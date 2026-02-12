@@ -431,13 +431,13 @@ const Bookability: React.FC = () => {
                       <React.Fragment key={category.category_id}>
                         {/* Category header row */}
                         <tr>
-                          <td
-                            colSpan={data.dates.length + 1}
-                            style={styles.categoryHeaderRow}
-                          >
+                          <td style={mergeStyles(styles.categoryHeaderRow, styles.stickyCol, { zIndex: 15, overflow: 'visible', textOverflow: 'clip', width: 'auto', minWidth: '160px' })}>
                             {category.category_name}
                             <span style={styles.roomCount}> ({category.room_count} rooms)</span>
                           </td>
+                          {data.dates.map(dateStr => (
+                            <td key={dateStr} style={styles.categoryHeaderFill} />
+                          ))}
                         </tr>
                         {/* Occupancy row */}
                         <tr>
@@ -583,10 +583,7 @@ const Bookability: React.FC = () => {
                   {bookingData && bookingData.has_own_hotel && (
                     <React.Fragment>
                       <tr>
-                        <td
-                          colSpan={data.dates.length + 1}
-                          style={styles.categoryHeaderRow}
-                        >
+                        <td style={mergeStyles(styles.categoryHeaderRow, styles.stickyCol, { zIndex: 15, overflow: 'visible', textOverflow: 'clip', width: 'auto', minWidth: '160px' })}>
                           Booking.com
                           <span style={styles.roomCount}>
                             {' '}{bookingData.latest_scrape ? `Scraped ${formatScrapeAge(bookingData.latest_scrape)}` : 'No scrape data'}
@@ -596,6 +593,9 @@ const Bookability: React.FC = () => {
                             </Link>
                           </span>
                         </td>
+                        {data.dates.map(dateStr => (
+                          <td key={dateStr} style={styles.categoryHeaderFill} />
+                        ))}
                       </tr>
                       <tr>
                         <td style={mergeStyles(styles.td, styles.stickyCol, styles.tariffNameCell)}>
@@ -784,6 +784,11 @@ const styles: Record<string, React.CSSProperties> = {
     borderTop: `2px solid ${colors.border}`,
     textAlign: 'left' as const,
     whiteSpace: 'nowrap' as const,
+  },
+  categoryHeaderFill: {
+    background: colors.background,
+    borderTop: `2px solid ${colors.border}`,
+    padding: 0,
   },
   stickyHeader: {
     position: 'sticky' as const,
