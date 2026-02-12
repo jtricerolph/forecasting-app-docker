@@ -192,6 +192,28 @@ async def update_resos_settings(
     return {"status": "saved", "message": "Resos settings updated"}
 
 
+@router.post("/settings/resos/test")
+async def test_resos_settings(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Test Resos connection with current settings"""
+    try:
+        from services.resos_client import ResosClient
+        async with await ResosClient.from_db(db) as client:
+            if not client.api_key:
+                raise HTTPException(status_code=400, detail="Resos API key not configured")
+            success = await client.test_connection()
+            if success:
+                return {"status": "success", "message": "Connected to Resos API successfully"}
+            else:
+                raise HTTPException(status_code=400, detail="Connection failed - check API key")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Connection test failed: {str(e)}")
+
+
 # ============================================
 # ROOM CATEGORIES ENDPOINTS
 # ============================================

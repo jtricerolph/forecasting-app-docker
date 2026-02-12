@@ -59,7 +59,7 @@ class NewbookClient:
         return cls(api_key=api_key, username=username, password=password, region=region)
 
     async def __aenter__(self):
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = httpx.AsyncClient(timeout=300.0)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
