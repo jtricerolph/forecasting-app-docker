@@ -101,7 +101,7 @@ def run_scheduled_booking_scrape():
             return
 
         # Clean up stale running batches and old queue items
-        cleanup_stale_batches(db, max_age_minutes=60)
+        cleanup_stale_batches(db, max_age_minutes=120)
         clear_old_queue_items(db, days=3)
 
         # Gather dates with priorities

@@ -606,7 +606,7 @@ async def process_queue(db: Session) -> Dict[str, Any]:
         }
 
     # Get pending items
-    items = get_pending_queue_items(db, limit=50)
+    items = get_pending_queue_items(db, limit=200)
     if not items:
         return {'success': True, 'dates_completed': 0, 'message': 'Queue empty'}
 
