@@ -26,7 +26,12 @@ from database import SyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(
+    job_defaults={
+        'misfire_grace_time': 3600,  # Allow jobs to run up to 1 hour late
+        'coalesce': True,            # If multiple runs were missed, only run once
+    }
+)
 
 
 def get_config_value(key: str, default: str = None) -> str:
